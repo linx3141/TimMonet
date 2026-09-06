@@ -5,8 +5,7 @@
 <a href="https://github.com/linx3141/TimMonet/releases"><img alt="GitHub all releases" src="https://img.shields.io/github/downloads/linx3141/TimMonet/total?label=Downloads"></a>
 <a href="https://github.com/linx3141/TimMonet/releases/latest"><img alt="GitHub latest release" src="https://img.shields.io/github/v/release/linx3141/TimMonet"></a>
 
-<!-- 如需给群号加可点击的加群链接,把 href 换成 https://qm.qq.com/q/xxxx 短链 -->
-<a href="https://github.com/linx3141/TimMonet"><img alt="QQ群 1051328541" src="https://img.shields.io/badge/QQ%E7%BE%A4-1051328541-12B7F5?logo=tencentqq&logoColor=white"></a>
+<a href="https://qm.qq.com/q/Tink3oFUau"><img alt="QQ群 1051328541" src="https://img.shields.io/badge/QQ%E7%BE%A4-1051328541-12B7F5?logo=tencentqq&logoColor=white"></a>
 
 <p>为 TIM（QQ NT 架构的轻量版 QQ）适配 Material You「莫奈取色」与深色主题的 Xposed 模块</p>
 
@@ -110,8 +109,8 @@
 
 微信赞赏：
 
-<img width="200" alt="微信赞赏码" src="mm_reward_qrcode_1788704088884.png" />
+<img width="1290" height="1290" alt="mm_reward_qrcode_1788704088884" src="https://github.com/user-attachments/assets/935bbb34-786c-4f19-8a7d-0ed668b98c3b" />
 
 支付宝：
 
-<img width="200" alt="支付宝收款码" src="1788704013661.jpg" />
+<img width="1080" height="1620" alt="1788704013661" src="https://github.com/user-attachments/assets/fe1200b2-c137-4450-a3e1-baa6a4033aa1" />
