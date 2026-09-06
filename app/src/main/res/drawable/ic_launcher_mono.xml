@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 主题图标(monochrome)单色剪影:只画彩色图标中"白环带"本身
+     (17.625~25.875 实心,外顺内逆),其余透明由系统垫背景色。
+     渲染结果:背景色圆盘(外盘+中心盘同色)+ 前景色环带,
+     与彩色图标"蓝盘+白环"结构一一对应,且与其他应用主题图标同构。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,28.125 A25.875,25.875 0 1,1 54,79.875 A25.875,25.875 0 1,1 54,28.125 Z M54,36.375 A17.625,17.625 0 1,0 54,71.625 A17.625,17.625 0 1,0 54,36.375 Z" />
+</vector>

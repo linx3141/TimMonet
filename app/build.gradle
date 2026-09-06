@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'com.timmonet'
+    compileSdk 37
+
+    defaultConfig {
+        applicationId 'com.timmonet'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildFeatures {
+        compose true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            signingConfig signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    compileOnly 'io.github.libxposed:api:102.0.0'
+
+    // Compose（版本与 KernelSU Manager 一致，全部使用本地缓存）
+    implementation 'androidx.compose.ui:ui:1.11.4'
+    implementation 'androidx.compose.foundation:foundation:1.11.4'
+    implementation 'androidx.compose.runtime:runtime:1.11.4'
+    implementation 'androidx.compose.animation:animation:1.11.4'
+    implementation 'androidx.compose.material3:material3:1.5.0-alpha18'
+    implementation 'androidx.compose.material:material-icons-extended:1.7.8'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'io.github.libxposed:service:102.0.0'
+    implementation 'com.materialkolor:material-kolor:5.0.0'
+}

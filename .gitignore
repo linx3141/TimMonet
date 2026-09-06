@@ -1,0 +1,50 @@
+# Gradle / Android
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 构建产物与安装包
+*.apk
+*.aab
+*.aar
+*.keystore
+
+# 日志与诊断临时文件（logcat dump、截图、UI dump 等）
+*.log
+log.log
+log2.log
+log3.log
+log-key.log
+*.png
+*.webp
+ui.xml
+tm*.png
+tm_probe.png
+cur.png
+
+# 反编译参考（1.4GB，不入库）
+tim_decompiled/
+
+# 外部素材
+TIM_4.1.0.apk
+0.0.1.34.ark
+*.zip
+
+# 恢复期中间产物
+recover_ref/
+
+# 误入库的编译产物解包目录
+com/
+
+# 系统/编辑器杂项
+.DS_Store
+Thumbs.db
+*.jks
+*.hprof
+.kotlin/

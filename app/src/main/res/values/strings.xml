@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TIM 莫奈取色</string>
+    <string name="app_description">为 TIM（NT 架构）适配 Material You 取色</string>
+
+    <string name="settings_theme">主题</string>
+    <string name="settings_color_style">色彩风格</string>
+    <string name="settings_color_spec">色彩标准</string>
+    <string name="settings_theme_mode_system">系统</string>
+    <string name="settings_theme_mode_light">浅色</string>
+    <string name="settings_theme_mode_dark">深色</string>
+    <string name="settings_theme_mode_amoled">纯黑</string>
+    <string name="settings_auto_color">自动取色</string>
+    <string name="settings_auto_color_summary">跟随壁纸 / 系统莫奈引擎</string>
+    <string name="settings_apply_hint">修改后会自动应用到 TIM，无需重启（约 3 秒内生效）</string>
+</resources>
