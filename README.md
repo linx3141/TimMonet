@@ -1,46 +1,74 @@
-# TimMonet
+<div align="center">
+<h1>TimMonet</h1>
 
-为 TIM 4.1.0（基于 QQ NT 架构的轻量版 QQ）适配 Material You「莫奈取色」的
-LSPosed 模块。
+<a href="https://github.com/linx3141/TimMonet/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/linx3141/TimMonet?label=Stars"></a>
+<a href="https://github.com/linx3141/TimMonet/releases"><img alt="GitHub all releases" src="https://img.shields.io/github/downloads/linx3141/TimMonet/total?label=Downloads"></a>
+<a href="https://github.com/linx3141/TimMonet/releases/latest"><img alt="GitHub latest release" src="https://img.shields.io/github/v/release/linx3141/TimMonet"></a>
 
-## 主页面（v2.0）
+<!-- 如需给群号加可点击的加群链接,把 href 换成 https://qm.qq.com/q/xxxx 短链 -->
+<a href="https://github.com/linx3141/TimMonet"><img alt="QQ群 1051328541" src="https://img.shields.io/badge/QQ%E7%BE%A4-1051328541-12B7F5?logo=tencentqq&logoColor=white"></a>
 
-模块的主页面移植自 KernelSU Manager 的 Material 主题设置页（样式未做改动）：
+<p>为 TIM（QQ NT 架构的轻量版 QQ）适配 Material You「莫奈取色」与深色主题的 Xposed 模块</p>
 
-- 颜色模式：系统 / 浅色 / 深色 / 纯黑
-- 自动取色（跟随系统莫奈引擎）或自定义种子色
-- 色彩风格（TonalSpot / Neutral / Vibrant / Expressive / Rainbow / FruitSalad / Monochrome / Fidelity / Content）
-- 色彩标准（Material Color Spec 2021 / 2025）
+<p>
+  <b>支持框架</b>：
+  <b><a href="https://github.com/LSPosed/LSPosed">LSPosed</a></b>
+</p>
+</div>
 
-设置通过 ContentProvider 传给 TIM 进程，修改后约 3 秒内自动生效，无需重启。
-KernelSU 中的预测性返回手势、导航栏角标、页面缩放与取色无关，已移除。
+---
 
-## 效果
+## 项目简介(必看)
 
-- 取色源与 KernelSU Manager 一致：直接读取系统莫奈引擎生成的
-  `system_accent1_*` / `system_primary_light/dark`（Android 12 以下才退回壁纸量化），
-  因此壁纸是蓝色而系统莫奈选了绿色时，本模块同样跟随系统取绿色；
-- 把 TIM 的品牌蓝（按钮、链接、选中态、聊天气泡、导航栏品牌底等）替换成
-  壁纸派生的主色，中性文字/背景/边框同步映射到对应明度的中性色阶；
-- 日间 / 夜间两套调色板自动切换，跟随 TIM 自身的主题开关；
-- 壁纸更换后自动重新取色，无需重启。
+- 这是一款基于 **Xposed API** 开发的 LSPosed 模块，作用于 **TIM 4.1.0[.4050]**
+- 推荐使用最新的LSPosed, 于lsposed.zip下载
+- 在模块内部完成 Material You 调色板计算，**不依赖系统莫奈引擎**（低版本 Android 同样可用）
+- 将 TIM 的品牌蓝与中性色阶整体映射为壁纸/种子色派生的 Material 3 配色：
+  - 深色主题化：登录页、聊天（AIO）、转发对话框、浮层菜单、我的页等原生页面
+  - 品牌色统一：按钮、链接、选中态、聊天气泡、徽标红点、底栏图标等
+- 来自KernelSU的设置页，可实时预览配色
+- 全程事件驱动、无延时轮询，热路径全部记忆化，性能开销低
+- **在TimMonet模块内**设置深色浅色与Monet配色方案
 
-## Hook 点
+---
 
-| 取色链路 | 类 / 方法 | 覆盖范围 |
-| --- | --- | --- |
-| QUI token 组件 | `com.tencent.biz.qui.quitoken.b.a` 的 `d(Context,int,int)`、`e(Context,int,int)` | NT 主界面、聊天页、设置页等原生组件 |
-| Hippy / JSI / WebView | `com.tencent.mobileqq.vas.theme.api.QUIUtil.getCurrentTokenMap()` | 跨端页面 |
-| 经典皮肤引擎 | `com.tencent.theme.SkinEngine.getColor(int)`、`loadColorStateList(int)` | 遗留页面 |
-| Resources 直读 | `Resources.getColor*`、`getColorStateList*`、`loadColorStateList(TypedValue,int,Theme)`、`TypedArray.getColor` | 主界面顶栏/聊天列表/底栏、AIO 消息气泡等绝大多数原生页面 |
-| Drawable 染色 | `Resources.getDrawable*`、`Resources.loadDrawable*` | 底栏图标、输入栏背景、联系人/设置页面背景、新朋友卡片等 XML 膨胀的烘焙色资源 |
-| 气泡文字 | `com.tencent.mobileqq.aio.utils.ai.h/f(Context)` | 修复深色模式下气泡文字与气泡背景同浅色导致的不可见 |
-| 主页面背景 | `com.tencent.mobileqq.resconfig.a.a/b/c(Context)` | 深色模式写死十六进制的页面背景 |
+## 功能分类
 
-全部使用 after-hook：每次调用基于原始值重新映射，不修改 TIM 的任何缓存，因此
-幂等且不影响其他主题功能。Resources 层只重映射 `qui_` 前缀的语义色，其余资源原样返回。
+本模块功能主要分为以下 3 类：
 
-浅色模式的页面/列表/卡片背景会按主色相做轻微染色（不是纯中性白），深色模式保持中性。
+| 功能类型 | 作用说明 | 启用方式 |
+|---|---|---|
+| 主题覆盖 | 对 TIM 各原生页面/组件做深色化与调色映射 | 勾选 TIM 后直接生效 |
+| 配色定制 | 自定义颜色模式、种子色、调色板风格与色彩规范 | 在模块设置页调整 |
+| AMOLED黑 | 你将看到一个气泡都是AMOLED黑的最省电Tim | 在模块设置页设置 |
+
+## 使用说明
+
+### 主题覆盖
+
+1. 在 LSPosed 管理器中启用本模块，作用域勾选 `com.tencent.tim`（`scope.list` 已声明）
+2. 强制停止并重启 TIM
+3. 生效后进入各页面检查配色
+4. 如果某些页面未生效，可能是该组件走的渲染路径未覆盖，请前往 [Issues](https://github.com/linx3141/TimMonet/issues) 或QQ群组反馈（附截图与日志最佳）
+
+### 配色定制
+
+1. 打开模块的 Compose 设置页（直接打开模块应用）
+2. 选择颜色模式 / 取色源 / 调色板风格 / 色彩规范
+3. 保存后模块会自动强制重启 TIM 使新配色完整生效
+4. 更换壁纸后如需跟随系统重新取色，同样建议重启一次 TIM
+
+---
+
+## 兼容性
+
+- 推荐 **LSPosed**（或兼容 Xposed API 93+ 的框架）配合 **TIM 4.1.0.4050** 使用
+- 模块最低支持 Android 8.0（API 26）
+- TIM 混淆会在版本升级时重命名方法，hook 使用「方法名 + 签名」匹配并附带签名兜底，但跨大版本仍可能需要同步更新类名
+- 部分色彩如 错误红 / 成功绿 / 警告黄、纯黑纯白蒙层等固定语义色不参与取色
+
+---
+
 
 ## 构建
 
@@ -49,18 +77,41 @@ KernelSU 中的预测性返回手势、导航栏角标、页面缩放与取色�
 # 产物：app/build/outputs/apk/debug/app-debug.apk
 ```
 
-要求 JDK 17+（项目已配置 `org.gradle.java.home` 指向本机缓存的 JDK 21）。
+要求 JDK 17+。
 
-## 安装与使用
+---
 
-1. 安装 APK 到手机；
-2. 在 LSPosed 管理器中启用「TIM 莫奈取色」模块，作用域勾选 `com.tencent.tim`
-   （`scope.list` 已声明）；
-3. 强制停止并重启 TIM；
-4. 更换壁纸后颜色会自动跟随。
+## 问题反馈
 
-## 已知限制
+请前往 **[GitHub Issues](https://github.com/linx3141/TimMonet/issues)** 或QQ群组提交反馈, 请携带好bug复现方法和设备信息。
 
-- 错误红 / 成功绿 / 警告黄、纯黑纯白蒙层等固定语义色不参与取色；
-- TIM 混淆会在版本升级时重命名方法，hook 使用「方法名 + 签名」匹配并附带
-  签名兜底，但跨大版本仍可能需要同步更新类名。
+---
+
+## 免责声明
+
+- 本模块仅供学习交流使用，请勿用于商业或违法用途
+- 本模块完全免费，不存在收费盈利；如果你是付费购买的，请联系售卖者退款
+- 禁止售卖、倒卖或二次打包分发本模块
+- 因使用本模块产生的任何后果，由使用者自行承担
+
+---
+
+## 交流与赞助
+
+### QQ 交流群
+
+- 群号：**1051328541**
+- 适配反馈、使用交流、新版本通知均可在群内进行
+
+### 赞助支持
+
+- 模块目前为个人维护项目，适配与更新需要投入时间与精力
+- 如果这个模块确实帮到了你，欢迎自愿赞助支持（可选，模块保持免费）
+
+微信赞赏：
+
+<img width="200" alt="微信赞赏码" src="mm_reward_qrcode_1788704088884.png" />
+
+支付宝：
+
+<img width="200" alt="支付宝收款码" src="1788704013661.jpg" />
