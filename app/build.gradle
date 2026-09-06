@@ -20,11 +20,25 @@ android {
         compose true
     }
 
+    signingConfigs {
+        // 真签名:凭据从 ~/.gradle/gradle.properties 读取(TM_KEYSTORE 等),
+        // 未配置时回退 debug 签名,便于无 key 环境构建。
+        release {
+            if (project.hasProperty('TM_KEYSTORE')) {
+                storeFile file(project.property('TM_KEYSTORE'))
+                storePassword project.property('TM_KEYSTORE_PASS')
+                keyAlias project.property('TM_KEY_ALIAS')
+                keyPassword project.property('TM_KEY_PASS')
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled true
             shrinkResources true
-            signingConfig signingConfigs.debug
+            signingConfig project.hasProperty('TM_KEYSTORE')
+                    ? signingConfigs.release : signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
