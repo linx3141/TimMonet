@@ -365,6 +365,12 @@ object TimMonetHooks {
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val b = c and 0xFF
+                val mx = maxOf(r, g, b)
+                val mn = minOf(r, g, b)
+                // 防误染兜底: 饱和且非蓝相的像素(黄/红/绿/肤色等)保持原样,
+                // 只重染蓝相/黑/白/灰(品牌横幅仅含这些色族; 判定虽已滤彩噪,
+                // 残余彩色像素也不再被插值改色)
+                if (mx - mn >= 40 && !(b >= r && b >= g)) continue
                 // 原型：QQ 蓝 0x2170FF、纯黑字、纯白字（仅夜间版白字用）
                 if (r > 200 && g > 200 && b > 190) {
                     // 纯白系 → onSurfaceVariant
@@ -406,7 +412,8 @@ object TimMonetHooks {
     private var brandScanLogCount = 0
 
 
-    /** 图像主体是否蓝族+黑/白族（低彩色噪声）。 */
+    /** 品牌横幅判定(蓝族+黑/白族、近乎零彩噪的纯矢量图)：
+     *  用于 Resources 层对"短名+长宽≥1.3 大图"的通用识别(资源短名随构建漂移)。 */
     private fun isBrandLikeImage(drawable: Drawable): Boolean {
         return try {
             var iw = drawable.intrinsicWidth
@@ -451,8 +458,11 @@ object TimMonetHooks {
                 }
             }
             if (tot < 3000) return false
-            blue * 10 >= tot * 1 && mono * 10 >= tot * 1 &&
-                colorNoise * 10 <= tot * 25
+            // 实测品牌横幅(jdl/jdm: 蓝85%/黑白14%/彩噪0; kzy: 蓝61%/白族38%/彩噪0)。
+            // 收紧: 蓝≥30%、黑白≥10%、彩噪≤4% —— 只剩纯矢量风横幅能通过,
+            // 彩色贴纸/插画/照片(彩噪通常≥8%)全部排除。
+            blue * 10 >= tot * 3 && mono * 10 >= tot * 1 &&
+                colorNoise * 10 <= tot * 4
         } catch (t: Throwable) {
             false
         }
@@ -1326,41 +1336,6 @@ private fun hookQuickMenuTheme(module: XposedModule, cl: ClassLoader) {
                                 }
                             }
                         }
-                        // 关于页品牌大图（单壳切换不触发 onResume，attach 是可靠时机）：                        // 页面后续可能再次 setImageResource 覆盖，做多轮延迟重染，
-                        // 已染过的实例用 memo 跳过避免重复开销
-                        try {
-                            fun tryTint(iv: ImageView) {
-                                val d = iv.drawable ?: return
-                                val idHash = System.identityHashCode(d)
-                                // 提前标记：同一 drawable 实例无论结果如何只判定一次
-                                // （负缓存，避免 RecyclerView 复用/重复 attach 反复做
-                                // 全量像素判定）
-                                if (!brandTintedMemo.add(idHash)) return
-                                if (brandTintedMemo.size > 256) brandTintedMemo.clear()
-                                val iw = d.intrinsicWidth
-                                val ih = d.intrinsicHeight
-                                val short = minOf(iw, ih)
-                                val long = maxOf(iw, ih)
-                                if (short !in 120..900 || long > 900 ||
-                                    long < short * 13 / 10 || !isBrandLikeImage(d)
-                                ) {
-                                    return
-                                }
-                                val out = tintBrandLogoV2(d)
-                                if (out == null) {
-                                    logOnce("attach brand FAILED ${iw}x${ih}")
-                                    return
-                                }
-                                out.bounds = d.bounds
-                                iv.setImageDrawable(out)
-                                logOnce("attach brand recolored ${iw}x${ih}")
-                            }
-                            if (view is ImageView) {
-                                tryTint(view)
-                            }
-                        } catch (t: Throwable) {
-                            // ignore
-                        }
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "quick menu attach failed", t)
@@ -1370,8 +1345,6 @@ private fun hookQuickMenuTheme(module: XposedModule, cl: ClassLoader) {
         }
 }
 
-/** 已检查过的品牌图实例(identity)：无论是否命中品牌都只判定一次(负缓存)。 */
-private val brandTintedMemo = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
 /** 徽标数字染色：数字 TextView 若处于 primary 底(自身背景、父容器背景或
  *  兄弟 ImageView 的 background/drawable 呈 primary 样)且为白字 → 染
@@ -6597,6 +6570,10 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val b = c and 0xFF
+                val mx = maxOf(r, g, b)
+                val mn = minOf(r, g, b)
+                // 防误染兜底: 饱和且非蓝相的像素保持原样(同上)
+                if (mx - mn >= 40 && !(b >= r && b >= g)) continue
                 // 源图只有亮蓝与白两族：按到两族原型的距离软混合
                 val db = ((r - 203) * (r - 203) + (g - 225) * (g - 225) +
                     (b - 253) * (b - 253)).toDouble()
