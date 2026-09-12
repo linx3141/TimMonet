@@ -7116,8 +7116,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         if (isWalletUIActive()) return drawable
         // 图片编辑/浏览页同上:用户内容配色优先
         if (isMediaEditorActive()) return drawable
-        // 相册/预览页选择控件(QUICheckBox)最外那圈白描边:见 checkBoxRingOverride
-        checkBoxRingOverride(name, drawable)?.let { return it }
         // 文件气泡圆形操作按钮（下载 lbb / 暂停 lbd / 发送取消 lbc）：
         // 矢量“白圆+深色图形”，SRC_IN 单色会毁掉双色，必须栅格化双簇重染
         if (name == "lbb" || name == "lbd" || name == "lbc") {
@@ -7351,82 +7349,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         return l.contains("icon") || l.startsWith("chat_tool") ||
             l.contains("_ic") || l.startsWith("qui_") ||
             l.contains("seleter") || l.contains("selector")
-    }
-
-    /** 选择控件(QUICheckBox)最外那圈白描边的莫奈化。
-     *
-     *  TIM 的 qui_common_check_box*white_border 选择器里，选中态是 vector
-     *  (fill=@color/qui_button_bg_primary_default、stroke=@color/qui_common_icon_white)，
-     *  未选中态是 fill=#4d000000 的同款白描边圆。填充已经按资源名映射成
-     *  primary，但外圈那道白边在深浅两态下都保持纯白，和莫奈配色割裂。
-     *
-     *  这里不去改 vector 内部(反射改 mStrokeColor 太脆)，而是在原 drawable
-     *  之上叠一圈描边把白圈盖掉：线宽按原 vector 的比例(viewport 48 /
-     *  strokeWidth 2 = 控件宽的 1/24)随控件尺寸缩放，半径与原白圈完全重合。
-     *  于是选中态描边 = primary(与填充同色，视觉统一)，未选中态描边 =
-     *  outline(中性莫奈色，不抢眼)。
-     */
-    private fun checkBoxRingOverride(name: String, drawable: Drawable): Drawable? {
-        if (!name.startsWith("qui_common_check_box")) return null
-        if (!name.contains("white_border")) return null
-        // 只处理"选择器"本身:checked/unchecked 子 vector 不叠加(它们由选择器统一覆盖)
-        if (name.contains("checked")) return null
-        return try {
-            val scheme = MonetPalette.palette(ThemeState.isNight(null, timClassLoader))
-            logOnce(
-                "check box ring override $name -> checked #" +
-                    Integer.toHexString(scheme.primary) + " / unchecked #" +
-                    Integer.toHexString(scheme.outline)
-            )
-            // 原选择器只有 state_enabled=true 两个分支(禁用态什么都不画),
-            // 叠加环也必须跟着禁用,否则禁用时会多出一圈圆环
-            val ring = android.graphics.drawable.StateListDrawable().apply {
-                addState(
-                    intArrayOf(android.R.attr.state_enabled, android.R.attr.state_checked),
-                    RingStrokeDrawable(scheme.primary)
-                )
-                addState(
-                    intArrayOf(android.R.attr.state_enabled),
-                    RingStrokeDrawable(scheme.outline)
-                )
-                addState(intArrayOf(), ColorDrawable(0))
-            }
-            LayerDrawable(arrayOf(drawable, ring))
-        } catch (t: Throwable) {
-            null
-        }
-    }
-
-    /** 只描一圈椭圆边、线宽 = bounds 宽度的 1/24(对应 TIM 原 vector:
-     *  viewport 48 上 strokeWidth 2，即 24dp 控件上的 1dp)。 */
-    private class RingStrokeDrawable(private val ringColor: Int) : Drawable() {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            color = ringColor
-        }
-        private val oval = android.graphics.RectF()
-
-        override fun draw(canvas: Canvas) {
-            val b = bounds
-            if (b.isEmpty) return
-            val w = b.width() / 24f
-            if (w <= 0f) return
-            paint.strokeWidth = w
-            val inset = w / 2f
-            oval.set(b.left + inset, b.top + inset, b.right - inset, b.bottom - inset)
-            canvas.drawOval(oval, paint)
-        }
-
-        override fun setAlpha(alpha: Int) {
-            paint.alpha = alpha
-        }
-
-        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {
-            paint.colorFilter = colorFilter
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
     }
 
     /** 兜底染色:图标整体染 onSurface(单色图形 SRC_IN 安全)。
