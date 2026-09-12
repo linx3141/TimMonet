@@ -39,8 +39,9 @@ TIM_4.1.0.apk
 # 恢复期中间产物
 recover_ref/
 
-# 误入库的编译产物解包目录
-com/
+# 误入库的编译产物解包目录(必须锚定仓库根: 裸 com/ 会连
+# app/src/main/java/com/... 下的新增源码一起忽略)
+/com/
 
 # 系统/编辑器杂项
 .DS_Store

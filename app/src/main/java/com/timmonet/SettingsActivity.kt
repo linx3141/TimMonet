@@ -25,7 +25,15 @@ class SettingsActivity : ComponentActivity() {
         RemoteSettingsWriter.init()
         var settings by mutableStateOf(TimMonetSettings.read(this))
         Log.i("TimMonetUI", "read settings: ${settings}")
-        RemoteSettingsWriter.push(settings)
+        // 本页可能在 TIM 进程内的入口里改过设置：远端更新就采用远端，
+        // 否则（首次）把本地值推上去。绝不能无条件 push 本地旧值。
+        RemoteSettingsWriter.syncOnBind(
+            localSettings = settings,
+            localRevision = TimMonetSettings.revision(this)
+        ) { remote ->
+            settings = remote
+            TimMonetSettings.write(this, remote)
+        }
 
         setContent {
             TimMonetTheme(appSettings = settings) {

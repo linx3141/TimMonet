@@ -86,4 +86,18 @@ object SettingsBridge {
             current
         }
     }
+
+    /**
+     * TIM 进程侧写远端 SharedPreferences（模块设置页在 TIM 进程内显示时用）。
+     * 改动会触发上面注册的监听器：配色相关改动按既有设计重启 TIM。
+     */
+    fun write(settings: AppSettings) {
+        val prefs = prefs ?: return
+        try {
+            TimMonetSettings.write(prefs, settings)
+            current = settings
+        } catch (t: Throwable) {
+            Log.e(TAG, "write remote settings failed", t)
+        }
+    }
 }

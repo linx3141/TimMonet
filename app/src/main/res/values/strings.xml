@@ -3,6 +3,10 @@
     <string name="app_name">TIM 莫奈取色</string>
     <string name="app_description">为 TIM（NT 架构）适配 Material You 取色</string>
 
+    <!-- 资源注入成功与否的自检标记：宿主进程注入模块资源后靠它比对(值必须与
+         ModuleResources.MARKER 一致) -->
+    <string name="module_res_marker" translatable="false">TimMonet</string>
+
     <string name="settings_theme">主题</string>
     <string name="settings_color_style">色彩风格</string>
     <string name="settings_color_spec">色彩标准</string>

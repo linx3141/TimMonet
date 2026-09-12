@@ -76,6 +76,17 @@ object TimMonetSettings {
             .apply()
     }
 
+    /**
+     * 设置修订时间戳（每次写入刷新）。
+     *
+     * 模块设置页可能在两处被打开（TIM 进程内的入口 / 模块 app 自己的 Activity），
+     * 两边共用远端 prefs，靠这个时间戳决定谁是最新、避免用旧值把新值推回去。
+     */
+    fun revision(context: Context): Long =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getLong(KEY_REVISION, 0L)
+
+    fun revision(prefs: SharedPreferences): Long = prefs.getLong(KEY_REVISION, 0L)
+
     /** 序列化为 key=value 行文本，供 ContentProvider 跨进程传输。 */
     fun serialize(context: Context): String {
         val settings = read(context)

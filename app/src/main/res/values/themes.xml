@@ -6,4 +6,28 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
+
+    <!-- TIM 进程内显示设置面板用的全屏 Dialog 主题：
+         关键是 windowIsFloating=false —— Dialog 默认是浮动窗口，窗口管理器会把
+         浮动窗口避开状态栏/导航栏（decor 高度只有屏幕高减去两条系统栏），
+         结果就是"不沉浸"。 -->
+    <style name="Theme.TimMonet.Dialog" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <!-- 窗口级动画对"非浮动 Dialog 窗口"不生效(实测无动画)，进出动画改成
+             代码里对内容视图做(ViewPropertyAnimator)，见 SettingsDialogHost -->
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
+    <!-- 保留动画资源定义，供内容视图动画复用(Animation.TimMonet.Panel 里的
+         windowEnter/ExitAnimation 与代码里用的时长/曲线一致) -->
+    <style name="Animation.TimMonet.Panel" parent="@android:style/Animation.Activity">
+        <item name="android:windowEnterAnimation">@anim/tim_monet_panel_in</item>
+        <item name="android:windowExitAnimation">@anim/tim_monet_panel_out</item>
+    </style>
 </resources>

@@ -31,4 +31,9 @@
         </activity>
 
     </application>
+
+    <!-- 让本模块能看见宿主(反向的包可见性，用于宿主/模块之间的常规查询) -->
+    <queries>
+        <package android:name="com.tencent.tim" />
+    </queries>
 </manifest>

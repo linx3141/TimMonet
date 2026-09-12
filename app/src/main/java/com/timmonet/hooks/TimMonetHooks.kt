@@ -1,6 +1,7 @@
 package com.timmonet.hooks
 
 import android.content.Context
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.content.res.Resources
 import android.content.res.TypedArray
@@ -270,6 +271,155 @@ object TimMonetHooks {
         hookAlbumTimelineText(module, classLoader)
         hookForceLight(module, classLoader)
         hookResumeRefresh(module, classLoader)
+        hookSettingEntry(module, classLoader)
+    }
+
+    // ------------------------------------------------------------------
+    // 设置页入口(仿 QAuxiliary)
+    //
+    // TIM 设置主页(MainSettingFragment)的列表来自 MainSettingConfigProvider.d(Context):
+    // 返回的 List 每一项(processor.c)就是一张卡片,所以"追加一张只含我们一个条目的
+    // 卡片"天然就是单独一块、和别的卡片不相连。位置照 QAuxiliary 放在 index 1
+    // (第一张卡之后)。item/Group 的类型不写死混淆名,而是从返回值里取实际类型。
+    // ------------------------------------------------------------------
+
+    private const val MODULE_PACKAGE = "io.github.linx3141.timmonet"
+    private const val MODULE_SETTINGS_CLASS = "com.timmonet.SettingsActivity"
+
+    /** 入口条目的 id(processor.e())。TIM 里没有 setting2Activity_settingEntryItem,
+     *  取一个远离现有 id(1/2/3/7/15/17…)的值,避免被 SettingConfigProvider.b(int) 误命中。 */
+    private const val SETTING_ENTRY_ID = 0x7F0F0101
+
+    private fun hookSettingEntry(module: XposedModule, cl: ClassLoader) {
+        val providerCls = runCatching {
+            Class.forName("com.tencent.mobileqq.setting.main.MainSettingConfigProvider", false, cl)
+        }.getOrNull() ?: return
+        val method = runCatching {
+            providerCls.getDeclaredMethod("d", Context::class.java)
+        }.getOrNull() ?: return
+        logOnce("hook installed: MainSettingConfigProvider.d (module setting entry)")
+        runCatching { module.deoptimize(method) }
+        module.hook(method).intercept { chain ->
+            val result = chain.proceed()
+            val list = result as? MutableList<*>
+            val ctx = chain.getArg(0) as? Context
+            if (list != null && ctx != null) {
+                try {
+                    injectSettingEntry(list, ctx, cl)
+                } catch (t: Throwable) {
+                    logOnce("setting entry inject failed: ${t.javaClass.simpleName} ${t.message}")
+                }
+            }
+            result
+        }
+    }
+
+    private fun injectSettingEntry(list: MutableList<*>, ctx: Context, cl: ClassLoader) {
+        @Suppress("UNCHECKED_CAST")
+        val groups = list as MutableList<Any?>
+        val firstGroup = groups.firstOrNull() ?: return
+        val groupCls = firstGroup.javaClass
+        // processor.c.b() = 这一组的 processor 列表,拿它取到条目类型(抗混淆)
+        val processors = runCatching {
+            groupCls.getMethod("b").invoke(firstGroup) as? List<*>
+        }.getOrNull() ?: return
+        val itemCls = processors.firstOrNull()?.javaClass ?: return
+        val itemCtor = itemCls.getConstructor(
+            Context::class.java,
+            Int::class.javaPrimitiveType,
+            CharSequence::class.java,
+            Int::class.javaPrimitiveType
+        )
+        // 点击回调:processor.g.d(Context, int, CharSequence, int) 内部是 Function0
+        val setClick = itemCls.methods.firstOrNull {
+            it.returnType == Void.TYPE && it.parameterTypes.size == 1 &&
+                it.parameterTypes[0].name == "kotlin.jvm.functions.Function0"
+        } ?: return
+        val res = ctx.resources
+        val pkg = ctx.packageName
+        // 图标用宿主自己的资源(模块资源 id 在宿主 Resources 里解析不了):
+        // qui_fill_color = 颜料滴,和"莫奈取色"语义最贴
+        val iconRes = res.getIdentifier("qui_fill_color", "drawable", pkg)
+        val entry = itemCtor.newInstance(ctx, SETTING_ENTRY_ID, "TimMonet", iconRes)
+        settingEntryClickHandler(cl, ctx)?.let { runCatching { setClick.invoke(entry, it) } }
+        val group = runCatching {
+            groupCls.getConstructor(
+                List::class.java, CharSequence::class.java, CharSequence::class.java
+            ).newInstance(listOf(entry), "", "")
+        }.getOrElse {
+            // 新版是合成构造器 (List, CharSequence, CharSequence, int, DefaultConstructorMarker)
+            val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker", false, cl)
+            groupCls.getConstructor(
+                List::class.java, CharSequence::class.java, CharSequence::class.java,
+                Int::class.javaPrimitiveType, marker
+            ).newInstance(listOf(entry), "", "", 6, null)
+        }
+        val index = minOf(1, groups.size)
+        groups.add(index, group)
+        logOnce("setting entry injected at index $index, groups=${groups.size}")
+        // 诊断:逐组打印条目数与 processor id(我们的入口 id 是 SETTING_ENTRY_ID),
+        // 便于核对入口在设置页里的实际位置
+        runCatching {
+            val summary = groups.mapIndexed { i, g ->
+                val items = g?.javaClass?.getMethod("b")?.invoke(g) as? List<*>
+                val ids = items?.map { p ->
+                    runCatching { p?.javaClass?.getMethod("e")?.invoke(p) as? Int }.getOrNull()
+                }
+                "$i:n=${items?.size ?: -1}$ids"
+            }
+            logOnce("setting groups = $summary")
+        }
+    }
+
+    /** 造一个宿主进程里的 kotlin.jvm.functions.Function0,invoke() 时打开模块设置页。 */
+    private fun settingEntryClickHandler(hostCl: ClassLoader, ctx: Context): Any? {
+        val function0 = runCatching {
+            hostCl.loadClass("kotlin.jvm.functions.Function0")
+        }.getOrNull() ?: return null
+        val unit = runCatching {
+            hostCl.loadClass("kotlin.Unit").getField("INSTANCE").get(null)
+        }.getOrNull()
+        return try {
+            java.lang.reflect.Proxy.newProxyInstance(hostCl, arrayOf(function0)) { proxy, method, args ->
+                when (method.name) {
+                    "invoke" -> {
+                        openModuleSettings(ctx)
+                        unit
+                    }
+                    "toString" -> "TimMonetSettingEntry"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.firstOrNull()
+                    else -> null
+                }
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** 打开模块设置页。
+     *
+     *  Android 11+ 的包可见性把宿主对我们 app 的跨包访问全拦了：实测显式
+     *  startActivity 报 START_CLASS_NOT_FOUND、我们自己的 provider 报
+     *  Unknown authority（同一组件用 adb shell 起是正常的）。所以主路径改成
+     *  "在宿主进程里直接显示设置页"（QAuxiliary/TAssistant 也是把界面跑在宿主
+     *  进程里），跨包启动只作为兜底。
+     */
+    private fun openModuleSettings(ctx: Context) {
+        if (com.timmonet.ui.SettingsDialogHost.show(ctx)) {
+            logOnce("module settings shown in host process")
+            return
+        }
+        try {
+            val intent = Intent().apply {
+                setClassName(MODULE_PACKAGE, MODULE_SETTINGS_CLASS)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(intent)
+            logOnce("module settings opened via startActivity fallback")
+        } catch (t: Throwable) {
+            logOnce("open module settings failed: ${t.javaClass.simpleName} ${t.message}")
+        }
     }
 
     private var sltvIconLogCount = 0
@@ -7116,6 +7266,8 @@ private fun hookSummaryBadge(module: XposedModule) {
         if (isWalletUIActive()) return drawable
         // 图片编辑/浏览页同上:用户内容配色优先
         if (isMediaEditorActive()) return drawable
+        // 相册/预览页选择控件(QUICheckBox)最外那圈白描边:见 checkBoxRingOverride
+        checkBoxRingOverride(name, drawable)?.let { return it }
         // 文件气泡圆形操作按钮（下载 lbb / 暂停 lbd / 发送取消 lbc）：
         // 矢量“白圆+深色图形”，SRC_IN 单色会毁掉双色，必须栅格化双簇重染
         if (name == "lbb" || name == "lbd" || name == "lbc") {
@@ -7349,6 +7501,82 @@ private fun hookSummaryBadge(module: XposedModule) {
         return l.contains("icon") || l.startsWith("chat_tool") ||
             l.contains("_ic") || l.startsWith("qui_") ||
             l.contains("seleter") || l.contains("selector")
+    }
+
+    /** 选择控件(QUICheckBox)最外那圈白描边的莫奈化。
+     *
+     *  TIM 的 qui_common_check_box*white_border 选择器里，选中态是 vector
+     *  (fill=@color/qui_button_bg_primary_default、stroke=@color/qui_common_icon_white)，
+     *  未选中态是 fill=#4d000000 的同款白描边圆。填充已经按资源名映射成
+     *  primary，但外圈那道白边在深浅两态下都保持纯白，和莫奈配色割裂。
+     *
+     *  这里不去改 vector 内部(反射改 mStrokeColor 太脆)，而是在原 drawable
+     *  之上叠一圈描边把白圈盖掉：线宽按原 vector 的比例(viewport 48 /
+     *  strokeWidth 2 = 控件宽的 1/24)随控件尺寸缩放，半径与原白圈完全重合。
+     *  于是选中态描边 = primary(与填充同色，视觉统一)，未选中态描边 =
+     *  outline(中性莫奈色，不抢眼)。
+     */
+    private fun checkBoxRingOverride(name: String, drawable: Drawable): Drawable? {
+        if (!name.startsWith("qui_common_check_box")) return null
+        if (!name.contains("white_border")) return null
+        // 只处理"选择器"本身:checked/unchecked 子 vector 不叠加(它们由选择器统一覆盖)
+        if (name.contains("checked")) return null
+        return try {
+            val scheme = MonetPalette.palette(ThemeState.isNight(null, timClassLoader))
+            logOnce(
+                "check box ring override $name -> checked #" +
+                    Integer.toHexString(scheme.primary) + " / unchecked #" +
+                    Integer.toHexString(scheme.outline)
+            )
+            // 原选择器只有 state_enabled=true 两个分支(禁用态什么都不画),
+            // 叠加环也必须跟着禁用,否则禁用时会多出一圈圆环
+            val ring = android.graphics.drawable.StateListDrawable().apply {
+                addState(
+                    intArrayOf(android.R.attr.state_enabled, android.R.attr.state_checked),
+                    RingStrokeDrawable(scheme.primary)
+                )
+                addState(
+                    intArrayOf(android.R.attr.state_enabled),
+                    RingStrokeDrawable(scheme.outline)
+                )
+                addState(intArrayOf(), ColorDrawable(0))
+            }
+            LayerDrawable(arrayOf(drawable, ring))
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** 只描一圈椭圆边、线宽 = bounds 宽度的 1/24(对应 TIM 原 vector:
+     *  viewport 48 上 strokeWidth 2，即 24dp 控件上的 1dp)。 */
+    private class RingStrokeDrawable(private val ringColor: Int) : Drawable() {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = ringColor
+        }
+        private val oval = android.graphics.RectF()
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            if (b.isEmpty) return
+            val w = b.width() / 24f
+            if (w <= 0f) return
+            paint.strokeWidth = w
+            val inset = w / 2f
+            oval.set(b.left + inset, b.top + inset, b.right - inset, b.bottom - inset)
+            canvas.drawOval(oval, paint)
+        }
+
+        override fun setAlpha(alpha: Int) {
+            paint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {
+            paint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
     }
 
     /** 兜底染色:图标整体染 onSurface(单色图形 SRC_IN 安全)。
