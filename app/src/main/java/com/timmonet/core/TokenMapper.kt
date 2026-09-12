@@ -101,23 +101,47 @@ object TokenMapper {
         return result
     }
 
+    /**
+     * TIM 品牌蓝（精确常量；取自 TIM 资源与 token dump 的 brand / 选中态）。
+     *
+     * 自己发送的气泡就是 primary，因此这些品牌底在**两种主题下**都必须映射成
+     * primary：相册选中图片的圆形序号底、预览页"原图"勾选底等。
+     * 注意这是"精确常量匹配"，不是按色相/明度猜主色。
+     */
+    val BRAND_BLUES = setOf(
+        0xFF0099FF.toInt(), // button_bg_primary_default / bubble_host_bottom / brand_standard
+        0xFF1E6FFE.toInt(),
+        0xFF2D77E5.toInt(),
+        0xFF4D94FF.toInt(),
+        0xFF12B7F5.toInt()
+    )
+
+    /** 品牌蓝（含半透明变体）-> primary，保留原 alpha；非品牌蓝返回 null。 */
+    private fun brandBlueRole(color: Int, scheme: DynamicScheme): Int? {
+        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        if (opaque !in BRAND_BLUES) return null
+        val alpha = color ushr 24
+        return (scheme.primary and 0x00FFFFFF) or (alpha shl 24)
+    }
+
     private fun computeInlineBgColor(color: Int, dark: Boolean): Int? {
         val alpha = color ushr 24
         if (alpha == 0) return null
         val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
         val scheme = MonetPalette.palette(dark)
         return try {
+            // 位图/代码创建的品牌底没有资源名可依据(相册选中序号是烤进位图的
+            // #0099FF，QUICheckBox 的圆底是代码设的 drawable)，只能按精确常量
+            // 识别成 primary；否则它们会一直是 TIM 蓝，与自己气泡不同色
+            brandBlueRole(color, scheme)?.let { return it }
             val hct = Hct.fromInt(opaque)
             val role = when {
+                // 只做"白/浅灰 -> 卡片面"这一档明确映射(内联背景色没有
+                // 资源名可依据);不再按色相猜测主色,避免把彩色元素当品牌色染
                 hct.chroma < 8.0 -> when {
                     hct.tone < 60.0 -> return null
-                    // 中浅灰/近白（60~100）都是卡片/占位底，统一染成比页面
-                    // 浅一档的 surfaceBright；页面级底色由 bg_page 等
-                    // 名字规则显式控制，不依赖颜色猜测。
-                    hct.tone < 100.0 -> Role.BG_CARD
                     else -> Role.BG_CARD
                 }
-                hct.hue in 190.0..265.0 && hct.chroma >= 24.0 -> Role.PRIMARY
                 else -> return null
             }
             val mapped = resolve(role, opaque, scheme)
@@ -143,6 +167,8 @@ object TokenMapper {
         if (alpha == 0) return color
         val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
         return try {
+            // 精确品牌蓝 -> primary(与内联背景色、文字色路径保持同一规则)
+            brandBlueRole(color, scheme)?.let { return it }
             val hct = Hct.fromInt(opaque)
             val mapped = when {
                 hct.chroma < 8.0 -> {
@@ -151,8 +177,7 @@ object TokenMapper {
                     if (tone < 4.0 || tone > 96.0) return color
                     grayToRole(tone, scheme)
                 }
-                hct.hue in 190.0..265.0 && hct.chroma >= 24.0 ->
-                    if (hct.tone < 18.0) scheme.onSurface else scheme.primary
+                // 不再按色相把彩色猜成主色(会误染彩色元素)
                 else -> return color
             }
             (mapped and 0x00FFFFFF) or (alpha shl 24)
@@ -170,6 +195,14 @@ object TokenMapper {
         tone <= 87.0 -> MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
         else -> MonetPalette.amoledBlack(scheme.surfaceContainer)
     }
+
+    /** 文字/前景类角色:统一不透明(消除 TIM 次要文字自带的 #8C 等 alpha)。 */
+    private val TEXT_ROLES = setOf(
+        Role.ON_SURFACE,
+        Role.ON_SURFACE_VARIANT,
+        Role.ON_PRIMARY,
+        Role.ON_PRIMARY_CONTAINER
+    )
 
     /** AMOLED 黑模式下要整体压成纯黑的“表面/背景”角色（文字/图标角色不在内）。 */
     private val AMOLED_SURFACES = setOf(
@@ -230,7 +263,11 @@ object TokenMapper {
             Role.OUTLINE -> scheme.outline
             Role.OUTLINE_VARIANT -> scheme.outlineVariant
         }
-        return (c and 0x00FFFFFF) or (alpha shl 24)
+        // 文字/前景类角色强制不透明:TIM 的次要文字色自带 alpha(实测
+        // "我的"页说明文字映射后为 #8C87B0CC,alpha=140),保留下来在深色
+        // 主题里显得暗淡。背景类仍保留原 alpha(半透明蒙层是设计需要)。
+        val outAlpha = if (role in TEXT_ROLES) 0xFF else alpha
+        return (c and 0x00FFFFFF) or (outAlpha shl 24)
     }
 
     private fun roleOf(name: String): Role? {
