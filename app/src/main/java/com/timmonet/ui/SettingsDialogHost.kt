@@ -9,7 +9,6 @@ import android.util.Log
 import android.view.ViewGroup
 import android.view.Window
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.luminance
@@ -63,6 +62,8 @@ class SettingsDialogHost private constructor(
 
     private var dismissing = false
 
+    private var slideStarted = false
+
     override val lifecycle: Lifecycle get() = lifecycleRegistry
 
     override val viewModelStore: ViewModelStore get() = store
@@ -95,28 +96,27 @@ class SettingsDialogHost private constructor(
                                     isAppearanceLightNavigationBars = !darkPanel
                                 }
                         }
-                        key(settings) {
-                            ThemeScreen(
-                                colorMode = settings.colorMode,
-                                keyColor = settings.keyColor,
-                                paletteStyle = settings.paletteStyle,
-                                colorSpec = settings.colorSpec,
-                                onBack = { dismiss() },
-                                onSetKeyColor = { update(settings.copy(keyColor = it)) },
-                                onSetColorMode = { mode: ColorMode ->
-                                    update(settings.copy(colorMode = mode))
-                                },
-                                onSetColorStyle = { name ->
-                                    runCatching { PaletteStyle.valueOf(name) }.getOrNull()
-                                        ?.let { update(settings.copy(paletteStyle = it)) }
-                                },
-                                onSetColorSpec = { name ->
-                                    runCatching {
-                                        ColorSpec.SpecVersion.valueOf(name)
-                                    }.getOrNull()?.let { update(settings.copy(colorSpec = it)) }
-                                },
-                            )
-                        }
+                                                ThemeScreen(
+                            colorMode = settings.colorMode,
+                            keyColor = settings.keyColor,
+                            paletteStyle = settings.paletteStyle,
+                            colorSpec = settings.colorSpec,
+                            onBack = { dismiss() },
+                            onSetKeyColor = { update(settings.copy(keyColor = it)) },
+                            onSetColorMode = { mode: ColorMode ->
+                                update(settings.copy(colorMode = mode))
+                            },
+                            onSetColorStyle = { name ->
+                                runCatching { PaletteStyle.valueOf(name) }.getOrNull()
+                                    ?.let { update(settings.copy(paletteStyle = it)) }
+                            },
+                            onSetColorSpec = { name ->
+                                runCatching {
+                                    ColorSpec.SpecVersion.valueOf(name)
+                                }.getOrNull()?.let { update(settings.copy(colorSpec = it)) }
+                            },
+                        )
+                    
                     }
                 }
             }
@@ -176,33 +176,55 @@ class SettingsDialogHost private constructor(
             super.dismiss()
             return
         }
+        // 与 QAuxiliary/TAssistant 那种"真页面"一致：向右推出、露出宿主
         view.animate()
-            .alpha(0f)
-            .scaleX(0.94f)
-            .scaleY(0.94f)
+            .translationX(screenWidth().toFloat())
             .setDuration(EXIT_MS)
-            .setInterpolator(android.view.animation.PathInterpolator(0.3f, 0f, 0.8f, 0.15f))
+            .setInterpolator(android.view.animation.PathInterpolator(0.4f, 0f, 1f, 1f))
             .withEndAction { super.dismiss() }
             .start()
         // 动画被系统打断(视图移除)时兜底关掉，避免面板卡住
         view.postDelayed({ runCatching { super.dismiss() } }, EXIT_MS + 120L)
     }
 
-    /** 进场：Material Z 轴(淡入 + 0.94->1.0 缩放)。 */
+    /**
+     * 进场：从屏幕右侧整屏推入（侧边覆盖式，和 TIM 真页面/QAuxiliary/TAssistant
+     * 的转场同款）。要点有两个：
+     * 1. 首帧绘制前先把面板整体摆到屏幕右侧，否则第一帧就"已经到位"，看不到推入；
+     * 2. 不能依赖 viewTreeObserver 的 preDraw —— 视图还没 attach 时注册的监听器
+     *    会随 observer 一起被换掉，动画永远不开始，表现就是"弹出一个全透明层、
+     *    点哪都没反应、返回才恢复"。这里改用 postOnAnimation + postDelayed 兜底，
+     *    先到先得且幂等，保证动画一定会跑。
+     */
     private fun animateIn() {
         val view = contentView ?: return
-        view.alpha = 0f
-        view.scaleX = 0.94f
-        view.scaleY = 0.94f
+        view.translationX = screenWidth().toFloat()
+        view.alpha = 1f
+        view.postOnAnimation { slideIn(view) }
+        view.postDelayed({ slideIn(view) }, 100L)
+        // 最后兜底：万一回调都没跑到，也不能留下"透明层挡着点击"的状态
+        view.postDelayed({
+            if (!dismissing && view.translationX != 0f) {
+                view.animate().cancel()
+                view.translationX = 0f
+                Log.w(TAG, "panel slide-in watchdog: snap into place")
+            }
+        }, 1000L)
+    }
+
+    /** 幂等：无论从哪条路先到，只启动一次推入动画。 */
+    private fun slideIn(view: android.view.View) {
+        if (slideStarted || dismissing) return
+        slideStarted = true
         view.animate()
-            .alpha(1f)
-            .scaleX(1f)
-            .scaleY(1f)
+            .translationX(0f)
             .setDuration(ENTER_MS)
             .setInterpolator(android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f))
             .start()
-        Log.i(TAG, "panel animate in (${ENTER_MS}ms)")
+        Log.i(TAG, "panel slide in (${ENTER_MS}ms)")
     }
+
+    private fun screenWidth(): Int = context.resources.displayMetrics.widthPixels
 
     override fun onStop() {
         super.onStop()
@@ -220,9 +242,9 @@ class SettingsDialogHost private constructor(
 
         private const val TAG = "TimMonet"
 
-        /** 与 res/anim/tim_monet_panel_in|out.xml 里的时长保持一致。 */
-        private const val ENTER_MS = 220L
-        private const val EXIT_MS = 160L
+        /** 侧边推入/推出的时长，接近 TIM 真页面的 activity 转场。 */
+        private const val ENTER_MS = 260L
+        private const val EXIT_MS = 240L
 
         /** 从任意 Context 里找出宿主 Activity。 */
         fun findActivity(context: Context?): Activity? {

@@ -1362,6 +1362,10 @@ private fun isPanelDrawable(drawable: Drawable?): Boolean =
 private val drawableNameMemo =
     java.util.Collections.synchronizedMap(java.util.WeakHashMap<Drawable, String>())
 
+/** drawable 的 constantState 身份 → 资源名（复制品共享 constantState，用于兜底查名）。 */
+private val drawableStateNameMemo =
+    java.util.concurrent.ConcurrentHashMap<Int, String>()
+
 
 /** 群聊头衔徽标(群主/管理员,TroopMemberLevelView2):
  *  徽标是自绘的(背景 drawable + 等级图 + 数字图 + VIP 动态特效),
@@ -2677,6 +2681,357 @@ private fun hookAioReply(module: XposedModule, cl: ClassLoader) {
     }
 }
 
+/** 引用区里的跳转箭头(按 drawable 名含 arrow 判定)统一成引用文字色。 */
+/** 引用块根视图。
+ *
+ *  AIOReplyComponent.V1() 返回的是引用**内容文字**那个 AIOMsgTextView（5p.xml 里的 s2k），
+ *  而跳转箭头是它的兄弟/父级（ReplyTextRelativeLayout 那一层）里的图标，所以在
+ *  V1() 里遍历永远找不到。这里往上找带 Reply 的祖先（找不到就退 2 层）。
+ */
+private fun replyBlockRoot(view: View): View {
+    var current: View = view
+    repeat(4) {
+        val parent = current.parent as? View ?: return current
+        current = parent
+        val name = current.javaClass.name
+        if (name.contains("Reply", ignoreCase = true)) return current
+        if (name.contains("RecyclerView")) return view
+    }
+    return current
+}
+
+/** 把颜色写到这条祖先链上**所有**含 Reply 的容器，而不是只写最外层那一个。
+ *
+ *  recolorReplyText 是从引用文字往上找块，setImageDrawable 是从箭头往上找块，
+ *  两边的层数/起点不同，写一个 key 很容易对不上(对不上就每次都读不到颜色 →
+ *  箭头只能等补帧 → 闪)。全链写入后，读取端爬到哪一层都能拿到。 */
+private fun stashReplyBlockColor(view: View, color: Int) {
+    var cur: View? = view
+    var hops = 0
+    while (cur != null && hops < 16) {
+        val name = cur.javaClass.name
+        if (name.contains("RecyclerView")) break
+        if (name.contains("Reply", ignoreCase = true)) replyBlockColors[cur] = color
+        cur = cur.parent as? View
+        hops++
+    }
+}
+
+/** 从引用区子视图往上找已记过颜色的引用块；返回 (块, 颜色)。 */
+private fun replyBlockColorOf(view: View): Pair<View, Int>? {
+    var cur: View? = view
+    var hops = 0
+    while (cur != null && hops < 16) {
+        val name = cur.javaClass.name
+        if (name.contains("RecyclerView")) break
+        if (name.contains("Reply", ignoreCase = true)) {
+            val c = replyBlockColors[cur]
+            if (c != null) return cur to c
+        }
+        cur = cur.parent as? View
+        hops++
+    }
+    return null
+}
+
+/** 最近的含 Reply 祖先（用于没记过颜色时按气泡判侧别）。 */
+private fun replyBlockAncestor(view: View): View? {
+    var cur: View? = view
+    var hops = 0
+    while (cur != null && hops < 16) {
+        val name = cur.javaClass.name
+        if (name.contains("RecyclerView")) return null
+        if (name.contains("Reply", ignoreCase = true)) return cur
+        cur = cur.parent as? View
+        hops++
+    }
+    return null
+}
+
+private fun recolorReplyJumpIcon(view: View, color: Int) {
+    logReplyIconInventory(view)
+    stashReplyBlockColor(view, color)
+    applyReplyJumpIcon(view, color, "now")
+    // 引用区里有几个 ImageView 在我们跑的时候 drawable 还是 null(TIM 后面才
+    // setImageResource，加载时又被图标兜底染成 onSurface)，所以再补一帧。
+    // 只补一次，不做轮询/重试。
+    runCatching {
+        view.post {
+            runCatching { applyReplyJumpIcon(view, color, "post") }
+        }
+    }
+}
+
+/** 给引用区里"跳转箭头"类的图标上色。reason 仅用于日志。 */
+private fun applyReplyJumpIcon(view: View, color: Int, reason: String) {
+    var applied = 0
+    try {
+        walkViewTree(view, 200) { v ->
+            when (v) {
+                is ImageView -> {
+                    val d = v.drawable ?: return@walkViewTree
+                    if (isJumpArrowDrawable(d, v)) {
+                        runCatching {
+                            val replaced = rasterizeIconColor(d, color)
+                            if (replaced != null) {
+                                replyTintedDrawables[replaced] = true
+                                v.setImageDrawable(replaced)
+                            } else {
+                                setJumpArrowColor(d, color)
+                            }
+                            v.alpha = 1f
+                            v.invalidate()
+                            applied++
+                        }
+                    }
+                }
+                is TextView -> {
+                    var changed = false
+                    v.compoundDrawables.forEach { d ->
+                        if (d != null && isJumpArrowDrawable(d, v)) {
+                            runCatching {
+                                setJumpArrowColor(d, color)
+                                changed = true
+                            }
+                        }
+                    }
+                    if (changed) {
+                        v.invalidate()
+                        applied++
+                    }
+                }
+                else -> Unit
+            }
+        }
+    } catch (t: Throwable) {
+        // ignore
+    }
+    if (applied > 0 && replyArrowLogCount++ < 40) {
+        Log.i(
+            TAG,
+            "reply jump icon tinted($reason) -> #" + Integer.toHexString(color) + " x" + applied
+        )
+    }
+}
+
+/** 引用块视图 → 该引用块的文字色（由 recolorReplyText 填，供 setImageDrawable
+ *  那一刻立刻上色用，避免等补帧时闪一帧原色）。 */
+private val replyBlockColors =
+    java.util.Collections.synchronizedMap(java.util.WeakHashMap<View, Int>())
+
+/** 我们自己栅格化出来的箭头位图 —— 防止 setImageDrawable hook 递归处理自己。 */
+private val replyTintedDrawables =
+    java.util.Collections.synchronizedMap(java.util.WeakHashMap<Drawable, Boolean>())
+
+private var replyIconSetLogCount = 0
+
+/** 在 setImageDrawable 那一刻推引用块该用什么色：与 recolorReplyText 同一套判定 ——
+ *  AMOLED 统一 onSurface；否则按气泡背景判自方(primary 气泡 → onPrimary)/
+ *  对方(surface 系 → onSurface)。不是猜色，判不出来返回 null。 */
+private fun inferReplyColor(block: View): Int? = try {
+    val cl = block.context?.classLoader
+    val scheme = MonetPalette.palette(ThemeState.isNight(null, cl))
+    if (MonetPalette.isAmoled()) {
+        scheme.onSurface
+    } else {
+        when (bubbleHost(block, scheme)) {
+            true -> scheme.onPrimary
+            false -> scheme.onSurface
+            null -> null
+        }
+    }
+} catch (t: Throwable) {
+    null
+}
+
+/** setImageDrawable 时就把引用跳转箭头换成目标色。@return true 表示已处理 */
+private fun handleReplyJumpIcon(view: ImageView, drawable: Drawable): Boolean {
+    val block = replyBlockAncestor(view) ?: return false
+    // ① 引用块文字色已经算过 → 直接用它；② 还没算过 → 用气泡背景判侧别
+    // (与 recolorReplyText 同一套判定)；③ 连侧别都判不出来才先隐藏，等那遍上色。
+    val known = replyBlockColorOf(view)
+    val stash = known?.second
+    val color = stash ?: inferReplyColor(known?.first ?: block)
+    if (color == null) {
+        view.alpha = 0f
+        view.postDelayed({
+            runCatching { if (view.alpha == 0f) view.alpha = 1f }
+        }, 200L)
+        if (replyIconSetLogCount++ < 40) {
+            Log.i(
+                TAG,
+                "reply icon set hidden(no color) block=" + block.javaClass.simpleName +
+                    " w=" + view.width + " h=" + view.height
+            )
+        }
+        return true
+    }
+    val replaced = rasterizeIconColor(drawable, color)
+    if (replaced != null) {
+        replyTintedDrawables[replaced] = true
+        view.setImageDrawable(replaced)
+        view.alpha = 1f
+    }
+    if (replyIconSetLogCount++ < 40) {
+        Log.i(
+            TAG,
+            "reply icon set block=" + block.javaClass.simpleName +
+                " from=" + (if (stash != null) "stash" else "bubble") +
+                " -> #" + Integer.toHexString(color) + " ok=" + (replaced != null)
+        )
+    }
+    return true
+}
+
+/** 把图标栅格化成"指定色 + 保留原 alpha/明暗"的新位图 drawable。
+ *
+ *  引用区的跳转箭头是皮肤位图(qui_tui_icon_set_top_tiny_allwhite_primary，
+ *  带 allwhite 令牌)，皮肤引擎会在**绘制时**按令牌重新上色，所以只改 drawable
+ *  内部 Paint 会被盖掉 —— 换成我们自己生成的位图后就没有人能再改它了
+ *  (面板图标当初也是这么处理的)。 */
+private fun rasterizeIconColor(drawable: Drawable, color: Int): Drawable? {
+    return try {
+        var iw = drawable.intrinsicWidth
+        var ih = drawable.intrinsicHeight
+        if (iw <= 0 || ih <= 0) {
+            val b = drawable.bounds
+            iw = b.width()
+            ih = b.height()
+        }
+        if (iw <= 0 || ih <= 0 || iw > 240 || ih > 240) return null
+        val bmp = Bitmap.createBitmap(iw, ih, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val saved = Rect(drawable.bounds)
+        drawable.setBounds(0, 0, iw, ih)
+        drawable.draw(canvas)
+        drawable.bounds = saved
+        val px = IntArray(iw * ih)
+        bmp.getPixels(px, 0, iw, 0, 0, iw, ih)
+        var core = 0
+        for (i in px.indices) {
+            val a = (px[i] ushr 24) and 0xFF
+            if (a < 8) {
+                px[i] = 0
+                continue
+            }
+            core++
+            val src = px[i]
+            val lum = (((src ushr 16) and 0xFF) * 299 + ((src ushr 8) and 0xFF) * 587 +
+                (src and 0xFF) * 114) / 1000
+            val k = 0.35f + 0.65f * (lum / 255f)
+            val r = (((color ushr 16) and 0xFF) * k).toInt().coerceIn(0, 255)
+            val g = (((color ushr 8) and 0xFF) * k).toInt().coerceIn(0, 255)
+            val b = ((color and 0xFF) * k).toInt().coerceIn(0, 255)
+            px[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        if (core < 4) return null
+        val out = Bitmap.createBitmap(iw, ih, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, iw, 0, 0, iw, ih)
+        BitmapDrawable(Resources.getSystem(), out)
+    } catch (t: Throwable) {
+        null
+    }
+}
+
+/** 给跳转箭头上色。
+ *
+ *  注意 TIM 的皮肤位图 drawable(SkinnableBitmapDrawable) 的着色落在内部
+ *  Paint.colorFilter 上（我们的图标兜底就是这么染的），只调 setTint 盖不掉，
+ *  所以这里优先改内部 Paint，其次才退回 setTint + setColorFilter。
+ */
+private fun setJumpArrowColor(d: Drawable, color: Int) {
+    val state = runCatching {
+        d.javaClass.getDeclaredField("mBitmapState").also { it.isAccessible = true }.get(d)
+    }.getOrNull()
+    if (state != null) {
+        val paint = runCatching {
+            state.javaClass.getDeclaredField("mPaint").also { it.isAccessible = true }
+                .get(state) as? Paint
+        }.getOrNull()
+        if (paint != null) {
+            paint.colorFilter = PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN)
+            d.invalidateSelf()
+            return
+        }
+    }
+    d.mutate()
+    d.setTint(color)
+    d.setColorFilter(color, PorterDuff.Mode.SRC_IN)
+}
+
+/** 跳转箭头判定。
+ *
+ *  只按资源名不可靠：drawableNameMemo 是按 drawable **实例**登记的，而 TIM 的
+ *  皮肤引擎常常把 drawable 复制一份再交给 ImageView，身份就对不上了。
+ *  所以：名字拿得到就按名字（含 arrow 命中、图片类排除），拿不到就按尺寸 ——
+ *  引用区里 16dp 级别的小图标就是跳转箭头，引用缩略图要大得多。
+ */
+private fun isJumpArrowDrawable(d: Drawable, host: View?): Boolean {
+    if (replyTintedDrawables.containsKey(d)) return false // 已是我们生成的位图
+    val name = drawableNameMemo[d] ?: runCatching {
+        d.constantState?.let { drawableStateNameMemo[System.identityHashCode(it)] }
+    }.getOrNull()
+    if (name != null) {
+        if (name.contains("arrow") || name.contains("set_top")) return true
+        if (name.contains("pic") || name.contains("photo") || name.contains("thumb") ||
+            name.contains("cover") || name.contains("avatar") || name.contains("emoji") ||
+            name.contains("face") || name.contains("bubble")
+        ) {
+            return false
+        }
+    }
+    val view = host ?: return false
+    // 引用区里名字拿不到的其它图片控件(缩略图/气泡底图)不要当成箭头
+    val hostName = view.javaClass.simpleName
+    if (hostName.contains("Async") || hostName.contains("Bubble") || hostName.contains("Round")) {
+        return false
+    }
+    val density = view.resources.displayMetrics.density
+    val maxPx = (24f * density).toInt()
+    val w = if (d.intrinsicWidth > 0) d.intrinsicWidth else view.width
+    val h = if (d.intrinsicHeight > 0) d.intrinsicHeight else view.height
+    return w in 1..maxPx && h in 1..maxPx
+}
+
+/** 一次性诊断：把引用区里看到的图标(名字/尺寸)列出来，便于定位跳转箭头。 */
+private fun logReplyIconInventory(view: View) {
+    if (replyIconInventoryCount >= 5) return
+    replyIconInventoryCount++
+    val density = view.resources.displayMetrics.density
+    val items = ArrayList<String>()
+    var nodes = 0
+    walkViewTree(view, 400) { v ->
+        nodes++
+        val nameOf = { d: Drawable ->
+            drawableNameMemo[d] ?: runCatching {
+                d.constantState?.let { drawableStateNameMemo[System.identityHashCode(it)] }
+            }.getOrNull() ?: "?"
+        }
+        when (v) {
+            is ImageView -> items.add(
+                "IV${v.width}x${v.height}/${v.javaClass.simpleName}" +
+                    " d=${v.drawable?.intrinsicWidth}x${v.drawable?.intrinsicHeight}" +
+                    " name=${v.drawable?.let(nameOf) ?: "null"}"
+            )
+            is TextView -> v.compoundDrawables.forEachIndexed { i, d ->
+                if (d != null) {
+                    items.add("TV$i d=${d.intrinsicWidth}x${d.intrinsicHeight} name=${nameOf(d)}")
+                }
+            }
+            else -> Unit
+        }
+    }
+    Log.i(
+        TAG,
+        "reply icon inventory #$replyIconInventoryCount density=$density nodes=$nodes root=" +
+            view.javaClass.simpleName + " :: " + items.joinToString(" | ")
+    )
+}
+
+private var replyIconInventoryCount = 0
+
+private var replyArrowLogCount = 0
+
 private fun recolorReplyText(chain: XposedInterface.Chain, cl: ClassLoader, reason: String) {
     try {
         val obj = chain.thisObject ?: return
@@ -2703,6 +3058,11 @@ private fun recolorReplyText(chain: XposedInterface.Chain, cl: ClassLoader, reas
             else -> scheme.primary
         }
         recolorTextViews(view, color, linkColor)
+        // 引用区右上角"跳转到引用消息"的箭头：TIM 用的是通用列表箭头
+        // (qui_tui_list_arrow_right_primary)，我们的图标兜底会把它统一染成
+        // onSurface，于是自己气泡里就和引用文字(onPrimary)不一致 —— 这里按
+        // 气泡方向单独给它上色（含 TextView 的 compound drawable 形式）。
+        recolorReplyJumpIcon(replyBlockRoot(view), color)
         recolorSourceBinding(obj, color, linkColor, cl)
         val i = replyLogCount++
         if (i < 30) {
@@ -4267,6 +4627,12 @@ private fun hookSummaryBadge(module: XposedModule) {
             if (isMediaEditorActive()) return
             if (isEmoticonHost(view)) return
             if (isMonetExemptUi(view)) return
+            // 引用区跳转箭头：TIM 是绑定之后才 setImageResource 的，如果等我们的
+            // 补帧上色，中间会先画一帧原色(allwhite 白) —— 这里在设置的那一刻就
+            // 换成自己生成的位图；颜色优先用引用块已算好的，其次按气泡背景判侧别。
+            // 预筛要和 applyReplyJumpIcon 一致(名字 + 尺寸)，只看名字会漏掉那些
+            // 名字查不到的皮肤 drawable(日志里显示为 name=?)。
+            if (isJumpArrowDrawable(drawable, view) && handleReplyJumpIcon(view, drawable)) return
             // “+”扩展面板(照片/拍照/通话/文件/红包/收钱…)的入口图标:
             // 个别插件图标(如“收钱”)在深色下仍是原生黑色位图,对比度过低,
             // 这里只兜底染"暗色单色图形",彩色图标原样保留
@@ -7261,7 +7627,14 @@ private fun hookSummaryBadge(module: XposedModule) {
             iconPlateMemo.add(drawable)
             return drawable
         }
-        runCatching { drawableNameMemo[drawable] = name }
+        runCatching {
+            drawableNameMemo[drawable] = name
+            // 皮肤引擎会把同一个资源复制成多个 drawable 实例交给不同 View，
+            // 按实例查名字会 miss；constantState 在复制品之间是共享的，一并登记。
+            drawable.constantState?.let {
+                drawableStateNameMemo[System.identityHashCode(it)] = name
+            }
+        }
         // 钱包窗口打开期间：所有 Resources 层染色暂停，保证钱包系 UI 100% 原版
         if (isWalletUIActive()) return drawable
         // 图片编辑/浏览页同上:用户内容配色优先

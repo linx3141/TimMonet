@@ -24,10 +24,4 @@
         <item name="android:windowAnimationStyle">@null</item>
     </style>
 
-    <!-- 保留动画资源定义，供内容视图动画复用(Animation.TimMonet.Panel 里的
-         windowEnter/ExitAnimation 与代码里用的时长/曲线一致) -->
-    <style name="Animation.TimMonet.Panel" parent="@android:style/Animation.Activity">
-        <item name="android:windowEnterAnimation">@anim/tim_monet_panel_in</item>
-        <item name="android:windowExitAnimation">@anim/tim_monet_panel_out</item>
-    </style>
 </resources>
