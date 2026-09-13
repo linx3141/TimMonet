@@ -49,3 +49,7 @@ Thumbs.db
 *.jks
 *.hprof
 .kotlin/
+
+# 误提交的截图/图片
+*.jpg
+*.jpeg

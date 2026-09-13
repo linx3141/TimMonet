@@ -61,7 +61,7 @@ object TokenMapper {
             )
         memo[key]?.let { return it }
 
-        val scheme = MonetPalette.palette(dark)
+        val scheme = MonetPalette.palette()
         val mapped = if (name == null) {
             inferByColor(color, scheme)
         } else {
@@ -81,7 +81,7 @@ object TokenMapper {
         refreshMemoGeneration()
         val cache = if (dark) tintMemoDark else tintMemoLight
         cache[name]?.let { return if (it == NO_MAPPING) null else it }
-        val color = resolve(role, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        val color = resolve(role, 0xFF000000.toInt(), MonetPalette.palette())
         cache[name] = color
         if (cache.size > 8192) cache.clear()
         return color
@@ -128,7 +128,7 @@ object TokenMapper {
         val alpha = color ushr 24
         if (alpha == 0) return null
         val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
-        val scheme = MonetPalette.palette(dark)
+        val scheme = MonetPalette.palette()
         return try {
             // 位图/代码创建的品牌底没有资源名可依据(相册选中序号是烤进位图的
             // #0099FF，QUICheckBox 的圆底是代码设的 drawable)，只能按精确常量
@@ -167,11 +167,15 @@ object TokenMapper {
         // 用 primary 会亮得刺眼；换成 guest bubble 后和聊天里收到的那侧气泡同色，
         // 白色数字/文字压在上面也刚好可读(内联颜色路径仍映射 primary，
         // 相册选中序号那种"品牌底+白字"的用法不受影响)。
-        brandBlueRole(color, MonetPalette.palette(dark))?.let {
-            val bubble = guestBubble(dark)
+        // ⚠️ 判据与取色必须**同源**：深浅一律取 scheme.isDark（= 模块设置的
+        // effectiveDark），不再相信调用方传进来的 dark —— 历史上这里用入参判断
+        // "亮底压暗"、颜色却来自 effectiveDark，两者可以不一致，导致同一个颜色
+        // 有时被压暗有时不被压暗（"时好时坏"型 bug 的典型）。
+        val scheme = MonetPalette.palette()
+        brandBlueRole(color, scheme)?.let {
+            val bubble = guestBubble(scheme.isDark)
             return (bubble and 0x00FFFFFF) or (alpha shl 24)
         }
-        val scheme = MonetPalette.palette(dark)
         val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
         val hct = try {
             Hct.fromInt(opaque)
@@ -182,10 +186,10 @@ object TokenMapper {
         // 即使它带彩色 —— 文件页"本机"tab 顶部的微云入口条就是个浅蓝
         // ColorDrawable(#CDEEFE)，以前因为 chroma>=8 被整条放过，于是黑页面上
         // 留了一根刺眼的亮条（亮底 + 亮字，几乎看不清）。
-        if (dark && ((opaque shr 16 and 0xFF) * 299 + (opaque shr 8 and 0xFF) * 587 +
-                (opaque and 0xFF) * 114) / 1000 > 170
-        ) {
-            return bgPage(dark)
+        // 注意：这条**故意不排除彩色**（浅蓝的微云入口条就是靠它压暗的），
+        // 所以用 BgResolver.luma 而不是 isLightLeftover（后者含彩色排除）。
+        if (scheme.isDark && BgResolver.luma(opaque) > BgResolver.BRIGHT) {
+            return bgPage(true)
         }
         if (hct.chroma >= 8.0) return null
         val mapped = if (hct.tone < 50.0) {
@@ -198,22 +202,22 @@ object TokenMapper {
 
     /** 聊天列表条目背景的两种角色色。 */
     fun bgList(dark: Boolean): Int =
-        resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 页面底色（BG_PAGE）：给"未选中底"这类需要跟页面融为一体的地方用。 */
     fun bgPage(dark: Boolean): Int =
-        resolve(Role.BG_PAGE, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        resolve(Role.BG_PAGE, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 深色下可见的"线"色（分隔线/边框）：给分隔线类资源用。 */
     fun outlineVariant(dark: Boolean): Int =
-        resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette())
 
     fun bgCard(dark: Boolean): Int =
-        resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 对方消息气泡的背景色（免打扰灰泡沿用）。 */
     fun guestBubble(dark: Boolean): Int =
-        resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), MonetPalette.palette(dark))
+        resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), MonetPalette.palette())
 
     private fun inferByColor(color: Int, scheme: DynamicScheme): Int {
         val alpha = color ushr 24
@@ -279,7 +283,12 @@ object TokenMapper {
         val alpha = original ushr 24
         // AMOLED 纯黑：所有表面槽位置黑
         if (MonetPalette.isAmoled() && role in AMOLED_SURFACES) {
-            return 0xFF000000.toInt() or (alpha shl 24)
+            // ⚠️ 只保留 alpha 与纯黑：不能写 `0xFF000000 or (alpha shl 24)` ——
+            // 0xFF000000 的 alpha 位已全是 1，或运算结果恒为 0xFF000000，
+            // 半透明表面（蒙层/遮罩/#80FFFFFF）会变成**不透明纯黑**把内容盖死。
+            // 与 MonetPalette.amoledBlack() 保持同一语义。
+            if (alpha == 0) return 0
+            return alpha shl 24
         }
         val c = when (role) {
             Role.KEEP -> return original
@@ -572,7 +581,75 @@ object TokenMapper {
             inlineMemo.clear()
             tintMemoLight.clear()
             tintMemoDark.clear()
+            // ⚠️ roleMemo 也必须一起失效：computeRole 依赖 MonetPalette.isAmoled()
+            // （AMOLED 开时 bubble_host → GUEST_BUBBLE 等），而 isAmoled 会随设置
+            // 变化。以前它只靠 "size > 4096" 兜底，于是切换 AMOLED 开关后
+            // 气泡/气泡文字沿用旧角色，只有重启进程才对 —— 典型的"改了没效果"。
+            roleMemo.clear()
             memoGeneration = generation
         }
     }
+
+/**
+ * 背景色判定的统一入口（P0-2 第二步）。
+ *
+ * "颜色 -> 面色"的判定历史上散在 10 处（inlineBgColor / bgColorForDrawable /
+ * inferByColor / mappedBitmapBgColor / fixTinySolidBg / loginPageMonetizePass /
+ * recolorContainer / hookMineGrid / dialogMonetizePass / hookStatusBar），
+ * 混用两种颜色度量（HCT tone 与 BT.601 luma）和 7 个不同的"亮"阈值 ——
+ * 同一个颜色经不同入口会落到不同结果。
+ *
+ * 这里把**判据**统一出来（度量、彩色排除、亮度档位），各调用点只需说明
+ * "我要哪一档面色"，不再各写一套阈值。迁移是渐进的：新代码一律走这里。
+ */
+
+}
+
+object BgResolver {
+
+    /** 彩色底（品牌色块、按钮、图片主色）不参与面色映射。 */
+    private const val CHROMA_SPAN_MAX = 40
+
+    // ---- 亮度档位（BT.601 luma）----
+    // 与原先散在各处的 LUMA_* 常量一一对应，取值一个没改。
+    const val NEAR_WHITE = 235   // 近乎纯白（卡片底、白色填充）
+    const val VERY_LIGHT = 220   // 很亮（浅色主题遗留的底）
+    const val LIGHT = 200        // 亮
+    const val BRIGHT = 170       // 亮背景：深色下应当压暗
+    const val MID = 160          // 中间偏亮：决定用哪一档前景色
+    const val MID_LOW = 150      // 中间
+    const val DARK_TEXT = 140    // 亮字 / 深字的分界
+    const val DARK = 120         // 偏暗
+
+    /** BT.601 亮度。 */
+    fun luma(color: Int): Int = luma((color shr 16) and 0xFF, (color shr 8) and 0xFF, color and 0xFF)
+
+    fun luma(r: Int, g: Int, b: Int): Int = (r * 299 + g * 587 + b * 114) / 1000
+
+    /** 彩度跨度（max-min），用来判断"是不是彩色"。 */
+    fun chromaSpan(color: Int): Int {
+        val r = (color shr 16) and 0xFF
+        val g = (color shr 8) and 0xFF
+        val b = color and 0xFF
+        return maxOf(r, g, b) - minOf(r, g, b)
+    }
+
+    /**
+     * 是否"浅色主题遗留的亮底"：深色主题下应当压暗的、**无彩色/弱彩色**的亮色。
+     * 彩色一律不动（按钮、品牌色块、图片主色都靠这条排除）。
+     */
+    fun isLightLeftover(color: Int, dark: Boolean): Boolean {
+        if (!dark) return false
+        if (chromaSpan(color) > CHROMA_SPAN_MAX) return false
+        return luma(color) > BRIGHT
+    }
+
+    /** 是否近乎纯白（用于"这张卡片底是白的，要换成卡片色"这类判断）。 */
+    fun isNearWhite(color: Int): Boolean = luma(color) >= NEAR_WHITE
+
+    /** 背景色：压暗时统一给页面底色。 */
+    fun dimmed(dark: Boolean): Int = TokenMapper.bgPage(dark)
+
+    /** 卡片底：统一给卡片色。 */
+    fun card(dark: Boolean): Int = TokenMapper.bgCard(dark)
 }

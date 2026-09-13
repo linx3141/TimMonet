@@ -144,13 +144,30 @@ object MonetPalette {
         return appContext
     }
 
-    fun palette(dark: Boolean): DynamicScheme {
+    /** 当前调色板。深浅完全由模块设置（或系统）决定，见 [isDarkNow]。 */
+    fun palette(): DynamicScheme {
         ensureInitialized(null)
         val effectiveDark = effectiveDark()
         val scheme = if (effectiveDark) darkScheme else lightScheme
         if (scheme != null) return scheme
         return fallbackScheme(effectiveDark)
     }
+
+    /**
+     * ⚠️ **参数早已被忽略**（历史上曾用它区分深浅，后来改为完全跟随设置）。
+     * 保留它只是因为还有一批调用点在传值 —— 那些值（TIM 的 themeId、硬编码的
+     * true/false、isDarkNow() 等）一律**不影响结果**，纯属误导。
+     *
+     * 它真正的副作用只剩两个：
+     *   ① 让 TokenMapper 的缓存键里多一个与结果无关的位（缓存条目翻倍）；
+     *   ② 读代码的人以为"传 false 就是浅色方案"，从而写出依赖错误前提的分支
+     *      （`bgColorForDrawable` 就曾真用调用方的 dark 判断"亮底压暗"，
+     *       而颜色来自这里的 effectiveDark —— 判据与取色来自两个深浅源）。
+     *
+     * **新代码一律用无参的 [palette]**。
+     */
+    @Deprecated("参数被忽略，请改用无参的 palette()")
+    fun palette(@Suppress("UNUSED_PARAMETER") dark: Boolean): DynamicScheme = palette()
 
     /** 后台真实调色板就绪前的轻量兜底（SPEC_2021 + TonalSpot，构建快很多）。 */
     private fun fallbackScheme(dark: Boolean): DynamicScheme {
@@ -226,22 +243,36 @@ object MonetPalette {
     }
 
     private fun rebuild() {
-        // 与 KernelSU Manager 一致：直接采用系统莫奈引擎生成的 accent 色作为种子，
-        // 而不是壁纸的原始主色。这样即使壁纸是蓝色、系统莫奈选了绿色，也会跟随系统。
-        val customKeyColor = userSettings.keyColor
-        val systemSeeds = if (customKeyColor == 0) appContext?.let { readSystemMonetSeeds(it) } else null
-        // 与 KernelSU Manager 完全一致：所有风格都用系统莫奈 primary 作为种子
-        val lightSeed = if (customKeyColor != 0) customKeyColor else systemSeeds?.first ?: fallbackSeed()
-        val darkSeed = if (customKeyColor != 0) customKeyColor else systemSeeds?.second ?: fallbackSeed()
-        seedColor = lightSeed
-        lightScheme = buildScheme(lightSeed, false, userSettings.paletteStyle, userSettings.colorSpec)
-        darkScheme = buildScheme(darkSeed, true, userSettings.paletteStyle, userSettings.colorSpec)
-        paletteGeneration++
-        Log.i(
-            TAG,
-            "palette rebuilt, lightSeed=#${Integer.toHexString(lightSeed)}, " +
-                "darkSeed=#${Integer.toHexString(darkSeed)}"
-        )
+        // ⚠️ 本函数跑在 HandlerThread 上：一旦抛异常没人接住，那个 Looper 线程就
+        // 死了，之后所有 post 静默失败 —— 表现是"取色永久停在兜底方案、且一条
+        // 日志都没有"。这里整体兜住，并把 initialized 复位以便下次重试。
+        try {
+            // 与 KernelSU Manager 一致：直接采用系统莫奈引擎生成的 accent 色作为
+            // 种子，而不是壁纸的原始主色。这样即使壁纸是蓝色、系统莫奈选了绿色，
+            // 也会跟随系统。
+            val customKeyColor = userSettings.keyColor
+            val systemSeeds =
+                if (customKeyColor == 0) appContext?.let { readSystemMonetSeeds(it) } else null
+            // 与 KernelSU Manager 完全一致：所有风格都用系统莫奈 primary 作为种子
+            val lightSeed =
+                if (customKeyColor != 0) customKeyColor else systemSeeds?.first ?: fallbackSeed()
+            val darkSeed =
+                if (customKeyColor != 0) customKeyColor else systemSeeds?.second ?: fallbackSeed()
+            seedColor = lightSeed
+            lightScheme =
+                buildScheme(lightSeed, false, userSettings.paletteStyle, userSettings.colorSpec)
+            darkScheme =
+                buildScheme(darkSeed, true, userSettings.paletteStyle, userSettings.colorSpec)
+            paletteGeneration++
+            Log.i(
+                TAG,
+                "palette rebuilt, lightSeed=#${Integer.toHexString(lightSeed)}, " +
+                    "darkSeed=#${Integer.toHexString(darkSeed)}"
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "palette rebuild failed (will retry)", t)
+            initialized = false
+        }
     }
 
     private fun buildScheme(
