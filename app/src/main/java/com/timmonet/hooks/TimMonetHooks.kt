@@ -102,6 +102,18 @@ object TimMonetHooks {
         ColorDrawable::class.java.getDeclaredField("mColor").apply { isAccessible = true }
     }.getOrNull()
 
+    /** ColorDrawable 的当前颜色。
+     *
+     *  必须优先走 public API(API 29+ 的 getColor())：在 Android 17 上反射
+     *  ColorDrawable.mColor 拿不到值(设备实测读出来恒为 0)，于是所有**纯色背景**
+     *  ——钱包页根布局那片纯白、HomeToolbar 的品牌蓝顶栏——都读不到颜色，
+     *  tintAnyDrawable 的 ColorDrawable 分支直接 return false，从来没被染过；
+     *  只有 GradientDrawable 那条路是好的，所以页面上出现"一块染了一块没染"。 */
+    private fun colorOfColorDrawable(d: ColorDrawable): Int =
+        runCatching { d.color }.getOrElse {
+            colorDrawableColorField?.get(d) as? Int ?: 0
+        }
+
     private val fieldCache = ConcurrentHashMap<String, Field?>()
     private val typeFieldCache = ConcurrentHashMap<String, Field?>()
     private val methodCache = ConcurrentHashMap<String, Method?>()
@@ -227,7 +239,8 @@ object TimMonetHooks {
         hookResources(module)
         hookDrawables(module)
         hookViewBackground(module)
-        hookWalletWindowGuard(module)
+        hookTextContrast(module)
+        hookStatusBar(module)
         hookAioEditText(module, classLoader)
         hookAioBubbleText(module, classLoader)
         hookAioBubbleBg(module, classLoader)
@@ -3397,9 +3410,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         module.hook(method).intercept { chain ->
             val result = chain.proceed()
             val view = chain.thisObject as? TextView
-            if (isWalletUi(view)) {
-                return@intercept result
-            }
             val arg = chain.getArg(0) as? CharSequence
             probeWhiteNumberText(view, arg)
             remapDarkSpans(view)
@@ -3416,9 +3426,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             module.hook(method).intercept { chain ->
                 val result = chain.proceed()
                 val view = chain.thisObject as? TextView
-                if (isWalletUi(view)) {
-                    return@intercept result
-                }
                 val arg = chain.getArg(0) as? CharSequence
                 probeWhiteNumberText(view, arg)
                 remapDarkSpans(view)
@@ -3443,7 +3450,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     Log.w(TAG, "tint badge pill failed", t)
                     null
                 }
-                if (view == null || isWalletUi(view)) {
+                if (view == null) {
                     return@intercept result
                 }
                 val resId = chain.getArg(0) as Int
@@ -4366,7 +4373,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             } catch (t: Throwable) {
                 null
             }
-            is ColorDrawable -> colorDrawableColorField?.get(drawable) as? Int
+            is ColorDrawable -> colorOfColorDrawable(drawable)
             is DrawableContainer -> {
                 val state = drawable.constantState as? DrawableContainer.DrawableContainerState
                     ?: return null
@@ -4620,6 +4627,16 @@ private fun hookSummaryBadge(module: XposedModule) {
         }
     }
 
+    /** 红包类图标（名字里带 hongbao/redpacket 的红包图形）→ 保持 TIM 原版配色。 */
+    private fun isHongbaoIconDrawable(drawable: Drawable): Boolean {
+        val name = drawableNameMemo[drawable] ?: runCatching {
+            drawable.constantState?.let { drawableStateNameMemo[System.identityHashCode(it)] }
+        }.getOrNull() ?: return false
+        val n = name.lowercase()
+        return n.contains("hongbao") || n.contains("redpacket") || n.contains("red_packet") ||
+            n.contains("_hb_") || n.contains("hb_icon")
+    }
+
     /** 小红点（ImageView 图片形式，如联系人页群通知/新朋友红点、闪烁红点）→ primary。 */
     private fun hookImageViewRedDot(module: XposedModule) {
         fun handleImage(view: ImageView?, drawable: Drawable?) {
@@ -4650,13 +4667,21 @@ private fun hookSummaryBadge(module: XposedModule) {
                 return
             }
             try {
+                // 红包类图标(红包面板的"拼手气/普通/专属/语音/口令红包"等)保持 TIM
+                // 原版配色：它们是红底彩色图形，会被下面的"小红点"判定认成红点、
+                // 单色化成 primary 纯色块(设备日志：red dot image ... #fff74c31 ->
+                // #ff6cd6ff)。
+                if (isHongbaoIconDrawable(drawable)) return
                 val iw = drawable.intrinsicWidth
                 val ih = drawable.intrinsicHeight
                 var dominant: Int? = null
                 // 取样结果按 drawable 实例缓存：RecyclerView 滚动时同一图标
                 // 反复 setImage 不再重复全像素取样
+                // 红点只能是"小红点"：按 dp 限尺寸 —— 原来写死 200px(≈67dp)，
+                // 44dp 的红包图标也落在里面被当红点。
+                val maxDotPx = (24f * view.resources.displayMetrics.density).toInt()
                 val domMemo = redDotDominantMemo[System.identityHashCode(drawable)]
-                if (iw <= 200 && ih <= 200 && iw > 0 && ih > 0) {
+                if (iw <= maxDotPx && ih <= maxDotPx && iw > 0 && ih > 0) {
                     if (drawable.colorFilter == null) {
                         if (domMemo != null) {
                             dominant = domMemo
@@ -4676,7 +4701,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 } else if (iw <= 0 && ih <= 0) {
                     when (drawable) {
                         is ColorDrawable ->
-                            dominant = colorDrawableColorField?.get(drawable) as? Int
+                            dominant = colorOfColorDrawable(drawable)
                         is GradientDrawable ->
                             dominant = runCatching { drawable.color?.defaultColor }.getOrNull()
                         else -> Unit
@@ -5217,9 +5242,9 @@ private fun hookSummaryBadge(module: XposedModule) {
         return false
     }
 
-    /** 通用豁免：钱包页 100% 原版 + “回到最新”双色位图气泡。 */
+    /** 通用豁免：“回到最新”双色位图气泡。 */
     private fun isMonetExemptUi(view: View?): Boolean =
-        isWalletUi(view) || isUnreadBubbleView(view)
+        isUnreadBubbleView(view)
 
     private fun hexCss(color: Int): String {
         val v = color and 0x00FFFFFF
@@ -5279,128 +5304,35 @@ private fun hookSummaryBadge(module: XposedModule) {
         if (protectedUnreadViewIds.size > 1024) protectedUnreadViewIds.clear()
     }
 
-    /** 钱包（qwallet）页面识别：沿父链找 qwallet 系容器。钱包页要求 100% 保持 TIM 原版。
-     *  快速路径：进程内没有任何钱包视图挂载时直接返回，避免每个 setBackground
-     *  都走父链遍历（热路径开销）。 */
-    private fun isWalletUi(view: View?): Boolean {
-        if (walletWindowCount <= 0) return false
-        var current: View? = view
-        var depth = 0
-        while (current != null && depth < 24) {
-            if (isWalletClassName(current.javaClass.name)) return true
-            current = current.parent as? View
-            depth++
-        }
-        // 收付款等子页面容器全是普通 LinearLayout，父链没有 qwallet 类名；
-        // 但它们挂在 qwallet 插件 Activity（cooperation.qwallet.plugin.*）的
-        // context 上，沿 context 链再查一次。
-        return view != null && isWalletContext(view.context)
-    }
-
-    private fun isWalletClassName(name: String): Boolean =
-        name.contains("qwallet") || name.contains("QWallet") ||
-            name.contains("qqwallet") || name.contains("QQWallet")
-
-    private fun isWalletContext(context: Context?): Boolean {
-        var ctx = context
-        var depth = 0
-        while (ctx != null && depth < 8) {
-            if (isWalletClassName(ctx.javaClass.name)) return true
-            ctx = (ctx as? android.content.ContextWrapper)?.baseContext
-            depth++
-        }
-        return false
-    }
-
-    /** 钱包窗口当前是否处于打开状态（attach/detach 计数维护）。 */
-    @Volatile
-    private var walletWindowCount = 0
-
     /** 资料卡页面是否激活（激活期间才允许全局 setBackground 拦截器做采样判断）。 */
     @Volatile
     private var profileUiCount = 0
 
-    private fun isWalletUIActive(): Boolean = walletWindowCount > 0
-
-    /** 监听钱包系视图挂载/卸载：挂载期间暂停所有 Resources 层染色。 */
-    private fun hookWalletWindowGuard(module: XposedModule) {
-        // 钱包 Activity 的首帧 chrome 在 attach 之前就会 inflate 染色，
-        // 必须按 Activity 生命周期提前标记，否则新建钱包页的导航条会漏网。
-        findMethod(Activity::class.java, setOf("onCreate"), Bundle::class.java)
-            ?.let { method ->
-                logOnce("hook installed: Activity.onCreate (wallet window guard)")
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val activity = chain.thisObject as? Activity
-                        if (activity != null && isWalletClassName(activity.javaClass.name)) {
-                            walletWindowCount++
-                        }
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
-                }
-            }
-        findMethod(Activity::class.java, setOf("onDestroy"))
-            ?.let { method ->
-                logOnce("hook installed: Activity.onDestroy (wallet window guard)")
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val activity = chain.thisObject as? Activity
-                        if (activity != null && isWalletClassName(activity.javaClass.name)) {
-                            if (walletWindowCount > 0) walletWindowCount--
-                        }
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
-                }
-            }
+    /** 深色底上的深色文字 -> 提亮。
+     *
+     *  XML inflate 时 AOSP TextView 会直接把颜色写进 mTextColor，绕过
+     *  setTextColor(int)/setTextColor(ColorStateList)，所以钱包页那些
+     *  #1E1E1E 文字两条 setTextColor hook 都覆盖不到，在莫奈深色面上几乎
+     *  看不见。这里在 attach 时按实际对比度兜底：只处理**无彩色**、亮度低、
+     *  且祖先链上确实有深色背景的文字；彩色文字与浅底上的文字一概不碰。
+     */
+    private fun hookTextContrast(module: XposedModule) {
+        // 注意挂 View.onAttachedToWindow：TextView 自己没重写这个方法，
+        // findMethod(TextView::class.java, ...) 会返回 null、hook 根本装不上。
         findMethod(View::class.java, setOf("onAttachedToWindow"))
             ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (wallet window guard)")
+                logOnce("hook installed: View.onAttachedToWindow (contrast fix)")
                 runCatching { module.deoptimize(method) }
                 module.hook(method).intercept { chain ->
                     val result = chain.proceed()
                     try {
-                        val view = chain.thisObject as? View ?: return@intercept result
-                        // 类名非钱包且进程内还没有任何钱包视图时跳过 context 链
-                        // （每个视图 attach 都走 8 层 context 遍历的开销）
-                        if (!isWalletClassName(view.javaClass.name) &&
-                            walletWindowCount <= 0
-                        ) {
-                            return@intercept result
-                        }
-                        if (isWalletClassName(view.javaClass.name) ||
-                            isWalletContext(view.context)
-                        ) {
-                            walletWindowCount++
-                        }
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
-                }
-            }
-        findMethod(View::class.java, setOf("onDetachedFromWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onDetachedFromWindow (wallet window guard)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val view = chain.thisObject as? View ?: return@intercept result
-                        if (!isWalletClassName(view.javaClass.name) &&
-                            walletWindowCount <= 0
-                        ) {
-                            return@intercept result
-                        }
-                        if (isWalletClassName(view.javaClass.name) ||
-                            isWalletContext(view.context)
-                        ) {
-                            if (walletWindowCount > 0) walletWindowCount--
+                        val tv = chain.thisObject as? TextView
+                        if (tv != null && !isMediaEditorActive()) {
+                            fixLowContrastText(tv)
+                            // 卡片/列表底色往往是 attach 之后才被染深的，那时
+                            // 这一次检查看到的还是浅底、会被跳过 —— 单次 post
+                            // 到下一帧再判一次（不轮询）。
+                            tv.post { runCatching { fixLowContrastText(tv) } }
                         }
                     } catch (t: Throwable) {
                         // ignore
@@ -5409,6 +5341,94 @@ private fun hookSummaryBadge(module: XposedModule) {
                 }
             }
     }
+
+    private var textContrastLogCount = 0
+
+    private fun fixLowContrastText(tv: TextView) {
+        // ⚠️ 必须用**实际生效**的配色判断明暗：MonetPalette.palette() 内部走
+        // effectiveDark()，而 ThemeState.isNight() 在"只设了模块内配色、没跟随
+        // 系统深色模式"时会返回 false —— 设备实测就是 dark=false 让这条兜底
+        // 全部早退，钱包页那些深灰文字一个都没提亮。
+        val dark = MonetPalette.palette(
+            ThemeState.isNight(null, timClassLoader)
+        ).isDark
+        val c = tv.currentTextColor
+        val opaque = c or 0xFF000000.toInt()
+        val r = (opaque shr 16) and 0xFF
+        val g = (opaque shr 8) and 0xFF
+        val b = opaque and 0xFF
+        val chroma = maxOf(r, g, b) - minOf(r, g, b)
+        val luma = colorLuma(opaque)
+        if (!dark) return
+        if (chroma > 24) return // 彩色文字不碰
+        // 只按亮度判断"已经够亮"，不再用 isSchemeColor 过滤：
+        // 纯黑 #000000 会命中方案里某个面角色(surfaceDim/container 系在深色下
+        // 可以就是纯黑)，于是钱包设置页那些黑字全被当成"已染"跳过。
+        // 映射本身是幂等的，重复处理无害。
+        if (luma >= 170) return
+        // 祖先链上第一个有背景的 view：只有它确实是深色，才算"深底深字"
+        var bgLuma = -1
+        var p: View? = tv.parent as? View
+        var depth = 0
+        while (p != null && depth < 8) {
+            val bc = colorOfDrawable(p.background)
+            if (bc != 0) {
+                bgLuma = colorLuma(bc or 0xFF000000.toInt())
+                break
+            }
+            p = p.parent as? View
+            depth++
+        }
+
+        // 只要祖先链上没有**亮色**背景(luma>140)就提亮：
+        // 深色底(#003045 luma=36)、透明底(bgLuma=-1)都算；
+        // 白卡片上的黑字(luma=255)保持不动，那是正常的。
+        if (bgLuma <= 140) {
+            val scheme = MonetPalette.palette(true)
+            tv.setTextColor(if (luma < 70) scheme.onSurface else scheme.onSurfaceVariant)
+
+        }
+    }
+
+    /** 状态栏颜色：TIM 在钱包页把状态栏硬设成插件资源里的品牌浅蓝(#A1CAFD)，
+     *  我们的取色映射(只认无彩色与精确品牌蓝)覆盖不到，于是状态栏是浅蓝、
+     *  下面顶栏是深色，两截。深色配色下把**亮色**状态栏统一到主题面色
+     *  (暗色状态栏一律不动，聊天列表那种本来就对)。 */
+    private fun hookStatusBar(module: XposedModule) {
+        runCatching {
+            // ⚠️ Window.setStatusBarColor 是抽象方法，挂 android.view.Window 上
+            // 根本不会被调用（实测 hook 装了但一次都没触发）—— 实现在 PhoneWindow。
+            val windowCls = Class.forName("com.android.internal.policy.PhoneWindow")
+            findMethod(windowCls, setOf("setStatusBarColor"), INT_TYPE)
+                ?.let { method ->
+                    logOnce("hook installed: Window.setStatusBarColor (dark normalize)")
+                    module.hook(method).intercept { chain ->
+                        try {
+                            val c = chain.getArg(0) as Int
+                            val scheme = MonetPalette.palette(
+                                ThemeState.isNight(null, timClassLoader)
+                            )
+                            if (scheme.isDark && colorLuma(c or 0xFF000000.toInt()) > 140) {
+                                val mapped = TokenMapper.bgCard(true)
+                                if (statusBarLogCount++ < 8) {
+                                    Log.i(
+                                        TAG,
+                                        "status bar #" + Integer.toHexString(c) +
+                                            " -> #" + Integer.toHexString(mapped)
+                                    )
+                                }
+                                return@intercept chain.proceed(arrayOf<Any>(mapped))
+                            }
+                        } catch (t: Throwable) {
+                            // ignore
+                        }
+                        chain.proceed()
+                    }
+                }
+        }.onFailure { Log.w(TAG, "setStatusBarColor hook failed", it) }
+    }
+
+    private var statusBarLogCount = 0
 
     private fun hookViewBackground(module: XposedModule) {
         // 窗口级背景（弹窗/对话框的 mWindowBackground）不经过 View.setBackground，
@@ -5422,6 +5442,10 @@ private fun hookSummaryBadge(module: XposedModule) {
                     module.hook(method).intercept { chain ->
                         chain.proceed()
                         val drawable = chain.getArg(0) as? Drawable
+                        logWhiteSource(
+                            "windowBackground d=" + drawable?.javaClass?.simpleName,
+                            colorOfDrawable(drawable)
+                        )
                         if (drawable != null) {
                             tintAnyDrawable(
                                 drawable,
@@ -5435,9 +5459,13 @@ private fun hookSummaryBadge(module: XposedModule) {
 
         findMethod(View::class.java, setOf("setBackground"), Drawable::class.java)
             ?.let { hookFrameworkMethod(module, it) { chain, result ->
-                // 钱包页（qwallet）要求 100% 保持 TIM 原版，不参与莫奈染色；
                 // “回到最新”双色位图气泡由专用 hook 处理，跳过通用单色染色
                 val view = chain.thisObject as? View
+                logWhiteSource(
+                    "setBackground d=" + (chain.getArg(0) as? Drawable)?.javaClass?.simpleName +
+                        " on " + viewChainName(view),
+                    colorOfDrawable(chain.getArg(0) as? Drawable)
+                )
                 // 图片编辑/浏览页:色块/画笔是用户内容,含红色实底扫描在内全部跳过
                 if (isMonetExemptUi(view) || isMediaEditorActive()) {
                     return@hookFrameworkMethod result
@@ -5626,10 +5654,11 @@ private fun hookSummaryBadge(module: XposedModule) {
             return handled
         }
         if (drawable is ColorDrawable) {
-            val original = colorDrawableColorField?.get(drawable) as? Int ?: return false
+            val original = colorOfColorDrawable(drawable)
+            if (original == 0) return false
             // 已经是莫奈配色方案里的颜色（说明已被资源名正确染过），不再二次映射
             if (isSchemeColor(original, dark)) return true
-            val mapped = TokenMapper.inlineBgColor(original, dark) ?: return false
+            val mapped = TokenMapper.bgColorForDrawable(original, dark) ?: return false
             if (mapped != original) {
                 drawable.mutate()
                 drawable.color = mapped
@@ -5638,15 +5667,44 @@ private fun hookSummaryBadge(module: XposedModule) {
             return true
         }
         if (drawable is GradientDrawable) {
-            val original = runCatching { drawable.color?.defaultColor }.getOrNull() ?: return false
-            if (isSchemeColor(original, dark)) return true
-            val mapped = TokenMapper.inlineBgColor(original, dark) ?: return false
-            if (mapped != original) {
-                drawable.mutate()
-                drawable.setColor(mapped)
-                logOnce("gradient bg #${Integer.toHexString(original)} -> #${Integer.toHexString(mapped)}")
+            // 单色底
+            val solid = runCatching { drawable.color?.defaultColor }.getOrNull()
+            if (solid != null) {
+                if (isSchemeColor(solid, dark)) return true
+                val mapped = TokenMapper.bgColorForDrawable(solid, dark) ?: return false
+                if (mapped != solid) {
+                    drawable.mutate()
+                    drawable.setColor(mapped)
+                    logOnce(
+                        "gradient bg #${Integer.toHexString(solid)} -> " +
+                            "#${Integer.toHexString(mapped)}"
+                    )
+                }
+                return true
             }
-            return true
+            // 多色渐变（setColors(int[])，此时 color 为 null）：钱包页
+            // QWalletHomeAppsLayout 的白色渐变底就走这条，以前整块直接跳过，
+            // 于是那片白底一直没被染。逐色按面色映射。
+            val colors = runCatching { drawable.colors }.getOrNull() ?: return false
+            if (colors.isEmpty()) return false
+            val out = IntArray(colors.size)
+            var changed = false
+            for (i in colors.indices) {
+                val c = colors[i]
+                val m = if (isSchemeColor(c, dark)) {
+                    c
+                } else {
+                    TokenMapper.bgColorForDrawable(c, dark) ?: c
+                }
+                out[i] = m
+                if (m != c) changed = true
+            }
+            if (changed) {
+                drawable.mutate()
+                drawable.colors = out
+                logOnce("gradient colors on " + drawable.javaClass.simpleName + " remapped")
+            }
+            return changed
         }
         if (drawable is DrawableContainer) {
             var handled = false
@@ -5678,7 +5736,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             if (drawable.colorFilter != null) return true
             val bitmap = drawable.bitmap ?: return false
             val dominant = sampleBitmapColor(bitmap) ?: return false
-            val mapped = TokenMapper.inlineBgColor(dominant, dark) ?: return false
+            val mapped = TokenMapper.bgColorForDrawable(dominant, dark) ?: return false
             if (mapped != dominant) {
                 drawable.mutate()
                 drawable.colorFilter = PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN)
@@ -7232,6 +7290,45 @@ private fun hookSummaryBadge(module: XposedModule) {
     // ------------------------------------------------------------------
 
     private fun hookDarkTextColors(module: XposedModule) {
+        // void setTextColor(ColorStateList)：XML 的 android:textColor="?attr/xxx"
+        // 在布局 inflate 时走这条 —— 钱包页"QQ红包 / 转账 / 金融理财 / 生活娱乐"
+        // 那些深灰文字色就是这么设进去的，只 hook int 版本覆盖不到。
+        findMethod(TextView::class.java, setOf("setTextColor"), ColorStateList::class.java)
+            ?.let { method ->
+                logOnce("hook installed: TextView.setTextColor(CSL) (dark normalize)")
+                module.hook(method).intercept { chain ->
+                    try {
+                        val csl = chain.getArg(0) as? ColorStateList
+                        if (csl != null && !csl.isStateful) {
+                            val c = csl.defaultColor
+                            val scheme = MonetPalette.palette(
+                                ThemeState.isNight(null, timClassLoader)
+                            )
+                            if (scheme.isDark) {
+                                val opaque = c or 0xFF000000.toInt()
+                                val r = (opaque shr 16) and 0xFF
+                                val g = (opaque shr 8) and 0xFF
+                                val b = opaque and 0xFF
+                                val grayish = maxOf(r, g, b) - minOf(r, g, b) <= 24
+                                val luma = colorLuma(opaque)
+                                if (grayish && luma < 170 && !isSchemeColor(c, true)) {
+                                    val mapped = if (luma < 70) {
+                                        scheme.onSurface
+                                    } else {
+                                        scheme.onSurfaceVariant
+                                    }
+                                    return@intercept chain.proceed(
+                                        arrayOf<Any>(ColorStateList.valueOf(mapped))
+                                    )
+                                }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        // ignore
+                    }
+                    chain.proceed()
+                }
+            }
         findMethod(TextView::class.java, setOf("setTextColor"), INT_TYPE)
             ?.let { method ->
                 logOnce("hook installed: TextView.setTextColor (dark normalize)")
@@ -7241,9 +7338,6 @@ private fun hookSummaryBadge(module: XposedModule) {
                                         if (isMediaEditorActive()) return@intercept chain.proceed()
                     val color = chain.getArg(0) as Int
                     val tvObj = chain.thisObject as? TextView
-                    if (isWalletUi(tvObj)) {
-                        return@intercept chain.proceed()
-                    }
                     // 用户详情页(资料卡):TIM 会在数据到达后重设文字颜色,
                     // 因此在这里接管 —— 左侧标签(昵称/账号/入群时间…)与头部
                     // 名称/简介为亮色 onSurface;右侧取值(账号号等)为次要色
@@ -7282,9 +7376,16 @@ private fun hookSummaryBadge(module: XposedModule) {
                             return@intercept chain.proceed(arrayOf<Any>(scheme.primary))
                         }
                     }
+                    val tvScheme = MonetPalette.palette(ThemeState.isNight(null, timClassLoader))
+                    val opaqueColor = color or 0xFF000000.toInt()
+                    val cr = (opaqueColor shr 16) and 0xFF
+                    val cg = (opaqueColor shr 8) and 0xFF
+                    val cb = opaqueColor and 0xFF
+                    val grayish = maxOf(cr, cg, cb) - minOf(cr, cg, cb) <= 24
+                    val textLuma = colorLuma(opaqueColor)
                     if (color == 0xFF000000.toInt() || color == 0xFFFFFFFF.toInt()) {
                         val view = chain.thisObject as? TextView
-                        val scheme = MonetPalette.palette(ThemeState.isNight(null, timClassLoader))
+                        val scheme = tvScheme
                         if (scheme.isDark) {
                             // 主色胶囊（未读/附标等）里的文字应为 onPrimary，
                             // 与聊天列表未读气泡统一；其余黑/白文字仍归一到 onSurface。
@@ -7292,7 +7393,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                             val onPrimaryPill = view?.background?.let { bg ->
                                 gradientColorOf(bg) == scheme.primary ||
                                     (bg is ColorDrawable && (runCatching {
-                                        colorDrawableColorField?.get(bg) as? Int
+                                        (bg as? ColorDrawable)?.let { colorOfColorDrawable(it) }
                                     }.getOrNull()?.let { it or 0xFF000000.toInt() }) ==
                                         (scheme.primary or 0xFF000000.toInt()))
                             } ?: false
@@ -7302,6 +7403,19 @@ private fun hookSummaryBadge(module: XposedModule) {
                         } else {
                             chain.proceed()
                         }
+                    } else if (tvScheme.isDark && grayish && textLuma < 170 &&
+                        !isSchemeColor(color, true)
+                    ) {
+                        // 深色配色下的深/中灰文字提亮：钱包页的"QQ红包 / 转账 /
+                        // 金融理财 / 生活娱乐"这些都是 TIM 的深灰文字色(#1a1a1a、
+                        // #333…)，在莫奈深色面上几乎看不见。只动**无彩色灰阶**
+                        // (max-min≤24)，彩色文字与浅灰文字一概不碰。
+                        val mapped = if (textLuma < 70) {
+                            tvScheme.onSurface
+                        } else {
+                            tvScheme.onSurfaceVariant
+                        }
+                        chain.proceed(arrayOf<Any>(mapped))
                     } else {
                         chain.proceed()
                     }
@@ -7635,8 +7749,6 @@ private fun hookSummaryBadge(module: XposedModule) {
                 drawableStateNameMemo[System.identityHashCode(it)] = name
             }
         }
-        // 钱包窗口打开期间：所有 Resources 层染色暂停，保证钱包系 UI 100% 原版
-        if (isWalletUIActive()) return drawable
         // 图片编辑/浏览页同上:用户内容配色优先
         if (isMediaEditorActive()) return drawable
         // 相册/预览页选择控件(QUICheckBox)最外那圈白描边:见 checkBoxRingOverride
@@ -7709,6 +7821,18 @@ private fun hookSummaryBadge(module: XposedModule) {
             // 判定"的兜底都会放过它 —— 深色配色下直接覆盖 tint。
             if (isIconLikeName(name)) {
                 return tintIconOnSurface(drawable, name)
+            }
+            // 名字规则一个都没命中：TIM 钱包页(qwallet 插件)用的就是 al3/2p 这类
+            // 混淆短名 —— 页面根布局背景 al3(#FFFFFF)、顶栏 2p(#0099FF)、
+            // QWalletHomeAppsLayout 的白色渐变底，全都落在这里被原样返回，
+            // 所以钱包页一直是大片白底 + 品牌蓝顶栏。
+            // 按 drawable 的**实际颜色**兜底(规则同 TokenMapper.inlineBgColor：
+            // 精确品牌蓝 -> primary、白/浅灰 -> 面色)；只处理纯色/渐变底，
+            // 位图不动(可能是照片/表情，染色会毁内容)。
+            if (drawable is ColorDrawable || drawable is GradientDrawable) {
+                if (tintAnyDrawable(drawable, ThemeState.isNight(null, timClassLoader))) {
+                    logOnce("drawable color fallback: $name")
+                }
             }
             return drawable
         }
@@ -7982,7 +8106,6 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 内联颜色 drawable（resId=0）：按颜色本身映射到莫奈底色。 */
     private fun tintInlineDrawable(drawable: Drawable, typedValue: TypedValue?): Drawable {
-        if (isWalletUIActive()) return drawable
         if (isMediaEditorActive()) return drawable
         val inlineColor = typedValue?.data ?: return drawable
         val mapped = TokenMapper.inlineBgColor(inlineColor, ThemeState.isNight(null, timClassLoader))
@@ -8178,18 +8301,53 @@ private fun hookSummaryBadge(module: XposedModule) {
 
         // int TypedArray.getColor(int, int)：XML 里的内联十六进制颜色不经过 Resources，
         // 只能按颜色本身推断（纯黑白保持不动）
+        // Drawable getDrawable(int)：android:background="?attr/xxx" 走的是这里 ——
+        // 钱包页(TenpayActivity / QWalletToolFragmentActivity)的根布局白底、
+        // 顶栏品牌蓝底、图标网格白底全都是这么拿到的，此前完全没经过任何染色
+        // 路径，所以那页一直是大片白 + TIM 蓝。取出来按值兜底(只动纯色/渐变底)。
+        for (params in listOf(arrayOf<Class<*>>(INT_TYPE), arrayOf<Class<*>>(INT_TYPE, themeCls))) {
+            findMethod(typedArrayCls, setOf("getDrawable"), *params)
+                ?.let { method ->
+                    logOnce("hook installed: TypedArray.getDrawable (attr bg)")
+                    hookFrameworkMethod(module, method) { chain, result ->
+                        if (isMediaEditorActive()) return@hookFrameworkMethod result
+                        val d = result as? Drawable ?: return@hookFrameworkMethod result
+                        if (d is ColorDrawable || d is GradientDrawable) {
+                            if (tintAnyDrawable(d, ThemeState.isNight(null, timClassLoader))) {
+                                logOnce("attr drawable tinted " + d.javaClass.simpleName)
+                            }
+                        }
+                        result
+                    }
+                }
+        }
+
         findMethod(typedArrayCls, setOf("getColor"), INT_TYPE, INT_TYPE)
             ?.let { hookFrameworkMethod(module, it) { chain, result ->
-                if (isWalletUIActive()) return@hookFrameworkMethod result
                 // 第三方模块注入界面(QAuxiliary 等,其 Material 组件/开关的颜色
                 // 正是从这里读)与图片编辑页:整体跳过,保持它们自身配色
                 if (isMediaEditorActive()) return@hookFrameworkMethod result
                 if (result is Int) {
                     val index = chain.getArg(0) as Int
                     val type = (chain.thisObject as? TypedArray)?.getType(index) ?: -1
-                    // 资源引用（@color/xxx）已经走 loadColorStateList 处理过，这里只处理内联十六进制
+                    logWhiteSource("TypedArray.getColor type=$type", result)
+                    // 资源引用（@color/xxx）：TIM 钱包主页的背景/顶栏就走这条 ——
+                    // 布局写的 ?attr/a_2 解析到 @color/al3(#FFFFFF)、?attr/a_5 解析到
+                    // @color/2p(#0099FF)，以前这里直接原样返回，于是钱包页一直是
+                    // 大片白底 + 品牌蓝顶栏。按值兜底(只认精确品牌蓝与无彩色浅色)。
                     if (type == TypedValue.TYPE_STRING) {
-                        result
+                        val dark = ThemeState.isNight(null, timClassLoader)
+                        val mapped = TokenMapper.inlineBgColor(result, dark)
+                            ?: darkTextFallback(result, dark)
+                            ?: result
+                        if (mapped != result && attrColorLogCount++ < 30) {
+                            Log.i(
+                                TAG,
+                                "attr color #" + Integer.toHexString(result) +
+                                    " -> #" + Integer.toHexString(mapped)
+                            )
+                        }
+                        mapped
                     } else {
                         val dark = ThemeState.isNight(null, timClassLoader)
                         val opaque = result or 0xFF000000.toInt()
@@ -8205,9 +8363,21 @@ private fun hookSummaryBadge(module: XposedModule) {
                                 )
                                 scheme.primary
                             }
-                            // 纯黑/纯白文字:深色模式下归一为 onSurface
-                            dark && (opaque == 0xFF000000.toInt() ||
-                                opaque == 0xFFFFFFFF.toInt()) -> scheme.onSurface
+                            // 内联纯白：TIM 里基本都是"底"(钱包页根布局、卡片、
+                            // 各种面板背景)，按**面**色映射。以前这里和纯黑一起
+                            // 归一成 onSurface(文字色)，结果白底依旧是白的 ——
+                            // 钱包页那片纯白就是这么来的。
+                            opaque == 0xFFFFFFFF.toInt() -> {
+                                val mapped = TokenMapper.inlineBgColor(result, dark)
+                                if (mapped != null && mapped != result) {
+                                    logOnce(
+                                        "inline white -> #" + Integer.toHexString(mapped)
+                                    )
+                                }
+                                mapped ?: result
+                            }
+                            // 纯黑文字:深色模式下归一为 onSurface
+                            dark && opaque == 0xFF000000.toInt() -> scheme.onSurface
                             // 其余:仅深色模式下的灰阶(白/浅灰底)做面色映射,
                             // 彩色一律保持原样(此前按颜色值盲目映射会改成更浅的面色)
                             dark -> TokenMapper.inlineBgColor(result, true) ?: result
@@ -8239,19 +8409,86 @@ private fun hookSummaryBadge(module: XposedModule) {
         }
     }
 
+    private var attrColorLogCount = 0
+
+    private var whiteSrcLogCount = 0
+
+    /** 诊断：钱包页那片纯白背景到底是谁设的（限次）。 */
+    private fun logWhiteSource(source: String, color: Int) {
+        if (color == 0 || whiteSrcLogCount >= 40) return
+        if ((color or 0xFF000000.toInt()) != 0xFFFFFFFF.toInt()) return
+        whiteSrcLogCount++
+        Log.i(TAG, "white source: $source")
+    }
+
+    private fun viewChainName(view: View?): String {
+        if (view == null) return "?"
+        val sb = StringBuilder(view.javaClass.simpleName)
+        var p = view.parent
+        var depth = 0
+        while (p is View && depth < 5) {
+            sb.append(" <- ").append(p.javaClass.simpleName)
+            p = p.parent
+            depth++
+        }
+        return sb.toString()
+    }
+
+    private fun colorOfDrawable(d: Drawable?): Int = when (d) {
+        null -> 0
+        is ColorDrawable -> colorOfColorDrawable(d)
+        is GradientDrawable -> runCatching { d.color?.defaultColor }.getOrNull() ?: 0
+        else -> 0
+    }
+
+    /** 深色配色下的纯黑/近黑 -> onSurface（TIM 浅色主题遗留的文字色），否则 null。 */
+    private fun darkTextFallback(color: Int, dark: Boolean): Int? {
+        val scheme = MonetPalette.palette(dark)
+        if (!scheme.isDark) return null
+        val op = color or 0xFF000000.toInt()
+        val r = (op shr 16) and 0xFF
+        val g = (op shr 8) and 0xFF
+        val b = op and 0xFF
+        if (maxOf(r, g, b) - minOf(r, g, b) > 24) return null
+        return if (colorLuma(op) < 70) scheme.onSurface else null
+    }
+
     private fun remapColorByName(name: String?, color: Int): Int {
-        if (name == null) return color
-        if (isWalletUIActive()) return color
         // 第三方模块注入界面(QAuxiliary 等)与图片编辑页:不改颜色
         if (isMediaEditorActive()) return color
+        val dark = ThemeState.isNight(null, timClassLoader)
         // 资源名在 Android 里强制小写，直接 startsWith 免去每次 lowercase 分配。
-        if (!name.startsWith("qui_") &&
-            !name.startsWith("skin_black") &&
-            !name.startsWith("skin_gray") &&
-            !name.startsWith("skin_input_theme") &&
-            !name.startsWith("troop_aiosm")
-        ) return color
-        val mapped = TokenMapper.mapColor(name, color, ThemeState.isNight(null, timClassLoader))
+        logWhiteSource("Resources.getColor name=$name", color)
+        val knownName = name != null &&
+            (name.startsWith("qui_") ||
+                name.startsWith("skin_black") ||
+                name.startsWith("skin_gray") ||
+                name.startsWith("skin_input_theme") ||
+                name.startsWith("troop_aiosm"))
+        if (!knownName) {
+            // 名字不在白名单里。TIM 钱包页(qwallet 插件)就是这种：布局写的
+            // android:background="?attr/a_2" 解析到 @color/al3(#FFFFFF)、顶栏
+            // "?attr/a_5" 解析到 @color/2p(#0099FF)，这些混淆短名不匹配任何
+            // 前缀，于是整页保持原版 —— 大片白底 + 品牌蓝顶栏。
+            // 这里按**颜色值**兜底；规则很保守(只认精确品牌蓝常量与无彩色浅色)，
+            // 见 TokenMapper.inlineBgColor。
+            TokenMapper.inlineBgColor(color, dark)?.let { return it }
+            // 深色配色下的纯黑/近黑：TIM 浅色主题留下的文字色，在莫奈深色面上
+            // 几乎看不见(钱包设置页"金额隐私保护/安全锁/服务管理"就是)，
+            // 按文字色归一为 onSurface。只认无彩色且很暗的，彩色一律不动。
+            val scheme = MonetPalette.palette(dark)
+            if (scheme.isDark) {
+                val op = color or 0xFF000000.toInt()
+                val r0 = (op shr 16) and 0xFF
+                val g0 = (op shr 8) and 0xFF
+                val b0 = op and 0xFF
+                if (maxOf(r0, g0, b0) - minOf(r0, g0, b0) <= 24 && colorLuma(op) < 70) {
+                    return scheme.onSurface
+                }
+            }
+            return color
+        }
+        val mapped = TokenMapper.mapColor(name, color, dark)
         if (name.startsWith("qui_") && name.contains("bg_") && mapped != color) {
             logOnce("color $name: #${Integer.toHexString(color)} -> #${Integer.toHexString(mapped)}")
         }
@@ -8260,7 +8497,6 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private fun remapColorStateListByName(resId: Int, name: String?, csl: ColorStateList): ColorStateList? {
         if (name == null) return null
-        if (isWalletUIActive()) return null
         if (isMediaEditorActive()) return null
         if (!name.startsWith("qui_") &&
             !name.startsWith("skin_black") &&
@@ -8330,7 +8566,6 @@ private fun hookSummaryBadge(module: XposedModule) {
                                         // 第三方模块注入界面/图片编辑页:整体跳过染色
                                         if (isMediaEditorActive()) return@intercept chain.proceed()
                     val original = chain.proceed()
-                    if (isWalletUIActive()) return@intercept original
                     if (original !is Int) return@intercept original
                     try {
                         val ctx = chain.getArg(0) as? Context
@@ -8359,7 +8594,6 @@ private fun hookSummaryBadge(module: XposedModule) {
                                         // 第三方模块注入界面/图片编辑页:整体跳过染色
                                         if (isMediaEditorActive()) return@intercept chain.proceed()
                     val result = chain.proceed()
-                    if (isWalletUIActive()) return@intercept result
                     val csl = result as? ColorStateList ?: return@intercept result
                     try {
                         val ctx = chain.getArg(0) as? Context

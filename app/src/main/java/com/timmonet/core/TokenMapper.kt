@@ -151,6 +151,42 @@ object TokenMapper {
         }
     }
 
+    /** drawable **背景**按值映射（背景语义，比 inlineBgColor 宽）。
+     *
+     *  与 inlineBgColor 的区别：内联颜色无从判断语义，只能保守地"白/浅灰才动"；
+     *  这里是 drawable 背景（ColorDrawable / GradientDrawable / 位图底），语义明确，
+     *  所以**无彩色一律映射到面色** —— TIM 深色主题里的 #36393E 这类"深灰面"
+     *  (钱包页下半屏就是它) 按老规则 tone<60 被判成文字色、直接放过，
+     *  结果一个页面被切成四段颜色。彩色一律不碰。
+     */
+    fun bgColorForDrawable(color: Int, dark: Boolean): Int? {
+        val alpha = color ushr 24
+        if (alpha == 0) return null
+        // 品牌蓝**底**映射到"对方气泡背景"色，而不是 primary：
+        // 钱包页顶栏(?attr/a_5 → @color/2p #0099FF)整条都是这个底，
+        // 用 primary 会亮得刺眼；换成 guest bubble 后和聊天里收到的那侧气泡同色，
+        // 白色数字/文字压在上面也刚好可读(内联颜色路径仍映射 primary，
+        // 相册选中序号那种"品牌底+白字"的用法不受影响)。
+        brandBlueRole(color, MonetPalette.palette(dark))?.let {
+            val bubble = guestBubble(dark)
+            return (bubble and 0x00FFFFFF) or (alpha shl 24)
+        }
+        val scheme = MonetPalette.palette(dark)
+        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        val hct = try {
+            Hct.fromInt(opaque)
+        } catch (t: Throwable) {
+            return null
+        }
+        if (hct.chroma >= 8.0) return null
+        val mapped = if (hct.tone < 50.0) {
+            MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
+        } else {
+            MonetPalette.amoledBlack(scheme.surfaceContainer)
+        }
+        return (mapped and 0x00FFFFFF) or (alpha shl 24)
+    }
+
     /** 聊天列表条目背景的两种角色色。 */
     fun bgList(dark: Boolean): Int =
         resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette(dark))
