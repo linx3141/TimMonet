@@ -178,6 +178,15 @@ object TokenMapper {
         } catch (t: Throwable) {
             return null
         }
+        // 深色主题下"很亮的背景"：TIM 亮色主题遗留的浅色底，一律压成页面底色，
+        // 即使它带彩色 —— 文件页"本机"tab 顶部的微云入口条就是个浅蓝
+        // ColorDrawable(#CDEEFE)，以前因为 chroma>=8 被整条放过，于是黑页面上
+        // 留了一根刺眼的亮条（亮底 + 亮字，几乎看不清）。
+        if (dark && ((opaque shr 16 and 0xFF) * 299 + (opaque shr 8 and 0xFF) * 587 +
+                (opaque and 0xFF) * 114) / 1000 > 170
+        ) {
+            return bgPage(dark)
+        }
         if (hct.chroma >= 8.0) return null
         val mapped = if (hct.tone < 50.0) {
             MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
@@ -318,11 +327,37 @@ object TokenMapper {
         val n = name.lowercase()
         val cached = roleMemo[n]
         if (cached != null) return if (cached == Role.UNKNOWN) null else cached
-        val computed = computeRole(n)
+        var computed = computeRole(n)
+        // 兜底：名字是"背景/条/横幅/填充"语义的资源，不该落到**前景色**角色。
+        // computeRole 的顺序是 文字 -> 图标 -> 背景，名字里同时含 bg/banner 和
+        // text_/icon_ 的资源会先被前者截胡成 onSurface，渲染出来就是一条亮底
+        // 配亮字（文件页的微云入口条 #CDEEFE 就是这样，几乎看不清）。这类名字
+        // 一律按背景处理。
+        if ((computed == Role.ON_SURFACE || computed == Role.ON_SURFACE_VARIANT) &&
+            isBackgroundLike(n)
+        ) {
+            if (bgRoleFixLog++ < 25) {
+                android.util.Log.i(
+                    "TimMonet",
+                    "bg-like role fixed: $n $computed -> BG_LIST"
+                )
+            }
+            computed = Role.BG_LIST
+        }
         roleMemo[n] = computed ?: Role.UNKNOWN
         if (roleMemo.size > 4096) roleMemo.clear()
         return computed
     }
+
+    /** 名字是"背景/条/横幅/填充"语义（排除纯文字/字体资源）。 */
+    private fun isBackgroundLike(n: String): Boolean {
+        if (n.contains("text") || n.contains("font")) return false
+        return n.contains("_bg") || n.contains("bg_") || n.contains("background") ||
+            n.contains("banner") || n.contains("_bar") || n.contains("fill") ||
+            n.contains("panel") || n.contains("_strip")
+    }
+
+    private var bgRoleFixLog = 0
 
     private fun computeRole(n: String): Role? {
         // 不参与莫奈取色的固定语义色

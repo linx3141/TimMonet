@@ -145,8 +145,6 @@ object TimMonetHooks {
 
     /** 转发页行绑定耗时统计（定位分享页卡顿）。 */
 
-
-
     private var summaryHighlightLogCount = 0
 
     private var todoRedLogCount = 0
@@ -245,6 +243,10 @@ object TimMonetHooks {
         hookResources(module)
         hookDrawables(module)
         hookViewBackground(module)
+        hookSetBackground(module)
+        hookNoticeBarBg(module, classLoader)
+        hookAttachedTinyBg(module)
+        hookAttachedNoticeBar(module)
         hookTextContrast(module)
         hookStatusBar(module)
         hookAioEditText(module, classLoader)
@@ -1757,12 +1759,19 @@ private fun hookPanelDispatch(module: XposedModule) {
                     if (!panelSeen) return@intercept chain.proceed()
                     val vg = chain.thisObject as? ViewGroup
                     if (vg != null && !isThirdPartyUiActive()) {
+                        // 提示条（微云入口）：每帧纠正一次背景与图标 ——
+                        // 一次性处理会被 TIM 后续的 bind/刷新覆盖掉（实测图标
+                        // 的 colorFilter 就是被覆盖的那一个）。几何筛很便宜，
+                        // 只有全宽且高 100~140 的 View 才会走到 getLocationOnScreen。
+                        if (vg.width >= 1250 && vg.height in 100..140) {
+                            runCatching { fixNoticeBar(vg) }
+                        }
                         if (panelSeen && isPlusPanelClass(vg.javaClass)) {
-                            val done = frames[vg] ?: 0
-                            if (done >= 3) {
-                                return@intercept chain.proceed()
-                            }
-                            frames[vg] = done + 1
+                            // 以前限制"每个面板只处理前 3 帧"：点击时图标会切到
+                            // pressed 态（另一个 drawable），那时帧数早就超了，新的
+                            // drawable 一直没被染色 -> 按下去变黑（私聊"文件"最明显）。
+                            // 已处理过的 drawable 都在 rasterizedPanelIcons 里、命中
+                            // 直接跳过，所以每帧遍历这十来个 item 的开销可忽略。
                             walkViewTree(vg, 200) { v ->
                                 // 入口底板同样在绘制前兜一道
                                 fixPlusItemPlate(v)
@@ -1877,10 +1886,6 @@ private fun hookPlusPanelPlate(module: XposedModule) {
             }
         }
 }
-
-
-
-
 
 
 
@@ -5816,6 +5821,8 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private var tabIconLog = 0
 
+
+
     /** 被我们重建过的顶栏分段 tab 背景（用于识别这类 RadioButton 并改文字色）。 */
     private val headerTabDrawables: MutableSet<Drawable> =
         java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
@@ -5871,6 +5878,192 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (v is android.widget.CompoundButton) fixHeaderTabTextColor(v)
                     } catch (t: Throwable) {
                         // ignore
+                    }
+                    result
+                }
+            }
+    }
+
+    /** 兜底扫尾：View attach 到窗口时检查**它自己**的背景是不是"极小纯色位图"。
+     *
+     *  前几轮分别挂在 tintDrawable / setBackgroundDrawable / setBackground 上
+     *  都没命中 —— 说明那个背景根本没经过这些 setter（TIM 的自定义 inflater
+     *  或直接在构造器里赋值）。这里不再关心它是怎么设进来的，只看最终状态。 */
+    private fun hookAttachedTinyBg(module: XposedModule) {
+        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
+            ?.let { method ->
+                logOnce("hook installed: View.onAttachedToWindow (tiny solid bg)")
+                runCatching { module.deoptimize(method) }
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    runCatching {
+                        val v = chain.thisObject as? View ?: return@runCatching
+                        val d = v.background ?: return@runCatching
+                        fixTinySolidBg(v, d)
+                    }
+                    result
+                }
+            }
+    }
+
+    /** QUI 通知条（com.tencent.biz.qui.noticebar）的背景。
+     *
+     *  反编译定位：noticebar/a/a.java 的 c() 返回
+     *      new ColorDrawable(context.getColor(R.color.qui_tui_common_bg_page))
+     *  它是 ColorDrawable 且颜色走 Context.getColor（不经过 Resources.getDrawable），
+     *  所以既不在 tintDrawable 里、background 也不是我们认识的那些素材 ——
+     *  前面按名字/按类型/按尺寸/按最终状态尝试全部打空，就是因为它压根没进
+     *  染色链路。文件页"本机"tab 顶部那条微云入口用的就是这个。
+     *  这里直接改它的返回值。 */
+    private fun hookNoticeBarBg(module: XposedModule, cl: ClassLoader) {
+        runCatching {
+            val cls = Class.forName("com.tencent.biz.qui.noticebar.a.a", false, cl)
+            findMethod(cls, setOf("c"))
+                ?.let { method ->
+                    logOnce("hook installed: noticebar.a.a.c (notice bar bg)")
+                    runCatching { module.deoptimize(method) }
+                    module.hook(method).intercept { chain ->
+                        var result = chain.proceed() as? Drawable
+                        runCatching {
+                            if (result != null && ThemeState.isNight(null, timClassLoader)) {
+                                val bg = TokenMapper.bgPage(true)
+                                result!!.mutate()
+                                result.setTint(bg)
+                                Log.i(TAG, "notice bar bg -> #" + Integer.toHexString(bg))
+                            }
+                        }
+                        result
+                    }
+                }
+        }.onFailure { Log.w(TAG, "notice bar bg hook failed", it) }
+    }
+
+    /** 现代路径：View.setBackground(Drawable)（直接赋值，不走 setBackgroundDrawable）。 */
+    private fun hookSetBackground(module: XposedModule) {
+        findMethod(
+            Class.forName("android.view.View"),
+            setOf("setBackground"),
+            Drawable::class.java
+        )?.let { method ->
+            logOnce("hook installed: View.setBackground (tiny solid bg)")
+            runCatching { module.deoptimize(method) }
+            module.hook(method).intercept { chain ->
+                val result = chain.proceed()
+                runCatching {
+                    val v = chain.thisObject as? View ?: return@runCatching
+                    val d = chain.getArg(0) as? Drawable ?: return@runCatching
+                    fixTinySolidBg(v, d)
+                }
+                result
+            }
+        }
+    }
+
+    /** 背景设置的统一拦截。
+     *
+     *  ⚠️ 必须**同时**挂 setBackground 和 setBackgroundDrawable：现代 Android 的
+     *  setBackground(Drawable) 是直接赋值 mBackground，并不会调用已废弃的
+     *  setBackgroundDrawable —— 只挂后者会漏掉 XML inflate 和绝大多数代码路径
+     *  （文件页的微云入口条就是这么逃掉的，前几轮一直找不到）。
+     *
+     *  这里把"极小尺寸的纯色位图"（2x2/4x4 之类靠拉伸铺满的纯色底素材）在
+     *  深色主题下直接换成页面底色：它们进不了栅格化染色（core<8、彩色占比
+     *  两条门槛都放过），是残留亮条的主要来源。 */
+    private fun fixTinySolidBg(v: View, d: Drawable) {
+        if (!ThemeState.isNight(null, timClassLoader)) return
+        // 判据彻底放开，只留一条本质规则：
+        //   深色主题下，View 的**背景**是亮色、且不在当前配色方案里 -> 换成页面底色。
+        // 不再限制 drawable 类型和尺寸 —— TIM 皮肤引擎会把素材包成各种自定义
+        // Drawable（SkinnableBitmapDrawable 等，不是 BitmapDrawable 子类），
+        // intrinsic 尺寸又常被替换成拉伸后的值，按类型/尺寸判断全都会漏
+        // （前几版就是这样一条都没中）。
+        // 按钮等用的是配色方案内的 primary/container 色，被 isSchemeColor 挡掉。
+        val c = colorOfDrawable(d) ?: return
+        if (isSchemeColor(c, true)) return
+        val luma = (((c shr 16) and 0xFF) * 299 + ((c shr 8) and 0xFF) * 587 +
+            (c and 0xFF) * 114) / 1000
+        if (luma <= 170) return
+        val gd = GradientDrawable()
+        gd.shape = GradientDrawable.RECTANGLE
+        gd.setColor(TokenMapper.bgPage(true))
+        v.setBackground(gd)
+        Log.i(
+            TAG,
+            "bright bg -> page color on " + v.javaClass.simpleName +
+                " d=" + d.javaClass.simpleName + " #" + Integer.toHexString(c) +
+                " " + v.width + "x" + v.height
+        )
+    }
+
+    /** 已换过背景的提示条（背景只需设一次；图标要持续纠正）。 */
+    private val noticeBarPainted: MutableSet<View> =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+
+    /** 文件页顶部的提示条（微云入口）：几何定位后换背景 + 染里面的图标。
+     *
+     *  几何特征：全宽(>=1250) + 高 100..140 + 屏幕 y 在 250..380。
+     *  它的背景是皮肤引擎包的 SkinnableNinePatchDrawable，isNight 与取色两个
+     *  判据实测都不可靠（一个 false 一个 #0），所以只能靠几何定位。
+     *  里面的"云"图标是 ImageView 的彩色位图，也走不到常规图标染色路径。 */
+    private fun fixNoticeBar(v: View) {
+        if (v.width < 1250 || v.height !in 100..140) return
+        val loc = IntArray(2)
+        runCatching { v.getLocationOnScreen(loc) }
+        if (loc[1] !in 250..380) return
+        val scheme = MonetPalette.palette(true)
+        // ① 背景 -> 页面底色（只在第一次设；本方法会被每帧调用）
+        if (noticeBarPainted.add(v)) {
+            val gd = GradientDrawable()
+            gd.shape = GradientDrawable.RECTANGLE
+            gd.setColor(TokenMapper.bgPage(true))
+            v.setBackground(gd)
+        }
+        // ② 里面的图标 -> 亮色。图标可能是 ImageView，也可能是 TextView 的
+        //    drawableLeft（"文件+波纹"那个图标就在文字左边），两种都覆盖。
+        //    这里只改 drawable 自身、不重新 setCompoundDrawables —— 后者会把
+        //    bounds 丢掉导致图标变形。
+        if (v is ViewGroup) {
+            walkViewTree(v, 30) { child ->
+                runCatching {
+                    when (child) {
+                        // 已经有 colorFilter 的说明染过了（TIM 没换新 drawable），
+                        // 直接跳过 —— 所以每帧实际只做一次判空，几乎零开销。
+                        // 一旦 TIM 重设成新 drawable，filter 为空，就会重染一次。
+                        is android.widget.ImageView -> child.drawable?.let { d ->
+                            if (d.colorFilter == null) {
+                                d.mutate()
+                                d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
+                            }
+                        }
+                        is TextView -> child.compoundDrawables?.forEach { d ->
+                            if (d != null && d.colorFilter == null) {
+                                d.mutate()
+                                d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** View attach 后立刻（下一帧）检查一次 —— 让提示条在首帧就是对的，
+     *  不用等到 onResume 之后。 */
+    private fun hookAttachedNoticeBar(module: XposedModule) {
+        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
+            ?.let { method ->
+                logOnce("hook installed: View.onAttachedToWindow (notice bar)")
+                runCatching { module.deoptimize(method) }
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    runCatching {
+                        val v = chain.thisObject as? View ?: return@runCatching
+                        if (v.width >= 1250 && v.height in 100..140) {
+                            v.post { runCatching { fixNoticeBar(v) } }
+                        } else if (v is ViewGroup) {
+                            // 尺寸还没算出来时，下一帧再判断
+                            v.post { runCatching { fixNoticeBar(v) } }
+                        }
                     }
                     result
                 }
@@ -8482,6 +8675,16 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun rasterizeIconUniform(drawable: Drawable): Drawable? {
         return try {
             if (isThirdPartyUiActive()) return null
+            // 网络图（URLDrawable 等）内容是异步加载的：栅格化只会拿到"图还没到"
+            // 的空画面并把它固化下来。改成挂 colorFilter —— 图片加载完成后依然
+            // 生效，单色线条图正合适。
+            if (drawable.javaClass.name.contains("URL", ignoreCase = true)) {
+                val urlScheme = MonetPalette.palette(ThemeState.isNight(null, timClassLoader))
+                if (urlScheme.isDark) {
+                    drawable.setColorFilter(urlScheme.onSurface, PorterDuff.Mode.SRC_IN)
+                }
+                return drawable
+            }
             var iw = drawable.intrinsicWidth
             var ih = drawable.intrinsicHeight
             if (iw <= 0 || ih <= 0) {
