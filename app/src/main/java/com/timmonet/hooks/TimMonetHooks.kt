@@ -40,8 +40,10 @@ import com.materialkolor.scheme.DynamicScheme
 import com.timmonet.MainModule
 import com.timmonet.core.ArkPackagePatcher
 import com.timmonet.core.MonetPalette
+import android.content.res.Configuration
 import com.timmonet.core.SettingsBridge
 import com.timmonet.core.ThemeState
+import com.timmonet.ui.theme.ColorMode
 import com.timmonet.core.TokenMapper
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -292,6 +294,7 @@ object TimMonetHooks {
         hookAlbumTimelineText(module, classLoader)
         hookForceLight(module, classLoader)
         hookResumeRefresh(module, classLoader)
+        registerSystemNightCallback()
         hookSettingEntry(module, classLoader)
     }
 
@@ -2119,6 +2122,7 @@ private var appliedThemeGen = -1L
  *     resume 时对当前界面整体重染——文字/背景按新 scheme 重映射，RecyclerView
  *     列表 notifyDataSetChanged 让其按新配色重建(inflate 资源重走 hook)，
  *     QUIBadge 角标重算。 */
+
 private fun hookResumeRefresh(module: XposedModule, cl: ClassLoader) {
     findMethod(Activity::class.java, setOf("onResume"))
         ?.let { method ->
@@ -5746,6 +5750,61 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private var statusBarLogCount = 0
+
+    /** 系统深浅色切换 → 强停 TIM。
+     *
+     *  本进程注册 ComponentCallbacks：系统级配置变化（含深色模式）时由系统直接
+     *  回调 onConfigurationChanged —— 即时、不用轮询、也没有启动宽限期的延迟。
+     *  （TIM 自己改配置不走这个回调，所以不像读 app.resources 那样抖动误判。）
+     *
+     *  只有"跟随系统"的自动模式才需要重启：那时配色确实跟着系统变了；
+     *  固定浅色/深色时系统怎么切都不影响配色。 */
+    private fun registerSystemNightCallback() {
+        val app = runCatching {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null) as? android.app.Application
+        }.getOrNull() ?: run {
+            // 模块加载常常早于 Application 创建（这时 currentApplication() 是
+            // null，注册会直接失败 —— 实测就是因此完全没注册上）。隔 500ms 重试。
+            android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed({ registerSystemNightCallback() }, 500L)
+            return
+        }
+        systemNightLast = runCatching {
+            app.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        }.getOrDefault(-1)
+        runCatching {
+            app.registerComponentCallbacks(object : android.content.ComponentCallbacks2 {
+                override fun onConfigurationChanged(newConfig: Configuration) {
+                    runCatching { onSystemConfigChanged(newConfig) }
+                }
+
+                override fun onLowMemory() {
+                    // ignore
+                }
+
+                override fun onTrimMemory(level: Int) {
+                    // ignore
+                }
+            })
+        }
+        Log.i(TAG, "night callbacks registered, base=$systemNightLast")
+    }
+
+    /** 系统配置变化回调：只在"日夜位真的变了"且模块处于自动模式时强停 TIM。 */
+    private fun onSystemConfigChanged(cfg: Configuration) {
+        val night = cfg.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        val prev = systemNightLast
+        systemNightLast = night
+        if (prev == -1 || night == prev) return
+        val mode = SettingsBridge.current.colorMode
+        if (mode == ColorMode.SYSTEM || mode == ColorMode.MONET_SYSTEM) {
+            Log.i(TAG, "system night $prev -> $night (mode=$mode), restarting TIM")
+            SettingsBridge.killTimProcess()
+        }
+    }
+
+    @Volatile private var systemNightLast = -1
 
     private var blackFixLog = 0
 

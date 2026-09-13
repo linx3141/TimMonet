@@ -51,8 +51,9 @@ object SettingsBridge {
         }
     }
 
-    /** 颜色相关设置变更 → 结束 TIM 进程（仅在 TIM 进程内执行；用户重开即全量新配色）。 */
-    private fun killTimProcess() {
+    /** 颜色相关设置变更 → 结束 TIM 进程（仅在 TIM 进程内执行；用户重开即全量新配色）。
+     *  系统深浅色切换（自动模式下）也走这里，见 hookSystemNightChange。 */
+    internal fun killTimProcess() {
         try {
             val app = Class.forName("android.app.ActivityThread")
                 .getMethod("currentApplication").invoke(null) as? android.content.Context
