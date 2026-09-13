@@ -251,6 +251,36 @@ object TimMonetHooks {
         hookNoticeBarBg(module, classLoader)
         hookPolarLightCard(module)
         hookPolarLightLate(module)
+        onViewAttached { v ->
+            v.post {
+                runCatching {
+                    // TabLayout 的选中指示器（自绘，不走 View.background）
+                    fixTabIndicator(v)
+                    // TIM 会在 attach 之后重新设置它的背景（实测处理过又被覆盖回
+                    // 亮色），所以在后续几个时间点各补一次 —— 同 hookPolarLightLate
+                    // 处理极光卡片的思路。
+                    fixThinBrightLine(v)
+                    v.postDelayed({ runCatching { fixThinBrightLine(v) } }, 300L)
+                    v.postDelayed({ runCatching { fixThinBrightLine(v) } }, 1200L)
+                    // 诊断：屏幕底部区域的矮元素（找那条 3px 全宽亮线到底是什么）
+                    val loc = IntArray(2)
+                    v.getLocationOnScreen(loc)
+                    val h = v.resources.displayMetrics.heightPixels
+                    if (loc[1] > h - 400 && bottomElLog++ < 40) {
+                        val d = v.background
+                        Log.i(
+                            TAG,
+                            "bottom el " + v.javaClass.name + " " + v.width + "x" +
+                                v.height + " at=" + loc[0] + "," + loc[1] +
+                                " bg=" + (d?.javaClass?.simpleName ?: "null") +
+                                " c=" + (d?.let { runCatching { solidColorOf(it) }.getOrNull() }
+                                    ?.let { "#" + Integer.toHexString(it) } ?: "?")
+                        )
+                    }
+                }
+            }
+        }
+        installAttachDispatcher(module)
         hookAttachedTinyBg(module)
         hookAttachedNoticeBar(module)
         hookTextContrast(module)
@@ -717,7 +747,7 @@ object TimMonetHooks {
                                 val alpha = (rCol ushr 24) and 0xFF
                                 val opaqueCol = opaqueColor(rCol)
                                 if (rCol != 0 && alpha in 1..127 &&
-                                    colorLuma(opaqueCol) >= 235
+                                    colorLuma(opaqueCol) >= LUMA_NEAR_WHITE
                                 ) {
                                     val cardCol = scheme.surfaceBright
                                     if (rb is android.graphics.drawable.ColorDrawable) {
@@ -953,7 +983,7 @@ object TimMonetHooks {
                         val alpha = hint ushr 24
                         if (alpha != 0) {
                             val opaque = opaqueColor(hint)
-                            if (colorLuma(opaque) < 160) {
+                            if (colorLuma(opaque) < LUMA_MID) {
                                 v2.setHintTextColor(target)
                             }
                         }
@@ -971,7 +1001,7 @@ object TimMonetHooks {
                             sampleBitmapColorOfDrawable(d2)
                         }.getOrNull() ?: return@walkViewTree
                         val op2 = dom or 0xFF000000.toInt()
-                        if (colorLuma(op2) < 160) {
+                        if (colorLuma(op2) < LUMA_MID) {
                             runCatching {
                                 d2.mutate()
                                 d2.setColorFilter(target, PorterDuff.Mode.SRC_IN)
@@ -1094,7 +1124,7 @@ object TimMonetHooks {
                             sampleBitmapColorOfDrawable(d)
                         }.getOrNull() ?: return@walkViewTree
                         val op = dom or 0xFF000000.toInt()
-                        if (colorLuma(op) >= 160) return@walkViewTree
+                        if (colorLuma(op) >= LUMA_MID) return@walkViewTree
                     }
                     runCatching {
                         d.mutate()
@@ -1271,13 +1301,13 @@ private fun mapPopupTextColor(color: Int, scheme: DynamicScheme): Int {
     if (isSchemeColor(opaque, scheme.isDark)) {
         // 已经是角色色：onPrimary 这类角色色不动；其余低亮度角色色换 onSurface 提对比
         if (opaque != (0xFF000000.toInt() or (scheme.onPrimary and 0x00FFFFFF)) &&
-            colorLuma(opaque) < 150
+            colorLuma(opaque) < LUMA_MID_LOW
         ) {
             return (scheme.onSurface and 0x00FFFFFF) or (alpha shl 24)
         }
         return color
     }
-    if (colorLuma(opaque) >= 140) return color
+    if (colorLuma(opaque) >= LUMA_DARK_TEXT) return color
     if (opaque == 0xFF000000.toInt()) {
         return (scheme.onSurface and 0x00FFFFFF) or (alpha shl 24)
     }
@@ -1403,13 +1433,28 @@ private fun hookForwardDialog(module: XposedModule, cl: ClassLoader) {
 @Volatile private var panelSeen = false
 
 private val panelItemViews: MutableSet<View> =
-    java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+    // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+    // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+    // 的结构性修改（丢数据/脏读）。
+    java.util.Collections.synchronizedSet(
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+    )
 private val panelDrawables: MutableSet<Drawable> =
-    java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+    // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+    // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+    // 的结构性修改（丢数据/脏读）。
+    java.util.Collections.synchronizedSet(
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+    )
 
 /** 已换过底板的面板入口容器（弱引用，每个 View 只处理一次）。 */
 private val plusPlateViews: MutableSet<View> =
-    java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+    // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+    // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+    // 的结构性修改（丢数据/脏读）。
+    java.util.Collections.synchronizedSet(
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+    )
 
 private var plusPlateLog = 0
 
@@ -1648,45 +1693,37 @@ private fun isInProfileCardUi(view: View?): Boolean {
 private fun looksLikeAccountText(s: String): Boolean {
     if (s.length !in 5..24) return false
     if (s.count { it.isDigit() } < 5) return false
-    return s.all {
-        it.isDigit() || it == ':' || it == '：' || it == ' ' ||
-            it == 'Q' || it == 'q' || it == '号' || it == 'I' || it == 'D'
-    }
+    // ⚠️ 收紧判据：原来只要"全是 数字/冒号/空格/Qq号ID 这些字符"就算账号文本，
+    // 于是 "2024 03 05"（日期）、"12345 67890"（普通数字串）都会被命中，
+    // 被强制提亮成 onSurface + alpha=1。现在要求**明确的账号形态**：
+    val t = s.trim()
+    if (t.startsWith("QQ:", true) || t.startsWith("QQ：", true) ||
+        t.startsWith("QID:", true) || t.startsWith("QID：", true)
+    ) return true
+    // 纯数字（QQ 号本体，无空格无其它字符）
+    return t.isNotEmpty() && t.all { it.isDigit() }
 }
 
 /** 长数字文本(QQ 号等)在 attach 时兜底:布局里静态写的文本不经过
  *  setText,只在挂载时补齐染色(不透明 onSurface)。 */
 private fun hookLongNumberText(module: XposedModule) {
-    findMethod(TextView::class.java, setOf("onAttachedToWindow"))
-        ?.let { method ->
-            logOnce("hook installed: TextView.onAttachedToWindow (long number text)")
-            runCatching { module.deoptimize(method) }
-            module.hook(method).intercept { chain ->
-                                    // 第三方模块注入界面:整体跳过染色
-                                    if (isThirdPartyUiActive()) return@intercept chain.proceed()
-                val result = chain.proceed()
-                try {
-                    val tv = chain.thisObject as? TextView
-                    val t = tv?.text?.toString()?.trim()
-                    if (tv != null && t != null && looksLikeAccountText(t) &&
-                        !isInProfileCardUi(tv)
-                    ) {
-                        val scheme = MonetPalette.palette(
-                            MonetPalette.isDarkNow()
-                        )
-                        if (scheme.isDark) {
-                            // 账号文字与"对方气泡内文字"同色:不透明 onSurface,
-                            // 并清掉 View 级 alpha(TIM 对次要信息会用 alpha<1)
-                            tv.alpha = 1f
-                            tv.setTextColor(scheme.onSurface)
-                        }
-                    }
-                } catch (t: Throwable) {
-                    // ignore
+    onViewAttached { tv ->
+        if (tv !is TextView) return@onViewAttached
+        // 第三方模块注入界面:整体跳过染色
+        if (isThirdPartyUiActive()) return@onViewAttached
+        val t = tv.text?.toString()?.trim() ?: return@onViewAttached
+        if (looksLikeAccountText(t) && !isInProfileCardUi(tv)) {
+            runCatching {
+                val scheme = MonetPalette.palette(MonetPalette.isDarkNow())
+                if (scheme.isDark) {
+                    // 账号文字与"对方气泡内文字"同色:不透明 onSurface,
+                    // 并清掉 View 级 alpha(TIM 对次要信息会用 alpha<1)
+                    tv.alpha = 1f
+                    tv.setTextColor(scheme.onSurface)
                 }
-                result
             }
         }
+    }
 }
 
 /** 会话列表顶部"已登录 XXX"提示条(LoginDevicesBannerProcessor):
@@ -1847,51 +1884,25 @@ private fun fixTitleBarIcon(v: View) {
 }
 
 private fun hookTitleBarLeftButton(module: XposedModule) {
-    findMethod(View::class.java, setOf("onAttachedToWindow"))
-        ?.let { method ->
-            logOnce("hook installed: View.onAttachedToWindow (titlebar left btn)")
-            runCatching { module.deoptimize(method) }
-            module.hook(method).intercept { chain ->
-                val result = chain.proceed()
-                try {
-                    val v = chain.thisObject as? View
-                    val id = v?.id ?: View.NO_ID
-                    // 预筛：只有 app 资源 id(0x7f...) 才去查名字；entryName()
-                    // 自带缓存，避免每次 attach 都走 Resources 反射
-                    if (v != null && id != View.NO_ID && (id ushr 24) == 0x7f &&
-                        !isThirdPartyUiActive()
-                    ) {
-                        val nm = entryName(v.resources, id)
-                        if (nm == "ivTitleBtnLeft" || nm == "ivTitleBtnRightImage") {
-                            fixTitleBarIcon(v)
-                        }
-                    }
-                } catch (t: Throwable) {
-                    // ignore
-                }
-                result
+    onViewAttached { v ->
+        val id = v.id
+        // 预筛：只有 app 资源 id(0x7f...) 才去查名字；entryName() 自带缓存，
+        // 避免每次 attach 都走 Resources 反射
+        if (id != View.NO_ID && (id ushr 24) == 0x7f && !isThirdPartyUiActive()) {
+            val nm = entryName(v.resources, id)
+            if (nm == "ivTitleBtnLeft" || nm == "ivTitleBtnRightImage") {
+                runCatching { fixTitleBarIcon(v) }
             }
         }
+    }
 }
 
 private fun hookPlusPanelPlate(module: XposedModule) {
-    findMethod(View::class.java, setOf("onAttachedToWindow"))
-        ?.let { method ->
-            logOnce("hook installed: View.onAttachedToWindow (plus plate)")
-            runCatching { module.deoptimize(method) }
-            module.hook(method).intercept { chain ->
-                val result = chain.proceed()
-                if (panelSeen) {
-                    try {
-                        val v = chain.thisObject as? View
-                        if (v is FrameLayout) fixPlusItemPlate(v)
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                }
-                result
-            }
+    onViewAttached { v ->
+        if (panelSeen && v is FrameLayout) {
+            runCatching { fixPlusItemPlate(v) }
         }
+    }
 }
 
 
@@ -1975,15 +1986,9 @@ private fun hookQuickMenuTheme(module: XposedModule, cl: ClassLoader) {
         Log.w(TAG, "QQCustomMenu* layouts not found")
         return
     }
-    findMethod(View::class.java, setOf("onAttachedToWindow"))
-        ?.let { method ->
-            logOnce("hook installed: View.onAttachedToWindow (quick menu theme)")
-            runCatching { module.deoptimize(method) }
-            module.hook(method).intercept { chain ->
-                val result = chain.proceed()
-                try {
-                    val view = chain.thisObject as? View
-                    if (view != null) {
+    onViewAttached { view ->
+                runCatching {
+                    if (true) {
                         if (classes.any { it.isInstance(view) }) {
                             // 菜单 attach 即染色一次(原 40 次/10s 轮跑经实验证明非必需)
                             runCatching {
@@ -2045,12 +2050,8 @@ private fun hookQuickMenuTheme(module: XposedModule, cl: ClassLoader) {
                             }
                         }
                     }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "quick menu attach failed", t)
                 }
-                result
-            }
-        }
+    }
 }
 
 
@@ -2241,7 +2242,7 @@ private fun loginPageMonetizePass(decor: View, cl: ClassLoader) {
                 when (b) {
                     is android.graphics.drawable.ColorDrawable -> {
                         val cur = opaqueColor(b.color)
-                        if (colorLuma(cur) >= 120) {
+                        if (colorLuma(cur) >= LUMA_DARK) {
                             b.mutate()
                             b.color = target
                         }
@@ -2251,7 +2252,7 @@ private fun loginPageMonetizePass(decor: View, cl: ClassLoader) {
                             b.color?.defaultColor
                         }.getOrNull() ?: 0
                         val op = opaqueColor(g0)
-                        if (g0 == 0 || colorLuma(op) >= 120) {
+                        if (g0 == 0 || colorLuma(op) >= LUMA_DARK) {
                             b.mutate()
                             b.setColor(target)
                         }
@@ -2337,7 +2338,7 @@ private fun loginPageMonetizePass(decor: View, cl: ClassLoader) {
                         }
                         is android.graphics.drawable.ColorDrawable -> {
                             val c0 = opaqueColor(b.color)
-                            nearWhite = colorLuma(c0) >= 220
+                            nearWhite = colorLuma(c0) >= LUMA_VERY_LIGHT
                         }
                         else -> {}
                     }
@@ -2429,7 +2430,7 @@ private fun forceMonetQuickMenu(root: View?) {
                                 }
                             }
                         }
-                    } else if (w0 > 0 && h0 > 0 && colorLuma(op) >= 140) {
+                    } else if (w0 > 0 && h0 > 0 && colorLuma(op) >= LUMA_DARK_TEXT) {
                         runCatching {
                             bgV.mutate()
                             bgV.color = panelColor
@@ -2453,7 +2454,7 @@ private fun forceMonetQuickMenu(root: View?) {
                         0xFFFFFFFF.toInt()
                     }
                     val op = opaqueColor(g0)
-                    if (g0 == 0 || colorLuma(op) >= 140) {
+                    if (g0 == 0 || colorLuma(op) >= LUMA_DARK_TEXT) {
                         if (forceSolidDrawableColor(bgV, panelColor)) {
                             handledBg++
                             if (quickMenuLogCount++ < 5) {
@@ -2470,7 +2471,7 @@ private fun forceMonetQuickMenu(root: View?) {
             if (v is TextView) {
                 val color = v.currentTextColor
                 val opaque = opaqueColor(color)
-                if (colorLuma(opaque) >= 200 &&
+                if (colorLuma(opaque) >= LUMA_LIGHT &&
                     opaque != (opaqueColor(textColor))
                 ) {
                     v.setTextColor(textColor)
@@ -2525,7 +2526,7 @@ private fun forceMonetQuickMenu(root: View?) {
                         val changed = when {
                             bg2 is ColorDrawable -> {
                                 val cur = opaqueColor(bg2.color)
-                                colorLuma(cur) >= 150 &&
+                                colorLuma(cur) >= LUMA_MID_LOW &&
                                     forceSolidDrawableColor(bg2, panelColor)
                             }
                             bg2 is GradientDrawable -> {
@@ -2533,7 +2534,7 @@ private fun forceMonetQuickMenu(root: View?) {
                                     bg2.color?.defaultColor
                                 }.getOrNull() ?: 0
                                 val op = opaqueColor(g0)
-                                (g0 == 0 || colorLuma(op) >= 140) &&
+                                (g0 == 0 || colorLuma(op) >= LUMA_DARK_TEXT) &&
                                     forceSolidDrawableColor(bg2, panelColor)
                             }
                             bg2 is LayerDrawable ->
@@ -3148,8 +3149,7 @@ private fun rasterizeIconColor(drawable: Drawable, color: Int): Drawable? {
             }
             core++
             val src = px[i]
-            val lum = (((src ushr 16) and 0xFF) * 299 + ((src ushr 8) and 0xFF) * 587 +
-                (src and 0xFF) * 114) / 1000
+            val lum = colorLuma((src ushr 16) and 0xFF, (src ushr 8) and 0xFF, src and 0xFF)
             val k = 0.35f + 0.65f * (lum / 255f)
             val r = (((color ushr 16) and 0xFF) * k).toInt().coerceIn(0, 255)
             val g = (((color ushr 8) and 0xFF) * k).toInt().coerceIn(0, 255)
@@ -3846,7 +3846,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (profileUiCount <= 0) return@intercept chain.proceed()
                         val view = chain.thisObject as? View
                         val incoming = chain.getArg(0) as? Drawable
-                        // 近白判定：无新背景（null）或背景为 luma>=235 的纯色
+                        // 近白判定：无新背景（null）或背景为 luma >= LUMA_NEAR_WHITE 的纯色
                         val nearWhite = if (incoming == null) {
                             true
                         } else {
@@ -3903,27 +3903,16 @@ private fun hookSummaryBadge(module: XposedModule) {
                 }
             }
             // View.onAttachedToWindow：内容卡本体挂载 → 计数 + 立即刷底 + 三次延迟兜底
-            findMethod(View::class.java, setOf("onAttachedToWindow"))
-                ?.let { method ->
-                    logOnce("hook installed: View.onAttachedToWindow (profile card bg)")
-                    runCatching { module.deoptimize(method) }
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        val view = chain.thisObject as? View
-                        if (view == null) return@intercept result
-                        if (profileContentCls.isInstance(view)) {
-                            profileUiCount++
-                            try {
-                                view.setBackground(cardFactory())
-                                // attach 即刷一次子树(延时兜底经实验证明非必需)
-                                forceProfilePageCards(view, cl)
-                            } catch (t: Throwable) {
-                                Log.w(TAG, "profile content card bg failed", t)
-                            }
-                        }
-                        result
-                    }
+            onViewAttached { view ->
+                if (profileContentCls.isInstance(view)) {
+                    profileUiCount++
+                    runCatching {
+                        view.setBackground(cardFactory())
+                        // attach 即刷一次子树(延时兜底经实验证明非必需)
+                        forceProfilePageCards(view, cl)
+                    }.onFailure { Log.w(TAG, "profile content card bg failed", it) }
                 }
+            }
             // rebuildProfileContent：内容重建后整棵子树重刷一遍卡片
             val cardInfoType = try {
                 Class.forName("com.tencent.mobileqq.profilecard.data.ProfileCardInfo", false, cl)
@@ -4338,28 +4327,12 @@ private fun hookSummaryBadge(module: XposedModule) {
                     }
                 }
             // 任何气泡视图挂载后再次整棵登记（回收重挂期间父链断裂也能按身份命中）
-            findMethod(View::class.java, setOf("onAttachedToWindow"))
-                ?.let { method ->
-                    logOnce("hook installed: View.onAttachedToWindow (unread bubble protect)")
-                    runCatching { module.deoptimize(method) }
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        try {
-                            val view = chain.thisObject as? View
-                            if (view != null) {
-                                val name = view.javaClass.name
-                                if (name.contains("UnreadBubble") ||
-                                    name.contains("unreadbubble")
-                                ) {
-                                    view.post { protectUnreadSubtree(view) }
-                                }
-                            }
-                        } catch (t: Throwable) {
-                            // ignore
-                        }
-                        result
-                    }
+            onViewAttached { view ->
+                val name = view.javaClass.name
+                if (name.contains("UnreadBubble") || name.contains("unreadbubble")) {
+                    view.post { runCatching { protectUnreadSubtree(view) } }
                 }
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "UnreadBubbleVB not found", t)
         }
@@ -4481,7 +4454,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     val tc = view.currentTextColor
                     val alpha = tc ushr 24
                     val luma = colorLuma((tc and 0xFFFFFF) or 0xFF000000.toInt())
-                    if (alpha != 0 && (alpha != 255 || luma < 150)) {
+                    if (alpha != 0 && (alpha != 255 || luma < LUMA_MID_LOW)) {
                         if (alpha < 255) {
                             setTextColorFast(view, scheme.onSurfaceVariant)
                         } else {
@@ -4643,7 +4616,7 @@ private fun hookSummaryBadge(module: XposedModule) {
         }
     }
 
-    /** 通用容器：仅当子项为近白（luma>=235）纯色背景时替换为 surfaceBright。 */
+    /** 通用容器：仅当子项为近白（luma >= LUMA_NEAR_WHITE）纯色背景时替换为 surfaceBright。 */
     private fun recolorContainer(container: DrawableContainer, scheme: DynamicScheme) {
         val state = container.constantState as? DrawableContainer.DrawableContainerState
             ?: return
@@ -4861,7 +4834,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val bl = c and 0xFF
-                val luma = (r * 299 + g * 587 + bl * 114) / 1000
+                val luma = colorLuma(r, g, bl)
                 lumaSum += luma
                 if (luma < 110) dark++
                 if (maxOf(r, g, bl) - minOf(r, g, bl) > 40) colorful++
@@ -5660,25 +5633,13 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun hookTextContrast(module: XposedModule) {
         // 注意挂 View.onAttachedToWindow：TextView 自己没重写这个方法，
         // findMethod(TextView::class.java, ...) 会返回 null、hook 根本装不上。
-        findMethod(View::class.java, setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (contrast fix)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val tv = chain.thisObject as? TextView
-                        if (tv != null && !isThirdPartyUiActive()) {
-                            fixLowContrastText(tv)
-                            // 卡片/列表底色往往是 attach 之后才被染深的，那时
-                            // 这一次检查看到的还是浅底、会被跳过 —— 单次 post
-                            // 到下一帧再判一次（不轮询）。
-                            tv.post { runCatching { fixLowContrastText(tv) } }
-                        }
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
+            onViewAttached { v ->
+                val tv = v as? TextView ?: return@onViewAttached
+                if (!isThirdPartyUiActive()) {
+                    runCatching { fixLowContrastText(tv) }
+                    // 卡片/列表底色往往是 attach 之后才被染深的，那时这一次检查
+                    // 看到的还是浅底、会被跳过 —— 下一帧再判一次（不轮询）。
+                    tv.post { runCatching { fixLowContrastText(tv) } }
                 }
             }
     }
@@ -5706,7 +5667,7 @@ private fun hookSummaryBadge(module: XposedModule) {
         // 纯黑 #000000 会命中方案里某个面角色(surfaceDim/container 系在深色下
         // 可以就是纯黑)，于是钱包设置页那些黑字全被当成"已染"跳过。
         // 映射本身是幂等的，重复处理无害。
-        if (luma >= 170) return
+        if (luma >= LUMA_BRIGHT_BG) return
         // 祖先链上第一个有背景的 view：只有它确实是深色，才算"深底深字"
         var bgLuma = -1
         var p: View? = tv.parent as? View
@@ -5721,7 +5682,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             depth++
         }
 
-        // 只要祖先链上没有**亮色**背景(luma>140)就提亮：
+        // 只要祖先链上没有**亮色**背景(luma > LUMA_DARK_TEXT)就提亮：
         // 深色底(#003045 luma=36)、透明底(bgLuma=-1)都算；
         // 白卡片上的黑字(luma=255)保持不动，那是正常的。
         if (bgLuma <= 140) {
@@ -5838,11 +5799,20 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private var redFilterDiag = 0
 
+    private var bottomElLog = 0
+
+    private var tabIndicatorLog = 0
+
 
 
     /** 被我们重建过的顶栏分段 tab 背景（用于识别这类 RadioButton 并改文字色）。 */
     private val headerTabDrawables: MutableSet<Drawable> =
-        java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+        // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+        // 的结构性修改（丢数据/脏读）。
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        )
 
     /** 顶栏分段 tab（文件发送页 最近/本机/收藏/微云）：文字色来自
      *  skin_title_segment_item_color（TIM 原版：选中=品牌蓝 #00A5E0 / 未选中=白），
@@ -5884,21 +5854,11 @@ private fun hookSummaryBadge(module: XposedModule) {
                 result
             }
         }
-        findMethod(View::class.java, setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (header tab text)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val v = chain.thisObject as? View
-                        if (v is android.widget.CompoundButton) fixHeaderTabTextColor(v)
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
-                }
+        onViewAttached { v ->
+            runCatching {
+                if (v is android.widget.CompoundButton) fixHeaderTabTextColor(v)
             }
+        }
     }
 
     /** 兜底扫尾：View attach 到窗口时检查**它自己**的背景是不是"极小纯色位图"。
@@ -5907,20 +5867,12 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  都没命中 —— 说明那个背景根本没经过这些 setter（TIM 的自定义 inflater
      *  或直接在构造器里赋值）。这里不再关心它是怎么设进来的，只看最终状态。 */
     private fun hookAttachedTinyBg(module: XposedModule) {
-        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (tiny solid bg)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    runCatching {
-                        val v = chain.thisObject as? View ?: return@runCatching
-                        val d = v.background ?: return@runCatching
-                        fixTinySolidBg(v, d)
-                    }
-                    result
-                }
+        onViewAttached { v ->
+            runCatching {
+                val d = v.background ?: return@runCatching
+                fixTinySolidBg(v, d)
             }
+        }
     }
 
     /** QUI 卡片的极光背景（com.tencent.biz.qui.quipolarlight.QUIPolarLightView）。
@@ -5985,6 +5937,92 @@ private fun hookSummaryBadge(module: XposedModule) {
         }.onFailure { Log.w(TAG, "notice bar bg hook failed", it) }
     }
 
+    /** 统一的 View attach 处理器注册表。
+     *
+     *  原来 View.onAttachedToWindow 上挂了 12 个独立 hook —— inflate 一个页面、
+     *  RecyclerView 回收再 attach 时，每个 View 都要串 12 层 chain.proceed() +
+     *  12 个 lambda；而且多个处理器改同一个 View 时的先后顺序取决于安装顺序，
+     *  很容易打架（实测极光卡片就被"后面的"覆盖过）。
+     *  现在只装一个 dispatcher，各处理器注册进来：注册顺序 = 执行顺序，
+     *  每个都包在 runCatching 里互相隔离。 */
+    private val attachHandlers = java.util.concurrent.CopyOnWriteArrayList<(View) -> Unit>()
+
+    private fun onViewAttached(handler: (View) -> Unit) {
+        attachHandlers.add(handler)
+    }
+
+    private fun installAttachDispatcher(module: XposedModule) {
+        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
+            ?.let { method ->
+                logOnce("hook installed: View.onAttachedToWindow (dispatcher)")
+                runCatching { module.deoptimize(method) }
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    val n = attachHandlers.size
+                    if (n > 0) {
+                        val v = chain.thisObject as? View
+                        if (v != null) {
+                            for (i in 0 until n) {
+                                runCatching { attachHandlers[i](v) }
+                            }
+                        }
+                    }
+                    result
+                }
+            }
+    }
+
+    /** TabLayout 的选中指示器（tabIndicator）。
+     *
+     *  它由控件自己绘制（内部 SlidingTabIndicator.draw），**不走 View.background**，
+     *  所以前面基于"背景染色"的手段全都抓不到。实测设置页/主界面底部 tab 栏
+     *  那条 3px 全宽亮线就是这个指示器 —— 颜色正好等于当前配色的 onSurface
+     *  （前景色被用在了绘制上）。
+     *  这里在 view attach 后主动把它设成 primary。 */
+    private fun fixTabIndicator(v: View) {
+        runCatching {
+            val cls = Class.forName("com.google.android.material.tabs.TabLayout")
+            if (!cls.isInstance(v)) return
+            if (!MonetPalette.isDarkNow()) return
+            val primary = MonetPalette.palette(true).primary
+            cls.getMethod("setSelectedTabIndicatorColor", Int::class.javaPrimitiveType)
+                .invoke(v, primary)
+            if (tabIndicatorLog++ < 5) {
+                Log.i(TAG, "tab indicator -> #" + Integer.toHexString(primary))
+            }
+        }
+    }
+
+    /** 全宽的"细亮线"兜底（高度 ≤ 8px）。
+     *
+     *  深色主题下这类线必定是浅色主题遗留的分隔线 / 底部安全区装饰（实测设置页
+     *  底部有一条 3px 的 #FFDBF3 亮线，固定在屏幕底部、不随滚动移动）。
+     *  它既不走 setBackground 的可识别路径，颜色采样也常拿不到，所以按
+     *  "全宽 + 极扁 + 亮色且不在配色内"这个组合特征兜底压暗。 */
+    private fun fixThinBrightLine(v: View) {
+        // 高度放宽到 120px：那条线的 View 本身可能有一个"安全区"的高度，
+        // 只是背景只在底部若干像素显色（实测 3px 亮、上方是卡片色）。
+        if (v.width < 1250 || v.height !in 1..120) return
+        if (!MonetPalette.isDarkNow()) return
+        val d = v.background ?: return
+        // 用 solidColorOf（超集）而不是 colorOfDrawable（最弱的一个：非
+        // Color/Gradient 一律返回 0）—— 否则皮肤引擎包出来的背景素材
+        // （SkinnableNinePatch/SkinnableBitmap 等）永远取不到色，
+        // 大量"亮色遗留底"就是这样漏掉的。
+        val c = solidColorOf(d) ?: return
+        if (isSchemeColor(c, true)) return
+        if (colorLuma(c) <= LUMA_BRIGHT_BG) return
+        val gd = GradientDrawable()
+        gd.shape = GradientDrawable.RECTANGLE
+        gd.setColor(TokenMapper.bgPage(true))
+        v.setBackground(gd)
+        Log.i(
+            TAG,
+            "thin bright line -> page color on " + v.javaClass.simpleName +
+                " " + v.width + "x" + v.height + " #" + Integer.toHexString(c)
+        )
+    }
+
     /** 极光卡片背景的**持续纠正**。
      *
      *  hookPolarLightCard 挂在 ImageView.setImageDrawable 上，但通用路径
@@ -5993,31 +6031,20 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  排除了 PolarLight 也无效，因为覆盖发生在后面）。
      *  这里在 attach 之后再补染一次，让专用结果成为最终结果。 */
     private fun hookPolarLightLate(module: XposedModule) {
-        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (polar light late)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
+        onViewAttached { v0 ->
+            runCatching {
+                val v = v0 as? android.widget.ImageView ?: return@runCatching
+                if (!v.javaClass.name.contains("PolarLight")) return@runCatching
+                v.postDelayed({
                     runCatching {
-                        val v = chain.thisObject as? android.widget.ImageView
-                            ?: return@runCatching
-                        if (!v.javaClass.name.contains("PolarLight")) return@runCatching
-                        v.postDelayed({
-                            runCatching {
-                                if (!MonetPalette.isDarkNow()) return@runCatching
-                                val d = v.drawable ?: return@runCatching
-                                d.mutate()
-                                d.setColorFilter(
-                                    TokenMapper.bgCard(true),
-                                    PorterDuff.Mode.SRC_IN
-                                )
-                            }
-                        }, 150L)
+                        if (!MonetPalette.isDarkNow()) return@runCatching
+                        val d = v.drawable ?: return@runCatching
+                        d.mutate()
+                        d.setColorFilter(TokenMapper.bgCard(true), PorterDuff.Mode.SRC_IN)
                     }
-                    result
-                }
+                }, 150L)
             }
+        }
     }
 
     /** 现代路径：View.setBackground(Drawable)（直接赋值，不走 setBackgroundDrawable）。 */
@@ -6066,11 +6093,17 @@ private fun hookSummaryBadge(module: XposedModule) {
         // intrinsic 尺寸又常被替换成拉伸后的值，按类型/尺寸判断全都会漏
         // （前几版就是这样一条都没中）。
         // 按钮等用的是配色方案内的 primary/container 色，被 isSchemeColor 挡掉。
-        val c = colorOfDrawable(d) ?: return
+        val c = solidColorOf(d) ?: return
         if (isSchemeColor(c, true)) return
-        val luma = (((c shr 16) and 0xFF) * 299 + ((c shr 8) and 0xFF) * 587 +
-            (c and 0xFF) * 114) / 1000
-        if (luma <= 170) return
+        // 彩色底不动（按钮、品牌色块等）：solidColorOf 能取到色之后，橙色按钮
+        // (#FFFDA312) 这类也会被当成"亮背景"压掉。只处理无彩色/弱彩色的亮底
+        // —— 它们才是"浅色主题遗留"的那一类。
+        val cr = (c shr 16) and 0xFF
+        val cg = (c shr 8) and 0xFF
+        val cb = c and 0xFF
+        if (maxOf(cr, cg, cb) - minOf(cr, cg, cb) > 40) return
+        val luma = colorLuma(c)
+        if (luma <= LUMA_BRIGHT_BG) return
         val gd = GradientDrawable()
         gd.shape = GradientDrawable.RECTANGLE
         gd.setColor(TokenMapper.bgPage(true))
@@ -6085,7 +6118,12 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 已换过背景的提示条（背景只需设一次；图标要持续纠正）。 */
     private val noticeBarPainted: MutableSet<View> =
-        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+        // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+        // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+        // 的结构性修改（丢数据/脏读）。
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+        )
 
     /** 文件页顶部的提示条（微云入口）：几何定位后换背景 + 染里面的图标。
      *
@@ -6138,24 +6176,10 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** View attach 后立刻（下一帧）检查一次 —— 让提示条在首帧就是对的，
      *  不用等到 onResume 之后。 */
     private fun hookAttachedNoticeBar(module: XposedModule) {
-        findMethod(Class.forName("android.view.View"), setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (notice bar)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    runCatching {
-                        val v = chain.thisObject as? View ?: return@runCatching
-                        if (v.width >= 1250 && v.height in 100..140) {
-                            v.post { runCatching { fixNoticeBar(v) } }
-                        } else if (v is ViewGroup) {
-                            // 尺寸还没算出来时，下一帧再判断
-                            v.post { runCatching { fixNoticeBar(v) } }
-                        }
-                    }
-                    result
-                }
-            }
+        onViewAttached { v ->
+            // 尺寸/位置要等布局完成才准，统一 post 一帧再看
+            v.post { runCatching { fixNoticeBar(v) } }
+        }
     }
 
     private fun hookViewBackground(module: XposedModule) {
@@ -6870,24 +6894,13 @@ private fun hookSummaryBadge(module: XposedModule) {
 
         // 兜底：XML 属性路径可能在构造器内直接设置 hint 色、不经过
         // setHintTextColor 方法，挂载后再强制刷一次（幂等）。
-        findMethod(View::class.java, setOf("onAttachedToWindow"))
-            ?.let { method ->
-                logOnce("hook installed: View.onAttachedToWindow (input hint force)")
-                module.hook(method).intercept { chain ->
-                    val result = chain.proceed()
-                    try {
-                        val view = chain.thisObject as? View
-                        if (view != null && cls.isInstance(view)) {
-                            view.post {
-                                (view as? TextView)?.setHintTextColor(hintColor())
-                            }
-                        }
-                    } catch (t: Throwable) {
-                        // ignore
-                    }
-                    result
+        onViewAttached { view ->
+            if (cls.isInstance(view)) {
+                view.post {
+                    runCatching { (view as? TextView)?.setHintTextColor(hintColor()) }
                 }
             }
+        }
     }
 
     private fun hookAioBubbleText(module: XposedModule, cl: ClassLoader) {
@@ -7434,6 +7447,22 @@ private fun hookSummaryBadge(module: XposedModule) {
         val b = color and 0xFF
         return (r * 299 + g * 587 + b * 114) / 1000
     }
+
+    /** 同上，但直接吃分量 —— 供像素循环使用，省掉为了调用而打包成 Int。 */
+    private fun colorLuma(r: Int, g: Int, b: Int): Int = (r * 299 + g * 587 + b * 114) / 1000
+
+    // ---- 亮度阈值 ----
+    // 这些判定线历史上各处各写各的（120/140/150/160/200/220/235），语义其实
+    // 只有下面几类。收敛成命名常量，**取值一个没改**，只是让"为什么是 170"
+    // 变得可读，将来要统一调整也只改一处。
+    private const val LUMA_NEAR_WHITE = 235   // 近乎纯白（卡片底、白色填充）
+    private const val LUMA_VERY_LIGHT = 220   // 很亮（浅色主题遗留的底）
+    private const val LUMA_LIGHT = 200        // 亮
+    private const val LUMA_BRIGHT_BG = 170    // 亮背景：深色下应当压暗
+    private const val LUMA_MID = 160          // 中间偏亮：决定用哪一档前景色
+    private const val LUMA_MID_LOW = 150      // 中间
+    private const val LUMA_DARK_TEXT = 140    // 亮字 / 深字的分界
+    private const val LUMA_DARK = 120         // 偏暗
 
     // ------------------------------------------------------------------
     // Ark（“聊天记录”合并转发卡片等）token 缓存：
@@ -7998,28 +8027,16 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private fun hookFileDownloadIcons(module: XposedModule) {
         runCatching {
-            findMethod(View::class.java, setOf("onAttachedToWindow"))
-                ?.let { method ->
-                    logOnce("hook installed: View.onAttachedToWindow (file icons)")
-                    runCatching { module.deoptimize(method) }
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        try {
-                            val view = chain.thisObject as? View ?: return@intercept result
-                            val name = view.javaClass.name
-                            if ((name.contains("AIOFile") || name.contains("aiofile")) &&
-                                fileMonitored.add(System.identityHashCode(view))
-                            ) {
-                                if (fileMonitored.size > 32) fileMonitored.clear()
-                                // attach 即扫一次(延时重扫经实验证明非必需)
-                                runCatching { scanFileIcons(view) }
-                            }
-                        } catch (t: Throwable) {
-                            // ignore
-                        }
-                        result
-                    }
+            onViewAttached { view ->
+                val name = view.javaClass.name
+                if ((name.contains("AIOFile") || name.contains("aiofile")) &&
+                    fileMonitored.add(System.identityHashCode(view))
+                ) {
+                    if (fileMonitored.size > 32) fileMonitored.clear()
+                    // attach 即扫一次(延时重扫经实验证明非必需)
+                    runCatching { scanFileIcons(view) }
                 }
+            }
         }
     }
 
@@ -8120,7 +8137,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                                 val b = opaque and 0xFF
                                 val grayish = maxOf(r, g, b) - minOf(r, g, b) <= 24
                                 val luma = colorLuma(opaque)
-                                if (grayish && luma < 170 && !isSchemeColor(c, true)) {
+                                if (grayish && luma < LUMA_BRIGHT_BG && !isSchemeColor(c, true)) {
                                     val mapped = if (luma < 70) {
                                         scheme.onSurface
                                     } else {
@@ -8763,14 +8780,24 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  这类白底是浅色主题下黑色图标的可读性载体,必须保持白色,
      *  不能被"按颜色把白染成深色"的通用兜底改掉,否则黑图标压深底不可见。 */
     private val iconPlateMemo: MutableSet<Drawable> =
-        java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+        // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+        // 的结构性修改（丢数据/脏读）。
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        )
 
     /** 图标底盘资源名(短名随构建可能漂移,已知 ius/iut)。 */
     private fun isIconPlateName(name: String): Boolean = name == "ius" || name == "iut"
 
     /** 已栅格化重染的面板图标(避免 setImageDrawable 递归与重复处理)。 */
     private val rasterizedPanelIcons: MutableSet<Drawable> =
-        java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        // 用 synchronizedSet 包一层：hook 会在图片加载线程执行，
+        // 未同步的 WeakHashMap 在多线程 add/contains 时会触发 expungeStaleEntries
+        // 的结构性修改（丢数据/脏读）。
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
+        )
 
 
     private var uniformIconLog = 0
@@ -8872,7 +8899,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val r0 = (c ushr 16) and 0xFF
                 val g0 = (c ushr 8) and 0xFF
                 val b0 = c and 0xFF
-                if ((r0 * 299 + g0 * 587 + b0 * 114) / 1000 < 90) darkPx++
+                if (colorLuma(r0, g0, b0) < 90) darkPx++
             }
             val flatDark = darkPx * 10 >= core * 9
             for (i in px.indices) {
@@ -8885,7 +8912,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val r0 = (px[i] ushr 16) and 0xFF
                 val g0 = (px[i] ushr 8) and 0xFF
                 val b0 = px[i] and 0xFF
-                val t = (r0 * 299 + g0 * 587 + b0 * 114) / 1000
+                val t = colorLuma(r0, g0, b0)
                 val nr = dr + (lr - dr) * t / 255
                 val ng = dg + (lg - dg) * t / 255
                 val nb = db + (lb - db) * t / 255
@@ -9273,6 +9300,12 @@ private fun hookSummaryBadge(module: XposedModule) {
                 // 正是从这里读):整体跳过,保持它们自身配色
                 if (isThirdPartyUiActive()) return@hookFrameworkMethod result
                 if (result is Int) {
+                    // 全透明色不参与任何映射。
+                    // TIM 的 ?attr/xxx 在取值未定义时会拿到 #0（alpha=0、RGB 也是 0），
+                    // 它的 RGB 恰是"纯黑"，会被下面"深色下纯黑 -> onSurface"的兜底
+                    // 当成黑**文字**提亮 —— 于是本该"什么都不画"的绘制变成一条亮色
+                    // （实测设置页底部那条 3px 全宽白线：attr color #0 -> #ffffdbf3）。
+                    if ((result ushr 24) == 0) return@hookFrameworkMethod result
                     val index = chain.getArg(0) as Int
                     val type = (chain.thisObject as? TypedArray)?.getType(index) ?: -1
                     if (whiteSrcLogCount < 40) {
