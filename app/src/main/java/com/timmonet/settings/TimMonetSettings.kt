@@ -23,6 +23,7 @@ object TimMonetSettings {
     private const val KEY_PALETTE_STYLE = "paletteStyle"
     private const val KEY_COLOR_SPEC = "colorSpec"
     private const val KEY_REVISION = "revision"
+    private const val KEY_AMOLED = "amoledBlack"
 
     /** 远端 SharedPreferences 名（TIM 进程与模块 UI 共用）。 */
     const val REMOTE_PREFS_NAME = "tim_monet_settings"
@@ -32,6 +33,7 @@ object TimMonetSettings {
         keyColor = 0,
         paletteStyle = PaletteStyle.TonalSpot,
         colorSpec = ColorSpec.SpecVersion.SPEC_2025,
+        amoledBlack = false,
     )
 
     fun read(context: Context): AppSettings {
@@ -41,10 +43,18 @@ object TimMonetSettings {
 
     /** 从任意 SharedPreferences 读取（TIM 侧读远端 prefs 也走这里）。 */
     fun read(prefs: SharedPreferences): AppSettings {
+        // 兼容旧版本：AMOLED 以前是颜色模式里的一个选项(DARK_AMOLED=6)，
+        // 现在是"深色模式时应用"的独立开关 —— 读到旧值就迁移成 深色 + 开。
+        var mode = ColorMode.fromValue(
+            prefs.getInt(KEY_COLOR_MODE, defaults().colorMode.value)
+        )
+        var amoled = prefs.getBoolean(KEY_AMOLED, false)
+        if (mode == ColorMode.DARK_AMOLED) {
+            mode = ColorMode.DARK
+            amoled = true
+        }
         return AppSettings(
-            colorMode = ColorMode.fromValue(
-                prefs.getInt(KEY_COLOR_MODE, defaults().colorMode.value)
-            ),
+            colorMode = mode,
             keyColor = prefs.getInt(KEY_KEY_COLOR, 0),
             paletteStyle = runCatching {
                 PaletteStyle.valueOf(
@@ -58,6 +68,7 @@ object TimMonetSettings {
                         ?: ColorSpec.SpecVersion.SPEC_2025.name
                 )
             }.getOrDefault(ColorSpec.SpecVersion.SPEC_2025),
+            amoledBlack = amoled,
         )
     }
 
@@ -72,6 +83,7 @@ object TimMonetSettings {
             .putInt(KEY_KEY_COLOR, settings.keyColor)
             .putString(KEY_PALETTE_STYLE, settings.paletteStyle.name)
             .putString(KEY_COLOR_SPEC, settings.colorSpec.name)
+            .putBoolean(KEY_AMOLED, settings.amoledBlack)
             .putLong(KEY_REVISION, System.currentTimeMillis())
             .apply()
     }
@@ -94,7 +106,8 @@ object TimMonetSettings {
             append(KEY_COLOR_MODE).append('=').append(settings.colorMode.value).append('\n')
             append(KEY_KEY_COLOR).append('=').append(settings.keyColor).append('\n')
             append(KEY_PALETTE_STYLE).append('=').append(settings.paletteStyle.name).append('\n')
-            append(KEY_COLOR_SPEC).append('=').append(settings.colorSpec.name)
+            append(KEY_COLOR_SPEC).append('=').append(settings.colorSpec.name).append('\n')
+            append(KEY_AMOLED).append('=').append(settings.amoledBlack)
         }
     }
 
@@ -106,8 +119,14 @@ object TimMonetSettings {
             val index = line.indexOf('=')
             if (index > 0) map[line.substring(0, index).trim()] = line.substring(index + 1).trim()
         }
+        var mode = ColorMode.fromValue(map[KEY_COLOR_MODE]?.toIntOrNull() ?: 0)
+        var amoled = map[KEY_AMOLED]?.toBooleanStrictOrNull() ?: false
+        if (mode == ColorMode.DARK_AMOLED) {
+            mode = ColorMode.DARK
+            amoled = true
+        }
         return AppSettings(
-            colorMode = ColorMode.fromValue(map[KEY_COLOR_MODE]?.toIntOrNull() ?: 0),
+            colorMode = mode,
             keyColor = map[KEY_KEY_COLOR]?.toIntOrNull() ?: 0,
             paletteStyle = runCatching {
                 PaletteStyle.valueOf(map[KEY_PALETTE_STYLE] ?: PaletteStyle.TonalSpot.name)
@@ -117,6 +136,7 @@ object TimMonetSettings {
                     map[KEY_COLOR_SPEC] ?: ColorSpec.SpecVersion.SPEC_2025.name
                 )
             }.getOrDefault(ColorSpec.SpecVersion.SPEC_2025),
+            amoledBlack = amoled,
         )
     }
 }

@@ -37,7 +37,8 @@ object SettingsBridge {
                 val paletteChanged = next.colorMode != current.colorMode ||
                     next.paletteStyle != current.paletteStyle ||
                     next.colorSpec != current.colorSpec ||
-                    next.keyColor != current.keyColor
+                    next.keyColor != current.keyColor ||
+                    next.amoledBlack != current.amoledBlack
                 current = next
                 if (paletteChanged) {
                     killTimProcess()

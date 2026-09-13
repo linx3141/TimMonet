@@ -41,6 +41,7 @@ class SettingsActivity : ComponentActivity() {
                     keyColor = settings.keyColor,
                     paletteStyle = settings.paletteStyle,
                     colorSpec = settings.colorSpec,
+                    amoledBlack = settings.amoledBlack,
                     onBack = { finish() },
                     onSetKeyColor = { keyColor ->
                         settings = settings.copy(keyColor = keyColor)
@@ -49,6 +50,11 @@ class SettingsActivity : ComponentActivity() {
                     },
                     onSetColorMode = { mode: ColorMode ->
                         settings = settings.copy(colorMode = mode)
+                        TimMonetSettings.write(this, settings)
+                        RemoteSettingsWriter.push(settings)
+                    },
+                    onSetAmoledBlack = { amoled ->
+                        settings = settings.copy(amoledBlack = amoled)
                         TimMonetSettings.write(this, settings)
                         RemoteSettingsWriter.push(settings)
                     },

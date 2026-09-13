@@ -191,6 +191,14 @@ object TokenMapper {
     fun bgList(dark: Boolean): Int =
         resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette(dark))
 
+    /** 页面底色（BG_PAGE）：给"未选中底"这类需要跟页面融为一体的地方用。 */
+    fun bgPage(dark: Boolean): Int =
+        resolve(Role.BG_PAGE, 0xFF000000.toInt(), MonetPalette.palette(dark))
+
+    /** 深色下可见的"线"色（分隔线/边框）：给分隔线类资源用。 */
+    fun outlineVariant(dark: Boolean): Int =
+        resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette(dark))
+
     fun bgCard(dark: Boolean): Int =
         resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette(dark))
 
@@ -329,6 +337,12 @@ object TokenMapper {
         // 红点素材（"…"按钮右上角闪烁红点 RedDotImageView 等复用 skin_tips_dot）
         if (n.contains("tips_dot")) return Role.PRIMARY
 
+        // 沉浸式顶栏底（ImmersiveTitleBar -> R.color.skin_color_title_immersive_bar）：
+        // 这是**背景**色，跟随页面底。以前它不在名字白名单里，深色皮肤给的深色
+        // 被"纯黑 -> onSurface"兜底成亮色 (#CCE9FF)，顶栏/状态栏与下方内容割裂
+        // （AMOLED 下最明显）。这一条覆盖所有用 ImmersiveTitleBar 的页面。
+        if (n.contains("title_immersive_bar")) return Role.BG_NAV_TINT
+
         // 群公告气泡（troop aiosm）：标题黑字 → onSurface，正文灰字 → onSurfaceVariant
         if (n.contains("troop_aiosm_title")) return Role.ON_SURFACE
         if (n.contains("troop_aiosm_content")) return Role.ON_SURFACE_VARIANT
@@ -436,10 +450,13 @@ object TokenMapper {
         if (n.contains("bg_primary")) return Role.BG_PAGE
         if (n.contains("bottom_bar_background_gradient")) return Role.BG_PAGE
         if (n.contains("bg_top_light_pressed")) return Role.BG_LIST
-        // QUI 的 bg_top/bottom/middle_light 是页面上的浅色卡片层，
-        // 应跟随卡片色 surfaceBright，而不是页面底色。
+        // 顶栏底（QUI 的 bg_top_light，TIM 原版是纯白顶栏 #FFFFFF，只比页面底
+        // #F5F6FA 亮一档）：跟随**页面底色**。以前跟卡片色 surfaceBright
+        // (#003045)，比内容 surfaceContainer(#001C2A) 亮两档 —— 深色主题下
+        // 一大堆页面的顶栏/状态栏跟下方割成两截。
+        if (n.contains("bg_top_light")) return Role.BG_NAV_TINT
+        // 其余 bottom/middle_light 是页面上的浅色卡片层，仍跟随卡片色。
         if (n.contains("bg_bottom_light") ||
-            n.contains("bg_top_light") ||
             n.contains("bg_middle_light")
         ) return Role.BG_CARD
         if (n.contains("bg_middle_standard")) return Role.BG_LIST

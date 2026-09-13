@@ -101,10 +101,14 @@ class SettingsDialogHost private constructor(
                             keyColor = settings.keyColor,
                             paletteStyle = settings.paletteStyle,
                             colorSpec = settings.colorSpec,
+                            amoledBlack = settings.amoledBlack,
                             onBack = { dismiss() },
                             onSetKeyColor = { update(settings.copy(keyColor = it)) },
                             onSetColorMode = { mode: ColorMode ->
                                 update(settings.copy(colorMode = mode))
+                            },
+                            onSetAmoledBlack = { amoled ->
+                                update(settings.copy(amoledBlack = amoled))
                             },
                             onSetColorStyle = { name ->
                                 runCatching { PaletteStyle.valueOf(name) }.getOrNull()

@@ -166,10 +166,10 @@ object MonetPalette {
         return built
     }
 
-    /** 是否使用 AMOLED 纯黑表面。 */
+    /** 是否使用 AMOLED 纯黑表面：**深色模式 + 独立开关**（旧版是颜色模式的一项）。 */
     fun isAmoled(): Boolean {
         ensureInitialized(null)
-        return userSettings.colorMode.isAmoled
+        return userSettings.amoledBlack && effectiveDark()
     }
 
     /**
@@ -177,7 +177,7 @@ object MonetPalette {
      * （只保留 alpha，文字/图标色不受影响）。非 AMOLED 模式原样返回。
      */
     fun amoledBlack(color: Int): Int {
-        if (!userSettings.colorMode.isAmoled) return color
+        if (!userSettings.amoledBlack || !effectiveDark()) return color
         val alpha = color ushr 24
         if (alpha == 0) return color
         return alpha shl 24

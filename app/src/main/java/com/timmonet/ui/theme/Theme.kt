@@ -26,6 +26,8 @@ data class AppSettings(
     val keyColor: Int,
     val paletteStyle: PaletteStyle,
     val colorSpec: ColorSpec.SpecVersion,
+    /** 深色模式下是否把表面压成 AMOLED 纯黑（独立开关，见 ThemeScreen）。 */
+    val amoledBlack: Boolean = false,
 )
 
 val PaletteStyle.supportsSpec2025: Boolean

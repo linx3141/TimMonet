@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.DesignServices
 import androidx.compose.material.icons.rounded.Style
+import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LargeFlexibleTopAppBar
@@ -82,6 +83,7 @@ import com.timmonet.R
 import com.timmonet.ui.component.material.ExpressiveScaffold
 import com.timmonet.ui.component.material.ExpressiveToggleButton
 import com.timmonet.ui.component.material.SegmentedColumn
+import com.timmonet.ui.component.material.SegmentedSwitchItem
 import com.timmonet.ui.component.material.SegmentedDropdownItem
 import com.timmonet.ui.component.material.TonalCard
 import com.timmonet.ui.component.material.TopBarBackButton
@@ -96,9 +98,11 @@ fun ThemeScreen(
     keyColor: Int,
     paletteStyle: PaletteStyle,
     colorSpec: ColorSpec.SpecVersion,
+    amoledBlack: Boolean,
     onBack: () -> Unit,
     onSetKeyColor: (Int) -> Unit,
     onSetColorMode: (ColorMode) -> Unit,
+    onSetAmoledBlack: (Boolean) -> Unit,
     onSetColorStyle: (String) -> Unit,
     onSetColorSpec: (String) -> Unit,
 ) {
@@ -181,14 +185,15 @@ fun ThemeScreen(
                     .padding(horizontal = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                // 只有 自动/浅色/深色 三档；AMOLED 纯黑是下面的独立开关
+                // （"深色模式时应用"），不再是颜色模式的一种。
                 val options = listOf(
                     listOf(ColorMode.SYSTEM) to stringResource(R.string.settings_theme_mode_system),
                     listOf(ColorMode.LIGHT) to stringResource(R.string.settings_theme_mode_light),
-                    listOf(ColorMode.DARK) to stringResource(R.string.settings_theme_mode_dark),
-                    listOf(ColorMode.DARK_AMOLED) to stringResource(R.string.settings_theme_mode_dark)
+                    listOf(ColorMode.DARK) to stringResource(R.string.settings_theme_mode_dark)
                 )
 
-                options.chunked(4).forEach { rowOptions ->
+                options.chunked(3).forEach { rowOptions ->
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)
@@ -216,7 +221,6 @@ fun ThemeScreen(
                                         ColorMode.SYSTEM -> Icons.Filled.Brightness4
                                         ColorMode.LIGHT -> Icons.Filled.Brightness7
                                         ColorMode.DARK -> Icons.Filled.Brightness3
-                                        ColorMode.DARK_AMOLED -> Icons.Filled.Brightness1
                                         else -> Icons.Filled.Brightness4
                                     },
                                     contentDescription = label
@@ -251,6 +255,24 @@ fun ThemeScreen(
                                 onItemSelected = { index ->
                                     onSetColorSpec(specs[index].name)
                                 }
+                            )
+                        }
+                    )
+                )
+
+                // 独立卡片：深色模式时应用 AMOLED 纯黑
+                // （仿 KernelSU 的"导航栏角标"那种单开关卡片，单独一张，不与
+                //  上面的下拉项共用容器）
+                SegmentedColumn(
+                    modifier = Modifier.padding(top = 8.dp),
+                    content = listOf(
+                        {
+                            SegmentedSwitchItem(
+                                icon = Icons.Rounded.Contrast,
+                                title = stringResource(R.string.settings_theme_amoled_black),
+                                summary = stringResource(R.string.settings_theme_amoled_black_desc),
+                                checked = amoledBlack,
+                                onCheckedChange = onSetAmoledBlack,
                             )
                         }
                     )

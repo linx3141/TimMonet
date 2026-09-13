@@ -63,7 +63,7 @@ fun TimMonetTheme(
     val context = LocalContext.current
     val systemDarkTheme = isSystemInDarkTheme()
     val darkTheme = appSettings.colorMode.isDark || (appSettings.colorMode.isSystem && systemDarkTheme)
-    val amoledMode = appSettings.colorMode.isAmoled
+    val amoledMode = appSettings.amoledBlack && darkTheme
     val dynamicColor = appSettings.keyColor == 0
 
     val colorScheme = rememberTimMonetColorScheme(
