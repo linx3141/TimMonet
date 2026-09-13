@@ -166,6 +166,19 @@ object MonetPalette {
         return built
     }
 
+    /** 当前是否深色 —— **唯一可信的深浅判据**。
+     *
+     *  ⚠️ 不要用 ThemeState.isNight()：它的数据源是 TIM 的
+     *  QQTheme.isNowThemeIsNight()，而本模块的 hookForceLight 恰好把那个方法
+     *  hook 成了永远返回 false（目的是让 TIM 走浅色资源、由我们统一染色），
+     *  于是它恒为 false，结果还被永久缓存 —— 所有 `if (!isNight) return` 的
+     *  分支都会变成死代码（曾导致一批"修了没效果"的 bug）。
+     *  深浅完全由模块设置（固定深/浅）或系统决定，直接用 effectiveDark()。 */
+    fun isDarkNow(): Boolean {
+        ensureInitialized(null)
+        return effectiveDark()
+    }
+
     /** 是否使用 AMOLED 纯黑表面：**深色模式 + 独立开关**（旧版是颜色模式的一项）。 */
     fun isAmoled(): Boolean {
         ensureInitialized(null)

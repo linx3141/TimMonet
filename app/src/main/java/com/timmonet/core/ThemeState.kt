@@ -1,69 +1,21 @@
 package com.timmonet.core
 
-import android.app.UiModeManager
 import android.content.Context
-import android.content.res.Configuration
-import java.lang.reflect.Method
-import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 判断 TIM 当前是否处于夜间模式。
+ * 深浅色判定（**已废弃的兼容壳**）。
  *
- * 优先询问 TIM 自己的 QQTheme.isNowThemeIsNight()（跟随 TIM 的主题开关），
- * 失败时退回系统深色模式。
+ * ⚠️ 历史问题：这里原本反射调用 TIM 的 QQTheme.isNowThemeIsNight() 判断夜间，
+ * 但本模块的 hookForceLight 为了让 TIM 走浅色资源，恰好把那个方法 hook 成了
+ * 永远返回 false —— 于是 isNight() 恒为 false，还被 cachedNight 永久缓存，
+ * 导致所有 `if (!isNight) return` 的分支变成死代码。
+ *
+ * 现在统一委托给 [MonetPalette.isDarkNow]（只看模块设置与系统）。新代码请直接
+ * 调用 MonetPalette.isDarkNow()，不要再用这个壳。
  */
 object ThemeState {
 
-    private const val QQ_THEME_CLASS = "com.tencent.mobileqq.utils.QQTheme"
-
-    private val classCache = ConcurrentHashMap<ClassLoader, Class<*>>()
-    private val methodCache = ConcurrentHashMap<Class<*>, Method?>()
-
-    @Volatile
-    private var cachedNight: Boolean? = null
-
-    fun isNight(context: Context?, hintLoader: ClassLoader? = null): Boolean {
-        cachedNight?.let { return it }
-        cachedNight = computeNight(context, hintLoader)
-        return cachedNight ?: false
-    }
-
-    private fun computeNight(context: Context?, hintLoader: ClassLoader?): Boolean {
-        val cl = context?.classLoader ?: hintLoader ?: Thread.currentThread().contextClassLoader
-        if (cl == null) return systemNight(context)
-
-        // 直接调用 TIM 的主题判断
-        val cls = try {
-            classCache[cl] ?: Class.forName(QQ_THEME_CLASS, false, cl).also { classCache[cl] = it }
-        } catch (t: Throwable) {
-            null
-        }
-        if (cls != null) {
-            val method = methodCache.getOrPut(cls) {
-                try {
-                    cls.getMethod("isNowThemeIsNight")
-                } catch (t: Throwable) {
-                    null
-                }
-            }
-            if (method != null) {
-                try {
-                    return method.invoke(null) as? Boolean ?: systemNight(context)
-                } catch (t: Throwable) {
-                    // fall through
-                }
-            }
-        }
-        return systemNight(context)
-    }
-
-    private fun systemNight(context: Context?): Boolean {
-        if (context == null) return false
-        return try {
-            val ui = context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
-            (ui?.nightMode ?: Configuration.UI_MODE_NIGHT_UNDEFINED) == Configuration.UI_MODE_NIGHT_YES
-        } catch (t: Throwable) {
-            false
-        }
-    }
+    @Deprecated("Use MonetPalette.isDarkNow() instead")
+    fun isNight(context: Context?, hintLoader: ClassLoader? = null): Boolean =
+        MonetPalette.isDarkNow()
 }
