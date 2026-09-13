@@ -67,7 +67,27 @@ object MonetPalette {
 
     private var initialized = false
     private var listenerRegistered = false
+
+    /**
+     * 上次**尝试**构建调色板的时刻（无论成功还是失败）。
+     *
+     * ⚠️ 这个字段是"失败重试节流"的唯一依据，因此它必须与 [initialized] 解耦：
+     * 历史上节流条件是 `if (initialized && now - lastAttemptAt < RETRY_THROTTLE_MS)`，
+     * 而 [rebuild] 在取色失败时会把 `initialized` 置回 `false` —— 于是**失败后
+     * 节流永不生效**，热路径（hook 住的 `Resources.getColor`）每调用一次就往
+     * 单线程队列里塞一次注定失败的 SPEC_2025 重算，同时每次都抢全局锁。
+     * 注释承诺的是"失败时最多每 5 秒重试一次"。
+     */
+    @Volatile
     private var lastAttemptAt = 0L
+
+    /** 失败重试的最小间隔。 */
+    private const val RETRY_THROTTLE_MS = 5000L
+
+    /** 允许 `onSettingsChanged` 立刻触发一次重建（绕过节流），语义见该方法。 */
+    private fun resetAttemptThrottle() {
+        lastAttemptAt = 0L
+    }
 
     private val rebuildThread by lazy {
         HandlerThread("TimMonetPalette").apply { start() }
@@ -97,8 +117,10 @@ object MonetPalette {
             }
             if (initialized && lightScheme != null) return
             val now = System.currentTimeMillis()
-            // 取色失败时最多每 5 秒重试一次
-            if (initialized && now - lastAttemptAt < 5000) return
+            // ⚠️ 节流只看 lastAttemptAt，**不能**再看 initialized：
+            // rebuild() 失败时会把 initialized 置回 false，一带上它就等于
+            // "失败后永不节流"，每次取色都重投一次 SPEC_2025 重算。
+            if (lastAttemptAt != 0L && now - lastAttemptAt < RETRY_THROTTLE_MS) return
             initialized = true
             lastAttemptAt = now
             // 首次构建放在后台线程：SPEC_2025 + Vibrant 的 ColorSpec 计算非常重，
@@ -107,10 +129,14 @@ object MonetPalette {
                 val current = SettingsBridge.readCurrent()
                 if (current != userSettings) userSettings = current
                 rebuild()
-            }
-            if (!listenerRegistered) {
-                listenerRegistered = true
-                registerColorListener()
+                // ⚠️ 注册壁纸监听必须在**构建之后**，且标志位只在真正成功时才保留：
+                // 以前是"先置 listenerRegistered = true 再调用"，一旦
+                // addOnColorsChangedListener 抛异常，标志位已经立住 —— 本进程内
+                // 再也不会重试，换壁纸永远不再重建调色板，只留一行警告。
+                if (!listenerRegistered && lightScheme != null) {
+                    listenerRegistered = true
+                    registerColorListener()
+                }
             }
         }
     }
@@ -120,6 +146,8 @@ object MonetPalette {
      * 在后台线程重建调色板，绝不在主线程做 IPC 轮询或昂贵的 ColorSpec 计算。
      */
     fun onSettingsChanged() {
+        // 用户主动改了设置，应当**立刻**重建，不要被失败重试节流挡住。
+        resetAttemptThrottle()
         rebuildHandler.post {
             val next = SettingsBridge.readCurrent()
             if (next != userSettings) {
@@ -208,9 +236,10 @@ object MonetPalette {
      */
     fun amoledBlack(color: Int): Int {
         if (!userSettings.amoledBlack || !effectiveDark()) return color
-        val alpha = color ushr 24
-        if (alpha == 0) return color
-        return alpha shl 24
+        // 全透明：原样返回（约定见 AGENTS.md）；与 TokenMapper.resolve 的
+        // AMOLED 分支保持同一语义。
+        if (ColorMath.isTransparent(color)) return color
+        return ColorMath.withAlpha(0xFF000000.toInt(), ColorMath.alpha(color))
     }
 
     /**

@@ -118,16 +118,16 @@ object TokenMapper {
 
     /** 品牌蓝（含半透明变体）-> primary，保留原 alpha；非品牌蓝返回 null。 */
     private fun brandBlueRole(color: Int, scheme: DynamicScheme): Int? {
-        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        val opaque = ColorMath.opaque(color)
         if (opaque !in BRAND_BLUES) return null
-        val alpha = color ushr 24
-        return (scheme.primary and 0x00FFFFFF) or (alpha shl 24)
+        return ColorMath.keepAlpha(scheme.primary, color)
     }
 
     private fun computeInlineBgColor(color: Int, dark: Boolean): Int? {
-        val alpha = color ushr 24
-        if (alpha == 0) return null
-        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        // 全透明：不参与任何映射（约定见 AGENTS.md），调用方按"无映射"处理
+        if (ColorMath.isTransparent(color)) return null
+        val alpha = ColorMath.alpha(color)
+        val opaque = ColorMath.opaque(color)
         val scheme = MonetPalette.palette()
         return try {
             // 位图/代码创建的品牌底没有资源名可依据(相册选中序号是烤进位图的
@@ -138,14 +138,14 @@ object TokenMapper {
             val role = when {
                 // 只做"白/浅灰 -> 卡片面"这一档明确映射(内联背景色没有
                 // 资源名可依据);不再按色相猜测主色,避免把彩色元素当品牌色染
-                hct.chroma < 8.0 -> when {
-                    hct.tone < 60.0 -> return null
+                hct.chroma < BgResolver.HCT_CHROMA_MAX -> when {
+                    hct.tone < BgResolver.TONE_TEXT_MAX -> return null
                     else -> Role.BG_CARD
                 }
                 else -> return null
             }
             val mapped = resolve(role, opaque, scheme)
-            (mapped and 0x00FFFFFF) or (alpha shl 24)
+            ColorMath.keepAlpha(mapped, color)
         } catch (t: Throwable) {
             null
         }
@@ -160,8 +160,9 @@ object TokenMapper {
      *  结果一个页面被切成四段颜色。彩色一律不碰。
      */
     fun bgColorForDrawable(color: Int, dark: Boolean): Int? {
-        val alpha = color ushr 24
-        if (alpha == 0) return null
+        // 全透明：不参与任何映射（约定见 AGENTS.md）
+        if (ColorMath.isTransparent(color)) return null
+        val alpha = ColorMath.alpha(color)
         // 品牌蓝**底**映射到"对方气泡背景"色，而不是 primary：
         // 钱包页顶栏(?attr/a_5 → @color/2p #0099FF)整条都是这个底，
         // 用 primary 会亮得刺眼；换成 guest bubble 后和聊天里收到的那侧气泡同色，
@@ -173,10 +174,9 @@ object TokenMapper {
         // 有时被压暗有时不被压暗（"时好时坏"型 bug 的典型）。
         val scheme = MonetPalette.palette()
         brandBlueRole(color, scheme)?.let {
-            val bubble = guestBubble(scheme.isDark)
-            return (bubble and 0x00FFFFFF) or (alpha shl 24)
+            return ColorMath.keepAlpha(guestBubble(scheme.isDark), color)
         }
-        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        val opaque = ColorMath.opaque(color)
         val hct = try {
             Hct.fromInt(opaque)
         } catch (t: Throwable) {
@@ -191,13 +191,13 @@ object TokenMapper {
         if (scheme.isDark && BgResolver.luma(opaque) > BgResolver.BRIGHT) {
             return bgPage(true)
         }
-        if (hct.chroma >= 8.0) return null
-        val mapped = if (hct.tone < 50.0) {
+        if (hct.chroma >= BgResolver.HCT_CHROMA_MAX) return null
+        val mapped = if (hct.tone < BgResolver.TONE_CONTAINER_SPLIT) {
             MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
         } else {
             MonetPalette.amoledBlack(scheme.surfaceContainer)
         }
-        return (mapped and 0x00FFFFFF) or (alpha shl 24)
+        return ColorMath.keepAlpha(mapped, color)
     }
 
     /** 聊天列表条目背景的两种角色色。 */
@@ -220,36 +220,48 @@ object TokenMapper {
         resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), MonetPalette.palette())
 
     private fun inferByColor(color: Int, scheme: DynamicScheme): Int {
-        val alpha = color ushr 24
-        if (alpha == 0) return color
-        val opaque = (color and 0x00FFFFFF) or 0xFF000000.toInt()
+        // 全透明：原样返回（约定见 AGENTS.md）
+        if (ColorMath.isTransparent(color)) return color
+        val alpha = ColorMath.alpha(color)
+        val opaque = ColorMath.opaque(color)
         return try {
             // 精确品牌蓝 -> primary(与内联背景色、文字色路径保持同一规则)
             brandBlueRole(color, scheme)?.let { return it }
             val hct = Hct.fromInt(opaque)
             val mapped = when {
-                hct.chroma < 8.0 -> {
+                hct.chroma < BgResolver.HCT_CHROMA_MAX -> {
                     val tone = hct.tone
                     // 纯黑纯白一般是图片上的蒙层文字，保持不动
-                    if (tone < 4.0 || tone > 96.0) return color
+                    if (tone < GRAY_LADDER_MIN || tone > GRAY_LADDER_MAX) return color
                     grayToRole(tone, scheme)
                 }
                 // 不再按色相把彩色猜成主色(会误染彩色元素)
                 else -> return color
             }
-            (mapped and 0x00FFFFFF) or (alpha shl 24)
+            ColorMath.keepAlpha(mapped, color)
         } catch (t: Throwable) {
             color
         }
     }
 
+    // 无彩色的 HCT tone 阶梯：**本项目唯一的"灰阶 -> 角色"映射**。
+    // 越过 96 之后的灰按"面"处理（卡片/底），AMOLED 黑时压成纯黑。
+    // 上下界之外的纯黑/纯白一般是图片上的蒙层文字，调用方保持原色。
+    private const val GRAY_LADDER_MIN = 4.0
+    private const val GRAY_LADDER_MAX = 96.0
+    private const val GRAY_ON_SURFACE_MAX = 12.0
+    private const val GRAY_ON_SURFACE_VARIANT_MAX = 32.0
+    private const val GRAY_OUTLINE_MAX = 55.0
+    private const val GRAY_OUTLINE_VARIANT_MAX = 76.0
+    private const val GRAY_CONTAINER_HIGH_MAX = 87.0
+
     private fun grayToRole(tone: Double, scheme: DynamicScheme): Int = when {
-        tone <= 12.0 -> scheme.onSurface
-        tone <= 32.0 -> scheme.onSurfaceVariant
-        tone <= 55.0 -> scheme.outline
-        tone <= 76.0 -> scheme.outlineVariant
-        // 76 以上灰按“面”处理（卡片/底），AMOLED 黑时压成纯黑
-        tone <= 87.0 -> MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
+        tone <= GRAY_ON_SURFACE_MAX -> scheme.onSurface
+        tone <= GRAY_ON_SURFACE_VARIANT_MAX -> scheme.onSurfaceVariant
+        tone <= GRAY_OUTLINE_MAX -> scheme.outline
+        tone <= GRAY_OUTLINE_VARIANT_MAX -> scheme.outlineVariant
+        tone <= GRAY_CONTAINER_HIGH_MAX ->
+            MonetPalette.amoledBlack(scheme.surfaceContainerHigh)
         else -> MonetPalette.amoledBlack(scheme.surfaceContainer)
     }
 
@@ -261,8 +273,17 @@ object TokenMapper {
         Role.ON_PRIMARY_CONTAINER
     )
 
-    /** AMOLED 黑模式下要整体压成纯黑的“表面/背景”角色（文字/图标角色不在内）。 */
-    private val AMOLED_SURFACES = setOf(
+    /**
+     * "表面/背景"类角色。
+     *
+     * 两处用它，语义各自不同但**清单必须一致**，所以只定义一次：
+     * 1. AMOLED 黑模式下这些角色整体压成纯黑（文字/图标角色不在内）；
+     * 2. 判断"这个颜色是不是我们已经铺过的面"（见 [isSurfaceColorOfScheme]）。
+     *
+     * ⚠️ 以前这两处各抄了一份一模一样的 13 项清单，加角色时只改一处就会让
+     * "AMOLED 压黑"和"判已染"对同一个角色给出不同答案。
+     */
+    private val SURFACE_ROLES = listOf(
         Role.SURFACE,
         Role.BG_NAV_TINT,
         Role.BG_PAGE,
@@ -280,15 +301,18 @@ object TokenMapper {
 
     private fun resolve(role: Role, original: Int, scheme: DynamicScheme): Int {
         if (role == Role.KEEP || role == Role.UNKNOWN) return original
-        val alpha = original ushr 24
+        val alpha = ColorMath.alpha(original)
         // AMOLED 纯黑：所有表面槽位置黑
-        if (MonetPalette.isAmoled() && role in AMOLED_SURFACES) {
-            // ⚠️ 只保留 alpha 与纯黑：不能写 `0xFF000000 or (alpha shl 24)` ——
-            // 0xFF000000 的 alpha 位已全是 1，或运算结果恒为 0xFF000000，
-            // 半透明表面（蒙层/遮罩/#80FFFFFF）会变成**不透明纯黑**把内容盖死。
-            // 与 MonetPalette.amoledBlack() 保持同一语义。
-            if (alpha == 0) return 0
-            return alpha shl 24
+        if (MonetPalette.isAmoled() && role in SURFACE_ROLES) {
+            // ⚠️ 全透明的槽位按约定**原样返回**。以前这里写 `return 0`，虽然
+            // "透明色"的 RGB 本来就是 0、结果恰好一样，但读起来像另一个规则，
+            // 而且和 MonetPalette.amoledBlack() 的 `return color` 注释上自称
+            // "同一语义"、代码却不一样。现在两边都走同一条约定。
+            if (ColorMath.isTransparent(original)) return original
+            // 只保留纯黑：不能写 `0xFF000000 or (alpha shl 24)` —— 0xFF000000 的
+            // alpha 位已全是 1，或运算结果恒为 0xFF000000，半透明表面
+            // （蒙层/遮罩/#80FFFFFF）会变成**不透明纯黑**把内容盖死（C1 那次事故）。
+            return ColorMath.withAlpha(0xFF000000.toInt(), alpha)
         }
         val c = when (role) {
             Role.KEEP -> return original
@@ -329,7 +353,7 @@ object TokenMapper {
         // "我的"页说明文字映射后为 #8C87B0CC,alpha=140),保留下来在深色
         // 主题里显得暗淡。背景类仍保留原 alpha(半透明蒙层是设计需要)。
         val outAlpha = if (role in TEXT_ROLES) 0xFF else alpha
-        return (c and 0x00FFFFFF) or (outAlpha shl 24)
+        return ColorMath.withAlpha(c, outAlpha)
     }
 
     private fun roleOf(name: String): Role? {
@@ -590,6 +614,88 @@ object TokenMapper {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 当前配色方案里"我们已经输出过的颜色"
+    //
+    // `isSchemeColor` / `isSurfaceColor` 曾经把同一份角色清单各抄一遍（而且越加越长，
+    // 加角色时经常只改一处 —— 于是"已经染过的颜色"在一条路径上被认出、在另一条
+    // 路径上被再染一次）。现在共用下面的 SURFACE_ROLES / PRIMARY_ROLES /
+    // FOREGROUND_ROLES，且判定必须留在 TokenMapper 内部：`Role` 是它的 private
+    // 嵌套枚举，同文件的其它 object 也访问不到。
+    //
+    // 比较基准统一用 `resolve(role, ROLE_PROBE, scheme)`：故意传一个**不透明、
+    // 且没有任何角色会把它映成别的颜色**的输入色，拿到的就是该角色的标准取值
+    // （含 TEXT_ROLES 的"强制不透明"处理），与调用点 `ColorMath.opaque(x)` 的
+    // 比较语义一致。
+    // ------------------------------------------------------------------
+
+    /** 基准输入色：不透明黑。 */
+    private const val ROLE_PROBE: Int = 0xFF000000.toInt()
+
+    private val PRIMARY_ROLES = listOf(
+        Role.PRIMARY,
+        Role.ON_PRIMARY,
+        Role.PRIMARY_CONTAINER,
+        Role.ON_PRIMARY_CONTAINER
+    )
+
+    private val FOREGROUND_ROLES = listOf(
+        Role.ON_SURFACE,
+        Role.ON_SURFACE_VARIANT,
+        Role.OUTLINE,
+        Role.OUTLINE_VARIANT
+    )
+
+    /**
+     * [color]（忽略 alpha）是否等于 [roles] 里任一角色在当前方案中的取值，
+     * 或等于 [extra] 里显式列出的方案色。
+     *
+     * [extra] 的存在是因为有两个方案槽位**没有对应的 Role**（`surfaceDim`、
+     * `surfaceContainerLowest`），历史上 `isSchemeColor` 直接比了它们；
+     * 去掉会让"判已染"的覆盖面变窄，等于让这些颜色被重复染色一次。
+     */
+    private fun matchesAnyRole(
+        color: Int,
+        roles: List<Role>,
+        scheme: DynamicScheme,
+        extra: List<Int> = emptyList()
+    ): Boolean {
+        val opaque = ColorMath.opaque(color)
+        if (MonetPalette.isAmoled() && opaque == ROLE_PROBE) return true
+        if (roles.any { resolve(it, ROLE_PROBE, scheme) == opaque }) return true
+        return extra.any { (it and 0x00FFFFFF) == (opaque and 0x00FFFFFF) }
+    }
+
+    /**
+     * 是否"当前配色方案里我们已经输出过的颜色"（表面 + 主色 + 前景 + 描边）。
+     *
+     * 取色一律来自 `palette()`，**不接受调用方的深浅参数** —— 历史上那个
+     * `dark` 形参从来没参与过判据，留着只会让人以为它能改变结果。
+     *
+     * 这是实现层；对外的统一入口是 [BgResolver.isSchemeColor]。
+     */
+    internal fun isSchemeColorOfScheme(color: Int): Boolean {
+        val scheme = MonetPalette.palette()
+        return matchesAnyRole(
+            color,
+            SURFACE_ROLES + PRIMARY_ROLES + FOREGROUND_ROLES,
+            scheme,
+            extra = listOf(scheme.surfaceDim, scheme.surfaceContainerLowest)
+        )
+    }
+
+    /** 只判"表面/容器类"角色（[isSchemeColorOfScheme] 的子集）。 */
+    internal fun isSurfaceColorOfScheme(color: Int): Boolean {
+        val scheme = MonetPalette.palette()
+        return matchesAnyRole(
+            color,
+            SURFACE_ROLES,
+            scheme,
+            extra = listOf(scheme.surfaceDim, scheme.surfaceContainerLowest)
+        )
+    }
+}
+
 /**
  * 背景色判定的统一入口（P0-2 第二步）。
  *
@@ -602,13 +708,16 @@ object TokenMapper {
  * 这里把**判据**统一出来（度量、彩色排除、亮度档位），各调用点只需说明
  * "我要哪一档面色"，不再各写一套阈值。迁移是渐进的：新代码一律走这里。
  */
-
-}
-
 object BgResolver {
 
-    /** 彩色底（品牌色块、按钮、图片主色）不参与面色映射。 */
-    private const val CHROMA_SPAN_MAX = 40
+    /**
+     * 彩色底（品牌色块、按钮、图片主色）不参与面色映射。
+     *
+     * ⚠️ 这里的"彩色"用 **RGB 跨度**（max-min），TokenMapper 的另几处历史代码用
+     * **HCT chroma**。两者尺度不可互换 —— 迁移中的代码请一律用本对象的方法，
+     * 不要再新写 `Hct.fromInt(...).chroma >= 8` 这类判据。
+     */
+    const val CHROMA_SPAN_MAX = 40
 
     // ---- 亮度档位（BT.601 luma）----
     // 与原先散在各处的 LUMA_* 常量一一对应，取值一个没改。
@@ -620,6 +729,39 @@ object BgResolver {
     const val MID_LOW = 150      // 中间
     const val DARK_TEXT = 140    // 亮字 / 深字的分界
     const val DARK = 120         // 偏暗
+
+    // ---- 其余仍在用的判据线 ----
+    // 这几条不属于上面"亮度档位"的量表（有的是灰度跨度、有的是像素取样门槛），
+    // 但同样被散着写成裸数字。收在这里只为**可读与可调**，取值一个没改。
+
+    /** 近似灰度：RGB 跨度 ≤ 此值就当作"灰"（不是彩色）。 */
+    const val GRAY_SPAN = 24
+
+    /** 暗灰前景上限：luma 低于此值的灰字在深色底上读不出来，需要提亮。 */
+    const val DIM_TEXT = 110
+
+    /** 提亮灰字的档位：低于 [DIM_TEXT_STRONG] 给 onSurface，否则给 onSurfaceVariant。 */
+    const val DIM_TEXT_STRONG = 70
+
+    /**
+     * 位图采样时"这个像素算数"的 **alpha** 下限（低于此值视为透明/抗锯齿边缘，跳过）。
+     *
+     * ⚠️ 它是 alpha 门槛，不是亮度门槛 —— 历史命名 `PIXEL_DARK` 与"暗/亮分界"
+     * 的注释都是错的，容易让人误当成 luma 阈值去用。
+     */
+    const val ALPHA_MIN = 110
+
+    /** 判定"主色系"（与角色色同色相）时允许的分量偏移。 */
+    const val ROLE_TOLERANCE = 45
+
+    /** HCT tone 低于此值视为"文字色"而非"面色"（内联背景色的保守边界）。 */
+    const val TONE_TEXT_MAX = 60.0
+
+    /** HCT tone 低于此值给 containerHigh、否则给 container（无彩 drawable 背景）。 */
+    const val TONE_CONTAINER_SPLIT = 50.0
+
+    /** HCT chroma 低于此值视为无彩。**仅用于尚未迁移的历史分支**。 */
+    const val HCT_CHROMA_MAX = 8.0
 
     /** BT.601 亮度。 */
     fun luma(color: Int): Int = luma((color shr 16) and 0xFF, (color shr 8) and 0xFF, color and 0xFF)
@@ -634,6 +776,9 @@ object BgResolver {
         return maxOf(r, g, b) - minOf(r, g, b)
     }
 
+    /** 是否近似灰度（弱彩色）。 */
+    fun isGray(color: Int, maxSpan: Int = GRAY_SPAN): Boolean = chromaSpan(color) <= maxSpan
+
     /**
      * 是否"浅色主题遗留的亮底"：深色主题下应当压暗的、**无彩色/弱彩色**的亮色。
      * 彩色一律不动（按钮、品牌色块、图片主色都靠这条排除）。
@@ -644,12 +789,50 @@ object BgResolver {
         return luma(color) > BRIGHT
     }
 
-    /** 是否近乎纯白（用于"这张卡片底是白的，要换成卡片色"这类判断）。 */
-    fun isNearWhite(color: Int): Boolean = luma(color) >= NEAR_WHITE
+    /**
+     * 是否"近乎纯白"——**逐通道**判定（R/G/B 三者都 ≥ [NEAR_WHITE]）。
+     *
+     * ⚠️ 这是本项目里唯一的 isNearWhite 语义。历史上同一个文件里还并存过一个
+     * luma 版本（`luma >= 235`，hooks 里另有一份逐通道副本），两者对偏色白给出
+     * **不同答案**（例：`#FFEEEE` 逐通道 false、luma 244 true），调用点却按同一个
+     * 名字理解 —— 典型的"同一判据两个结果"。现已全部收敛到本函数。
+     *
+     * 若某处确实需要 luma 尺度（"整体够亮"而非"每个通道都够亮"），请显式写
+     * `luma(c) >= NEAR_WHITE`，不要另起一个叫 isNearWhite 的函数。
+     */
+    fun isNearWhite(color: Int): Boolean {
+        val r = (color shr 16) and 0xFF
+        val g = (color shr 8) and 0xFF
+        val b = color and 0xFF
+        return r >= NEAR_WHITE && g >= NEAR_WHITE && b >= NEAR_WHITE
+    }
 
-    /** 背景色：压暗时统一给页面底色。 */
-    fun dimmed(dark: Boolean): Int = TokenMapper.bgPage(dark)
+    /**
+     * 深色底上给灰字挑前景档位（唯一入口）。
+     *
+     * [brightenBelow] 是"低于多少亮度才值得提亮"：调用点的语境不同 ——
+     * 纯净的 `setTextColor(Int)` 入口要覆盖到中灰（TIM 的 #333/#1a1a1a 系），
+     * 而"前景已经被别处处理过"的入口只处理明显偏暗的。默认取 [BRIGHT]。
+     */
+    fun foregroundForDimText(
+        color: Int,
+        scheme: DynamicScheme,
+        brightenBelow: Int = BRIGHT
+    ): Int? {
+        if (!scheme.isDark) return null
+        if (!isGray(color)) return null
+        if (luma(color) >= brightenBelow) return null
+        return if (luma(color) < DIM_TEXT_STRONG) scheme.onSurface else scheme.onSurfaceVariant
+    }
 
-    /** 卡片底：统一给卡片色。 */
-    fun card(dark: Boolean): Int = TokenMapper.bgCard(dark)
+    /**
+     * 是否"当前配色方案里我们已经输出过的颜色"（表面 + 主色 + 前景 + 描边）。
+     *
+     * 用途：判断一个颜色**要不要再染**。这是唯一入口 —— hooks 侧的同名函数已改成
+     * 转发到这里；角色清单在 [TokenMapper] 内部只维护一份。
+     */
+    fun isSchemeColor(color: Int): Boolean = TokenMapper.isSchemeColorOfScheme(color)
+
+    /** 只判"表面/容器类"角色（[isSchemeColor] 的子集）：这块颜色是不是一个"面"。 */
+    fun isSurfaceColorOf(color: Int): Boolean = TokenMapper.isSurfaceColorOfScheme(color)
 }

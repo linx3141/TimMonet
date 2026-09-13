@@ -170,11 +170,23 @@ object ArkPackagePatcher {
         out.write(xorWithKey(indexBytes))
         for (entry in rebuilt) out.write(entry.stored)
 
-        // 保留原包备份，便于出问题时手工恢复（TIM 不会自行发现重打包错误，
-        // 因为我们放行了签名校验）。
+        // ⚠️ 备份必须**每次刷新**，且替换过程必须可回滚。
+        //
+        // 历史实现是"如果 .bak 不存在就写一份，然后 file.delete() + rename"：
+        // 一旦 `tmp.renameTo(file)` 在删除原文件之后仍然失败（跨挂载点、
+        // 目录权限、目标被 mmap 占用等），原包就**永久消失**，而函数只返回
+        // false、日志里没有任何异常 —— TIM 之后加载的是一个不存在的 ark。
+        // 与 KDoc 承诺的"失败时返回 false，绝不破坏原包"完全相反。
+        //
+        // 现在：先把当前内容写进 .bak（每次都写，保证内容恰好是"本次改动前"
+        // 的版本），rename 失败时可原样回滚。
         val backup = File(file.parentFile, file.name + ".bak")
-        if (!backup.exists()) {
+        try {
+            backup.delete()
             FileOutputStream(backup).use { it.write(src) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "ark backup failed, aborting repack of ${file.name}", t)
+            return false
         }
 
         val tmp = File(file.parentFile, file.name + ".tmp")
@@ -184,11 +196,26 @@ object ArkPackagePatcher {
                 Log.i(TAG, "ark app repacked: ${file.name} (${out.size()} bytes)")
                 return true
             }
-            file.delete()
+            // rename 失败：先把原包挪开（保留字节，不删除），再放新包。
+            if (!file.renameTo(backup)) {
+                Log.w(
+                    TAG,
+                    "ark replace failed (cannot move original aside): ${file.name}; " +
+                        "original untouched, .bak kept"
+                )
+                return false
+            }
             if (tmp.renameTo(file)) {
                 Log.i(TAG, "ark app repacked: ${file.name} (${out.size()} bytes)")
                 return true
             }
+            // 新包放不进去：把原包挪回来，绝不留下"两边都没有"的状态。
+            val restored = backup.renameTo(file)
+            Log.w(
+                TAG,
+                "ark replace failed: ${file.name}; original restored=$restored " +
+                    (if (!restored) "(recover from ${backup.name})" else "")
+            )
             return false
         } finally {
             if (tmp.exists()) tmp.delete()
