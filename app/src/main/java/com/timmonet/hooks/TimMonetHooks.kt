@@ -4481,6 +4481,8 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     // quibadge.c（QUIBadge 取色 c，Context 参数版方法）：proceed 后若返回值
     // 是 int 颜色则重写——f()/h() 替换为 primary，i()/j() 替换为 onPrimary。
+    private var quibadgeRawLog = 0
+
     private fun hookQuiBadge(module: XposedModule, cl: ClassLoader) {
         val cls = try {
             Class.forName(QUI_BADGE, false, cl)
@@ -4494,10 +4496,27 @@ private fun hookSummaryBadge(module: XposedModule) {
                     logOnce("hook installed: $QUI_BADGE.$methodName")
                     module.hook(method).intercept { chain ->
                         val result = chain.proceed()
-                        if (result is Int) {
-                            MonetPalette.palette(ThemeState.isNight(null, cl)).primary
+                        if (result !is Int) return@intercept result
+                        if (quibadgeRawLog++ < 20) {
+                            Log.i(
+                                TAG,
+                                "quibadge.c.$methodName raw=#" + Integer.toHexString(result)
+                            )
+                        }
+                        // 按 TIM **原色**区分状态：普通未读是红(#F74C30)、免打扰是灰。
+                        // 这两个方法只带 Context，拿不到 viewType，但不影响——
+                        // 原色本身就把状态带出来了：
+                        //   红(有色相) -> primary + onPrimary
+                        //   灰(无彩色) -> secondaryContainer + onPrimary（同为亮色，
+                        //                与普通未读一眼能分开，且字看得清）
+                        val scheme = MonetPalette.palette(ThemeState.isNight(null, cl))
+                        val r = (result shr 16) and 0xFF
+                        val g = (result shr 8) and 0xFF
+                        val b = result and 0xFF
+                        if (maxOf(r, g, b) - minOf(r, g, b) <= 30) {
+                            scheme.secondaryContainer
                         } else {
-                            result
+                            scheme.primary
                         }
                     }
                 }
@@ -4855,11 +4874,19 @@ private fun hookSummaryBadge(module: XposedModule) {
     )
     private var quiBadgeSkipLog = 0
 
+    private var quiBadgeForceLog = 0
+
+    /** 角标状态已变：清掉"代次记忆"，让下一次 onDraw 兜底按新状态重新上色。 */
+    private fun invalidateBadgeTint(view: Any?) {
+        if (view is View) quiBadgeForceMemo.remove(view)
+    }
+
     private fun forceQuiBadge(view: Any?) {
         if (view == null) return
         // onDraw 每帧都会调用,而本函数要反射读 6 个字段并计算行卡颜色。
-        // 同一配色代次内同一 badge 只处理一次(配色变化时会重新处理);
-        // 角标状态变化伴随 setText/重新绑定,由其它 hook 负责。
+        // 同一配色代次内同一 badge 只处理一次；角标状态变化时由 QUIBadge 的
+        // state setter hook 调 invalidateBadgeTint() 把这条记忆清掉,
+        // 于是下一帧会重新处理一次,之后继续短路。
         if (view is View) {
             val gen = MonetPalette.generation()
             if (quiBadgeForceMemo[view] == gen) {
@@ -4895,7 +4922,19 @@ private fun hookSummaryBadge(module: XposedModule) {
             val viewType = (fields.viewType?.get(view) as? Int) ?: -1
             val isRecall = text.contains("撤回") || text.contains("recall") ||
                 text.contains("Recall") || text.contains("removed")
-            val isMuted = viewType == 1 || viewType == 3 || viewType == 8
+            // 免打扰判定：viewType 之外再兜一道"原背景是不是灰的"。TIM 里普通未读
+            // 是红底(#F74C30)、免打扰是灰底；只靠 viewType 会漏(实测普通未读
+            // vt=2，而这里原来只认 1/3/8，于是免打扰的也被算成普通，整列角标
+            // 一起变成 primary)。quiBadgeForceMemo 保证同一代次只处理一次，
+            // 所以这里读到的 mBgPaint.color 还是 TIM 原色。
+            val origBg = (fields.bgPaint?.get(view) as? Paint)?.color ?: 0
+            val origR = (origBg shr 16) and 0xFF
+            val origG = (origBg shr 8) and 0xFF
+            val origB = origBg and 0xFF
+            val origGray = origBg != 0 &&
+                maxOf(origR, origG, origB) - minOf(origR, origG, origB) <= 24 &&
+                colorLuma(origBg) in 90..235
+            val isMuted = viewType == 1 || viewType == 3 || viewType == 8 || origGray
             val rowColor = findRowCardColor(view as? View, dark, text)
             val bgColor: Int
             val fgColor: Int
@@ -4953,8 +4992,10 @@ private fun hookSummaryBadge(module: XposedModule) {
                 viewBg.setColorFilter(bgColor, PorterDuff.Mode.SRC_IN)
                 viewBg.setTint(bgColor)
             }
-            logOnce(
-                "quibadge force vt=$viewType '$text' bg=#" +
+            if (quiBadgeForceLog++ < 40) Log.i(
+                TAG,
+                "quibadge force muted=$isMuted orig=#" +
+                    Integer.toHexString(origBg) + " vt=$viewType '$text' bg=#" +
                     Integer.toHexString(bgColor) + " fg=#" + Integer.toHexString(fgColor)
             )
             viewPostInvalidate?.invoke(view)
@@ -4990,7 +5031,7 @@ private fun hookSummaryBadge(module: XposedModule) {
         }
     }
 
-    /** QUIBadge 自绘附标控件（n/setAIOBarNum/onDraw 三入口）→ forceQuiBadge 兜底。 */
+    /** QUIBadge 自绘附标控件（状态 setter / updateCustomStyle / onDraw）→ forceQuiBadge。 */
     private fun hookQuiBadgeView(module: XposedModule, cl: ClassLoader) {
         try {
             val cls = Class.forName("com.tencent.mobileqq.quibadge.QUIBadge", false, cl)
@@ -4999,19 +5040,40 @@ private fun hookSummaryBadge(module: XposedModule) {
                     logOnce("hook installed: QUIBadge.updateCustomStyle")
                     module.hook(method).intercept { chain ->
                         val result = chain.proceed()
-                        forceQuiBadge(chain.thisObject)
+                        invalidateBadgeTint(chain.thisObject)
                         result
                     }
                 }
-            findMethod(cls, setOf("setAIOBarNum"), INT_TYPE)
-                ?.let { method ->
-                    logOnce("hook installed: QUIBadge.setAIOBarNum (title unread)")
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        forceQuiBadge(chain.thisObject)
-                        result
+            // 角标状态 setter 是"状态真的变了"的唯一可靠信号：清掉 onDraw 兜底的
+            // "代次记忆"，让下一次绘制重新上色（那时 viewType/mText 已绑好、
+            // view 也已布局，findRowCardColor 才探得准）。
+            // 不能在 setter 里直接上色：那一刻 item view 还没布局，行卡色会探错。
+            // 这同时修掉了"首次 onDraw 发生在绑定之前 → 免打扰被判成普通未读 →
+            // 永远停在 primary"的问题（未读角标全变成一个色的根因）。
+            val stateSetters = setOf(
+                "setreddot", "setrednum", "setredtext", "setrednumwithicon",
+                "setgraydot", "setgraynum", "setgraytext", "setgraynumwithicon",
+                "seticon", "setaiobarnum"
+            )
+            for (method in cls.declaredMethods) {
+                if (method.name.lowercase() !in stateSetters) continue
+                val params = method.parameterTypes
+                if (!params.all {
+                        it == Int::class.javaPrimitiveType ||
+                            it == String::class.java ||
+                            Drawable::class.java.isAssignableFrom(it)
                     }
+                ) {
+                    continue
                 }
+                runCatching { method.isAccessible = true }
+                logOnce("hook installed: QUIBadge.${method.name} (state tint)")
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    invalidateBadgeTint(chain.thisObject)
+                    result
+                }
+            }
             findMethod(cls, setOf("onDraw"), Canvas::class.java)
                 ?.let { method ->
                     logOnce("hook installed: QUIBadge.onDraw")
