@@ -52,6 +52,10 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
    `ViewGroup.dispatchDraw`（每帧纠正，用于会被 TIM 覆盖的东西）。
 3. **图片层** —— `ImageView.setImageDrawable` → 采样主色后重染
    （`rasterizeIconUniform` 等）。
+4. **span 层（不在 View 树里）** —— 有些 UI 根本不是 View，而是
+   `DynamicDrawableSpan` / `CompoundDrawable` 画进 `EditText`/`TextView` 的
+   位图（引用条就是）。这一层**任何 View 判据都抓不到**，只能从它的
+   写入入口做上下文限定 —— 见「坑 11」。
 
 ## 关键约定（新代码必须遵守）
 
@@ -163,6 +167,17 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 10. **"先删后建"的文件替换会丢数据**：`ArkPackagePatcher` 曾经 `file.delete()`
     之后再 `rename`，第二次 rename 失败就永久毁掉原 `.ark`（只返回 false、无异常）。
     现在改成"先写 .bak → 失败可回滚"。
+11. **有些"控件"根本不是 View**：输入框上方的引用条（含"取消引用"圆按钮）由
+    `com.tencent.mobileqq.aio.i.d extends DynamicDrawableSpan` 实现 ——
+    `InputReplyVBDelegate.s()` 把一个**临时 TextView** 画成 Bitmap，
+    再 `editText.setCompoundDrawables(null, span.getDrawable(), …)` 塞进编辑框。
+    所以它**不经过 View 树**，`setBackground` / `onAttachedToWindow` /
+    `dispatchDraw` 全都无效（这个功能因此漏染了很久）。
+    这类元素只能**从写入入口做上下文限定**（那里置 ThreadLocal 标志，
+    在 `setCompoundDrawables` 里判断），不要试图在 View 树里找它。
+    另外那个图标是**圆底+镂空叉**的合成位图，要"圆 primary + 叉 onPrimary"
+    必须叠两层（详见 `hookReplyBarSpan` 的 KDoc）；尺寸要用 TIM 已算好的
+    `bounds`，用 `intrinsicWidth` 会让按钮从 11dp 涨成 24dp。
 
 ## 调试手段
 
