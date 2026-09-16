@@ -194,6 +194,14 @@ object TimMonetHooks {
 
     private var redSolidBgLogCount = 0
 
+    /** 细线兜底的日志节流计数（仅日志用）。 */
+    private var thinLineLog = 0
+    /**
+     * 细线兜底的扫描预算：`dispatchDraw` 是热路径，只在一段窗口内做子 View 遍历，
+     * 超出后彻底跳过（避免每帧全树扫描）。纯计数、无副作用。
+     */
+    private var thinLineScanBudget = 0
+
     private var redDotImgLogCount = 0
 
     private var colorSwatchLogCount = 0
@@ -317,7 +325,7 @@ object TimMonetHooks {
         hookLongNumberText()
         hookProfileHeaderText(module, classLoader)
         hookTroopMemberLevel(module, classLoader)
-        hookPanelDispatch(module)
+        hookDispatchDraw(module)
         hookMannounceWeb(module)
         hookHighlightSpans(module)
         hookDarkTextColors(module)
@@ -1839,7 +1847,15 @@ private fun isPlusPanelClass(cls: Class<*>): Boolean {
     return r
 }
 
-private fun hookPanelDispatch(module: XposedModule) {
+/**
+ * `ViewGroup.dispatchDraw` 的单一入口，承载两件事：
+ * 1. **面板图标**（原有职责，见下方 `panelSeen` 分支）；
+ * 2. **全局细线兜底** —— 极细（≤2dp）全宽的分隔线，在布局完成前就被设色，
+ *    任何按尺寸判断的入口都拿不到几何，只能在绘制前按几何纠正（详见下方注释）。
+ *
+ * 两件事共用同一个 hook：`dispatchDraw` 是热路径，同一框架方法不重复挂。
+ */
+private fun hookDispatchDraw(module: XposedModule) {
     var logCount = 0
     // 每个面板容器只在前几帧处理(避免每帧遍历子树影响渲染性能),
     // 3 帧足够覆盖"bind 后 / 首帧绘制后才被 TIM 涂黑"两种情况
@@ -1848,12 +1864,46 @@ private fun hookPanelDispatch(module: XposedModule) {
     )
     findMethod(ViewGroup::class.java, setOf("dispatchDraw"), Canvas::class.java)
         ?.let { method ->
-            logOnce("hook installed: ViewGroup.dispatchDraw (panel icons)")
+            logOnce("hook installed: ViewGroup.dispatchDraw (panel icons + thin line)")
             runCatching { module.deoptimize(method) }
             module.hook(method).intercept { chain ->
                 try {
+                    val vg0 = chain.thisObject as? ViewGroup
+                    // 极细（≤2dp）且全宽的**分隔线**兜底。
+                    //
+                    // 为什么必须在这里做：TIM 是在 **布局完成之前** 就给这类线设好背景色的
+                    // （实测 setBackgroundColor 时 width=height=0），所以任何"按尺寸判断"
+                    // 的入口（attach / setBackground / setBackgroundColor）都拿不到它的几何，
+                    // 它会以当时的颜色直接画出来。而它的颜色又恰好可能等于某个**前景**角色
+                    // —— 联系人页顶栏下方那条 1px 线就是 #E6E4F0（onSurface，把文字色当线色用），
+                    // `isSchemeColor` 只看颜色值、判不出"用途"，于是放行，白线就留在深色页面上。
+                    //
+                    // 这里在绘制前遍历一层子 View 按几何兜：全宽 + 极薄 + 亮 → 压成页面底色。
+                    // 只在颜色确实需要改时才写，且带日志节流。
+                    if (vg0 != null && thinLineScanBudget++ < 4000) {
+                        runCatching {
+                            val sw = vg0.resources.displayMetrics.widthPixels
+                            for (i in 0 until vg0.childCount) {
+                                val ch = vg0.getChildAt(i) ?: continue
+                                if (ch.width != sw || ch.height !in 1..ch.dpPx(2f)) continue
+                                val bg = ch.background as? ColorDrawable ?: continue
+                                val c = bg.color
+                                if (c == TokenMapper.bgPage(true)) continue
+                                if (BgResolver.luma(opaqueColor(c)) < BgResolver.LIGHT) continue
+                                bg.setColor(TokenMapper.bgPage(true))
+                                if (thinLineLog++ < 12) {
+                                    Log.i(
+                                        TAG,
+                                        "thin line(per-frame) " + ch.javaClass.simpleName +
+                                            " ${ch.width}x${ch.height} #" +
+                                            Integer.toHexString(c) + " -> page"
+                                    )
+                                }
+                            }
+                        }
+                    }
                     if (!panelSeen) return@intercept chain.proceed()
-                    val vg = chain.thisObject as? ViewGroup
+                    val vg = vg0
                     if (vg != null && !isThirdPartyUiActive()) {
                         // 提示条（微云入口）：每帧纠正一次背景与图标 ——
                         // 一次性处理会被 TIM 后续的 bind/刷新覆盖掉（实测图标
