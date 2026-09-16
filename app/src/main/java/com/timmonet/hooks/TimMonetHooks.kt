@@ -323,6 +323,7 @@ object TimMonetHooks {
         hookDarkTextColors(module)
         hookSearchItemText(module, classLoader)
         hookAioReply(module, classLoader)
+        hookReplyBarSpan(module, classLoader)
         hookForwardRecentTheme(module, classLoader)
         hookSplashBackground(module, classLoader)
         hookForwardDialog(module, classLoader)
@@ -3157,6 +3158,93 @@ private fun replyBlockAncestor(view: View): View? {
         hops++
     }
     return null
+}
+
+/**
+ * 引用条（输入框上方"取消引用"那条）的**取消按钮**上色：圆 = primary、叉 = onPrimary。
+ *
+ * ## 为什么常规手段都抓不到它
+ * 这条引用条**不是 View**。TIM 4.1.0 的实现（反编译 `com.tencent.mobileqq.aio.i.d`）：
+ * `InputReplyVBDelegate.s(...)` 把 `d`（一个 `DynamicDrawableSpan`）通过
+ * `editText.setCompoundDrawables(null, span.getDrawable(), null, null)` 画进编辑框，
+ * 而 span 内部先把一个**临时 TextView** 画成 Bitmap 再用作 drawable。
+ * 所以它不经过 View 树 —— `View.setBackground` / `onAttachedToWindow` 之类的判据
+ * 全部无效（这也是它长期没被染到的原因）。
+ *
+ * ## 为什么必须叠两层
+ * 那个叉号图标是**圆底 + 镂空叉号**的合成位图（`qui_close_filled.png`，72x72：
+ * 不透明圆 + 透明叉）。单色滤镜只能给"圆"上色，叉号是**透出背景**的，因此
+ * 染一个 drawable 永远做不出"圆 primary + 叉 onPrimary"：
+ *   - 底层 = onPrimary 实心椭圆  ← 叉号的镂空位置会露出它
+ *   - 上层 = 同一张位图染成 primary ← 圆的位置盖住底层
+ *
+ * ## 两个易错点（都踩过）
+ * 1. **颜色顺序**放反会得到"圆 onPrimary、叉 primary"（正好相反）。
+ * 2. **尺寸**必须沿用 TIM 已算好的 `bounds`（它把 72px 位图缩到 11dp）；
+ *    用 `intrinsicWidth` 会让按钮从 11dp 涨成 24dp。
+ *
+ * ## 如何精确定位到这一处
+ * 叉号资源 `qui_common_icon_secondary` 是**通用图标色**（导航栏等几十处在用），
+ * 不能改全局映射。所以用上下文限定：
+ * `InputReplyVBDelegate.s()` 是引用条写入编辑框的唯一入口，进入时设标志，
+ * 在 `TextView.setCompoundDrawables` 里看到标志才处理。
+ */
+private val inReplyBarSpan = ThreadLocal<Boolean>()
+
+private fun hookReplyBarSpan(module: XposedModule, cl: ClassLoader) {
+    // ① 唯一入口：InputReplyVBDelegate.s(com.tencent.mobileqq.aio.i.d, d$a)
+    runCatching {
+        val delegateCls = Class.forName(
+            "com.tencent.mobileqq.aio.input.reply.InputReplyVBDelegate", false, cl
+        )
+        val spanCls = Class.forName("com.tencent.mobileqq.aio.i.d", false, cl)
+        val listenerCls = Class.forName("com.tencent.mobileqq.aio.i.d" + "$" + "a", false, cl)
+        findMethodStrict(delegateCls, setOf("s"), spanCls, listenerCls)?.let { method ->
+            logOnce("hook installed: InputReplyVBDelegate.s (reply bar close)")
+            runCatching { module.deoptimize(method) }
+            module.hook(method).intercept { chain ->
+                inReplyBarSpan.set(true)
+                try {
+                    chain.proceed()
+                } finally {
+                    inReplyBarSpan.set(false)
+                }
+            }
+        } ?: logOnce("MISS: InputReplyVBDelegate.s (reply bar close)")
+    }.onFailure { Log.w(TAG, "hook reply bar span failed", it) }
+
+    // ② 标志在位时，第 3 个参数（right）就是那个叉号 drawable
+    findMethod(
+        TextView::class.java,
+        setOf("setCompoundDrawables"),
+        Drawable::class.java,
+        Drawable::class.java,
+        Drawable::class.java,
+        Drawable::class.java
+    )?.let { method ->
+        module.hook(method).intercept { chain ->
+            val right = if (inReplyBarSpan.get() == true) {
+                chain.getArg(2) as? Drawable
+            } else {
+                null
+            }
+            if (right == null) return@intercept chain.proceed()
+
+            val scheme = MonetPalette.palette()
+            val base = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(scheme.onPrimary)
+            }
+            val face = right.constantState?.newDrawable()?.mutate() ?: right
+            face.setColorFilter(PorterDuffColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN))
+            val layered = LayerDrawable(arrayOf(base, face))
+            val w = right.bounds.width().takeIf { it > 0 } ?: right.intrinsicWidth
+            val h = right.bounds.height().takeIf { it > 0 } ?: right.intrinsicHeight
+            layered.setBounds(0, 0, w, h)
+            chain.proceed(arrayOf<Any?>(null, null, layered, null))
+            layered
+        }
+    }
 }
 
 private fun recolorReplyJumpIcon(view: View, color: Int) {
