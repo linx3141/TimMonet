@@ -196,6 +196,10 @@ object TimMonetHooks {
 
     /** 细线兜底的日志节流计数（仅日志用）。 */
     private var thinLineLog = 0
+
+    /** 支付密码弹窗染色的日志节流计数（仅日志用）。 */
+    private var payPwdLog = 0
+
     /**
      * 细线兜底的扫描预算：`dispatchDraw` 是热路径，只在一段窗口内做子 View 遍历，
      * 超出后彻底跳过（避免每帧全树扫描）。纯计数、无副作用。
@@ -292,6 +296,7 @@ object TimMonetHooks {
         hookTextContrast()
         hookStatusBar(module)
         hookAioEditText(module, classLoader)
+        hookPayPwdGridSetColor(module)
         hookAioBubbleText(module, classLoader)
         hookAioBubbleBg(module, classLoader)
         hookResconfig(module, classLoader)
@@ -7056,7 +7061,72 @@ private fun hookSummaryBadge(module: XposedModule) {
     // 的整条输入栏背景不在本 hook 范围，保持原样。
     // ------------------------------------------------------------------
 
-    private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
+    
+/**
+ * 终极兜底：直接拦 `Paint.setColor`。
+ *
+ * 前面把 `drawRoundRect` / `drawRect` / `drawPath` 都挂了一遍仍未命中 ——
+ * 说明密码格的实际画法不在这些入口里（实现与反编译那段有出入）。
+ * 但**无论怎么画，填色前必然要设置 Paint 的颜色**，所以在 `setColor` 上按
+ * 特征色 `#FFEDEDED` 识别是最可靠的一层。
+ *
+ * ⚠️ 这是**热方法**（每帧大量调用），所以：不匹配颜色时只做一次 int 比较、
+ * 立即 `proceed()`，不做任何其它判断。仅在命中那个硬编码色时才改写参数。
+ */
+private fun hookPayPwdGridSetColor(module: XposedModule) {
+    findMethod(Paint::class.java, setOf("setColor"), INT_TYPE)?.let { mm ->
+        logOnce("hook installed: Paint.setColor (pay pwd grid)")
+        runCatching { module.deoptimize(mm) }
+        module.hook(mm).intercept { chain ->
+            val c = chain.getArg(0) as Int
+            when {
+                c == PAY_PWD_GRID_COLOR -> {
+                    // 6 个密码格的底（#FFEDEDED 纯白）
+                    gridSeenAt = android.os.SystemClock.uptimeMillis()
+                    val mapped = TokenMapper.guestBubble(true)
+                    if (payPwdLog++ < 4) {
+                        Log.i(TAG, "pay pwd grid painted -> #" + Integer.toHexString(mapped))
+                    }
+                    chain.proceed(arrayOf<Any>(mapped))
+                }
+                c == PAY_PWD_DOT_COLOR &&
+                    android.os.SystemClock.uptimeMillis() - gridSeenAt < PAY_PWD_DOT_WINDOW_MS -> {
+                    // 密码圆点。它和格子底是**同一个 init() 里成对设置**的：
+                    //     mPaintBackground.setColor(#FFEDEDED)
+                    //     mPaintForeground.setColor(COLOR_BUTTON_BACKGROUND_DARK = #FF333333)
+                    // 所以用"紧随格子底之后"这个时间邻接关系来消歧 ——
+                    // #333333 本身是通用深灰（别处也当文字色用），不能无条件替换。
+                    val mapped = MonetPalette.palette().primary
+                    if (payPwdLog++ < 8) {
+                        Log.i(TAG, "pay pwd dot painted -> #" + Integer.toHexString(mapped))
+                    }
+                    chain.proceed(arrayOf<Any>(mapped))
+                }
+                else -> chain.proceed()
+            }
+        }
+    }
+}
+
+/** 密码格底色的硬编码值：`PasswordEditText.init()` 里的 `-1184275`。 */
+private const val PAY_PWD_GRID_COLOR = 0xFFEDEDED.toInt()
+
+/**
+ * 密码圆点的硬编码值：`DownloadCardView.COLOR_BUTTON_BACKGROUND_DARK = -13421773`
+ * = `#FF333333`（实测真机圆点就是这个色，压在 #2B2B34 的格子上几乎看不见）。
+ */
+private const val PAY_PWD_DOT_COLOR = 0xFF333333.toInt()
+
+/** 圆点必须在格子底之后这个时间窗内出现（两者在同一 init() 里紧挨着设置）。 */
+private const val PAY_PWD_DOT_WINDOW_MS = 120L
+
+/** 上次把 Paint 设成密码格底色的时刻（用于识别紧随其后的圆点色）。 */
+@Volatile
+private var gridSeenAt = 0L
+
+
+
+private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         val cls = try {
             Class.forName("com.tencent.mobileqq.aio.input.edit.AIOEditText", false, cl)
         } catch (t: Throwable) {
@@ -8849,6 +8919,60 @@ private fun hookSummaryBadge(module: XposedModule) {
         // （代码里的 jdm 是深浅变体），inflate 直接加载，在这层按运行时像素重染
         if (name == "jdl" || name == "jdm" || name == "kzy") {
             return tintBrandLogoV2(drawable) ?: drawable
+        }
+        // ------------------------------------------------------------------
+        // 支付密码弹窗（Tenpay）—— 依据反编译 TIM 4.1.0：
+        //   layout/ad9.xml 就是这个"输入支付密码"弹窗：
+        //     标题    TextView id=jfr  text=@string/q41("输入支付密码")
+        //     关闭叉  ImageView id=fim src=@drawable/a3h
+        //             （a3h 是 selector：默认 dvi / 按下 dvj）
+        //     密码格  LinearLayout id=fiq background=@drawable/dwa
+        //             内含 SixPasswdDialogEditText id=iwz（Canvas 自绘灰分隔线）
+        //     键盘    MyKeyboardWindow id=je9
+        //             → layout/afd.xml，删除键 ImageButton id=je5 src=@drawable/dy4
+        //
+        // 这四个资源的颜色**全部硬编码在资源里、没有语义 token**：
+        //   dwa 42x42 纯白位图(+#BBBBBB 边) / dvi 40x68 纯黑 / dvj 纯黑 / dy4 44x32 纯黑
+        // 于是深色主题下原样显示 —— 密码格是一条刺眼的白带、叉和删除键是黑图标
+        // 直接看不见。它们都是**纯色素材**（不是照片/表情），可以安全整体染色。
+        //
+        // ⚠️ 必须放在下面那个白名单早退**之前**：这些是混淆短名，不匹配
+        // qui_/skin_ 等前缀，落到早退里会被原样放行（这正是它们一直没被染的原因）。
+        if (name == "dwa") {
+            // 密码格容器底：白 → 页面面色，与输入框观感一致
+            ColorMath.recolorInPlace(drawable, TokenMapper.bgPage(true))
+            if (payPwdLog++ < 4) {
+                Log.i(TAG, "pay pwd grid bg $name -> page")
+            }
+            return drawable
+        }
+        if (name == "k1t" || name == "k1u" || name == "h4q") {
+            // 支付密码弹窗**左上角的关闭 ×**（ImageButton，src=@drawable/h4q
+            // → selector：默认 k1t / 按下 k1u）。k1t.webp 是 40x40 的 #111111
+            // 深灰位图（实测屏幕取色完全一致），深色主题下几乎看不见。
+            //
+            // ⚠️ 区分清楚两个容易混的图标：`ad9.xml` 的 `ImageView id=fim`
+            // （src=@drawable/a3h）虽然也在标题栏左侧、看起来像关闭按钮，
+            // 但它在代码里叫 **pass_back_btn**（BusinessPayActivity），
+            // 内容是返回箭头 `<`。**这里才是屏幕上那个 ×**。两者都要处理。
+            if (payPwdLog++ < 8) {
+                Log.i(TAG, "pay pwd close-x $name -> onSurface")
+            }
+            return tintIconOnSurface(drawable, name)
+        }
+        if (name == "a3h" || name == "dvi" || name == "dvj" || name == "dy4") {
+            // 支付密码弹窗里的**返回箭头**与**键盘删除键**：都是纯黑位图，
+            // 深色主题下等于看不见 → 统一提到前景色。
+            //   a3h = selector（默认 dvi 40x68 / 按下 dvj 18x30）—— 内容是 `<`，
+            //         对应 `ad9.xml` 的 `ImageView id=fim`（代码里叫 pass_back_btn）；
+            //   dy4 = 键盘删除键（`layout/afd.xml` 的 ImageButton id=je5）。
+            // 一并处理 selector 本身：StateListDrawable 继承 DrawableContainer，
+            // `setColorFilter` 会**转发给当前所有子 drawable**，比只染子项可靠
+            // （只染 dvi/dvj 时，selector 换状态后颜色会丢）。
+            if (payPwdLog++ < 8) {
+                Log.i(TAG, "pay pwd icon $name -> onSurface")
+            }
+            return tintIconOnSurface(drawable, name)
         }
         if (!name.startsWith("qui_") &&
             !name.contains("skin_") &&

@@ -178,6 +178,24 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     另外那个图标是**圆底+镂空叉**的合成位图，要"圆 primary + 叉 onPrimary"
     必须叠两层（详见 `hookReplyBarSpan` 的 KDoc）；尺寸要用 TIM 已算好的
     `bounds`，用 `intrinsicWidth` 会让按钮从 11dp 涨成 24dp。
+12. **有些界面跑在独立进程里，`onViewAttached` 可能整体不触发**：支付密码弹窗
+    位于 `com.tencent.tim:tool` 进程（`QWalletToolFragmentActivity`）。实测该进程里
+    `View.onAttachedToWindow` 的 dispatcher 收不到任何回调（连"记录所有 EditText
+    子类"的诊断都为空），但**资源层 hook 正常**（`Resources.getDrawable` 等照常命中）。
+    所以在这类界面里：**能在资源层解决的就别指望 View 层**；资源层覆盖不到的
+    （Canvas 自绘），要走**绘制层**（如 `Paint.setColor` / `Canvas.draw*`）。
+    另外该弹窗带 **FLAG_SECURE**，`adb screencap` 全黑、必须让用户手动截图；
+    且 `:tool` 进程**没有存储权限**，写 `/sdcard` 会静默失败 —— 调试只能靠 logcat
+    （注意 TIM 日志量大，环形缓冲很快就冲掉，要抓就得马上抓）。
+13. **短混淆名不在染色白名单里**：`tintDrawable` 有一道早退（只放行 `qui_`/`skin_`
+    等前缀白名单）。支付密码弹窗用的 `dwa`/`dvi`/`dvj`/`a3h`/`dy4` 都是短混淆名，
+    全部落到早退里被原样放行 —— 这就是它们长期没被染的原因。这类资源要在早退
+    **之前**显式处理。
+14. **颜色可能硬编码在 Canvas 代码里，资源层永远抓不到**：支付密码的 6 个格子由
+    `PasswordEditText` 用 `canvas.draw*` + `mPaintBackground.setColor(-1184275)`
+    （= `#FFEDEDED` 纯白）自绘。既不是资源、也不是 View 背景。
+    可靠的拦截点是 **`Paint.setColor`**（无论怎么画，填色前必然设颜色）——
+    按特征色匹配即可；它是热方法，所以不匹配时必须只做一次 int 比较就 `proceed()`。
 
 ## 调试手段
 
