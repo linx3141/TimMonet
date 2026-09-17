@@ -7125,7 +7125,6 @@ private const val PAY_PWD_DOT_WINDOW_MS = 120L
 private var gridSeenAt = 0L
 
 
-
 private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         val cls = try {
             Class.forName("com.tencent.mobileqq.aio.input.edit.AIOEditText", false, cl)
@@ -8945,6 +8944,18 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                 Log.i(TAG, "pay pwd grid bg $name -> page")
             }
             return drawable
+        }
+        // ------------------------------------------------------------------
+        // 语音/视频通话界面（com.tencent.av）
+        //   jzq 麦克风、d_u 蓝牙音频 —— 都是 120x120 的**纯黑位图**，
+        //   深色主题下压在通话按钮底上完全看不见（实测屏幕取色 #000000）。
+        //   同样属于"短混淆名 + 纯黑素材"，落在下面的白名单早退里被原样放行。
+        // ------------------------------------------------------------------
+        if (name == "jzq" || name == "jzw" || name == "d_u") {
+            if (payPwdLog++ < 8) {
+                Log.i(TAG, "av icon $name -> onSurface")
+            }
+            return tintIconOnSurface(drawable, name)
         }
         if (name == "k1t" || name == "k1u" || name == "h4q") {
             // 支付密码弹窗**左上角的关闭 ×**（ImageButton，src=@drawable/h4q
