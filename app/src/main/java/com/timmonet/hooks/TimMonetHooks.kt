@@ -200,6 +200,9 @@ object TimMonetHooks {
     /** 支付密码弹窗染色的日志节流计数（仅日志用）。 */
     private var payPwdLog = 0
 
+    /** 通话图标着色源纠正的日志节流（仅日志用）。 */
+    private var avIconLog = 0
+
     /**
      * 细线兜底的扫描预算：`dispatchDraw` 是热路径，只在一段窗口内做子 View 遍历，
      * 超出后彻底跳过（避免每帧全树扫描）。纯计数、无副作用。
@@ -296,6 +299,7 @@ object TimMonetHooks {
         hookTextContrast()
         hookStatusBar(module)
         hookAioEditText(module, classLoader)
+        hookAvTintDrawable(module, classLoader)
         hookPayPwdGridSetColor(module)
         hookAioBubbleText(module, classLoader)
         hookAioBubbleBg(module, classLoader)
@@ -7124,6 +7128,158 @@ private const val PAY_PWD_DOT_WINDOW_MS = 120L
 @Volatile
 private var gridSeenAt = 0L
 
+
+/**
+ * 通话界面（语音/视频）由 `com.tencent.av.utils.av` 着色的图标 —— 纠正**图标**的着色源。
+ *
+ * 反编译（TIM 4.1.0）：
+ * ```
+ *   private ColorStateList a;                     // 真实 APK 里被混淆成单字母名
+ *   av(...) { this.a = resources.getColorStateList(tintResId); onStateChange(getState()); }
+ *   onStateChange(int[] s) {
+ *       int c = this.a.getColorForState(s, 0);
+ *       setColorFilter(c, PorterDuff.Mode.MULTIPLY);   // ← 图标颜色全由这个 CSL 决定
+ *   }
+ * ```
+ * 图标位图是纯白剪影，最终颜色 = 位图 × 这个 ColorStateList。而这些 selector
+ * 原本是纯白/浅色（`#ffffffff`、`#5e6379`），会命中模块自己
+ * `TypedArray.getColor` 那条「内联白 → 面色」规则，在到达 `av` 之前就已经变成
+ * `#2B2B34`(surfaceContainer) —— 对"底"是对的，对"前景符号"就成了
+ * **图标压在深色底上几乎看不见**（通话弹出菜单图标对比度极低就是这么来的）。
+ *
+ * 同一个 `av` 类还负责按钮**底叠加层**（半透明白 → 半透明面），那个映射是正确的，
+ * 所以这里按**资源名**区分前景/底，见 [AV_ICON_TINT_COLORS]，不能按颜色值一刀切。
+ *
+ * ⚠️ 纠正必须发生在 `proceed()` **之后**：拦截器体执行在原始构造函数体之前，
+ * 那时字段还是 null，随后构造函数体才会写入真正的 CSL，先写会被它覆盖。
+ */
+private fun hookAvTintDrawable(module: XposedModule, cl: ClassLoader) {
+    val cls = runCatching {
+        Class.forName("com.tencent.av.utils.av", false, cl)
+    }.getOrNull() ?: run {
+        logOnce("MISS: com.tencent.av.utils.av (av tint)")
+        return
+    }
+    // 真实 APK 里这个字段是单字母名 `a`（反编译中间产物叫 f48607a），所以按类型取。
+    val cslField = cachedFieldByType(cls, ColorStateList::class.java)
+    if (cslField == null) {
+        logOnce(
+            "MISS: av csl field; fields=" + runCatching {
+                cls.declaredFields.joinToString(",") { it.name + ":" + it.type.simpleName }
+            }.getOrNull()
+        )
+        return
+    }
+    runCatching { cslField.isAccessible = true }
+
+    // 构造签名：av(Resources, InputStream|Bitmap, int tintResId)
+    val ctors = runCatching {
+        cls.declaredConstructors.filter { c ->
+            c.parameterTypes.size == 3 &&
+                c.parameterTypes[0] == Resources::class.java &&
+                c.parameterTypes[2] == Int::class.javaPrimitiveType
+        }
+    }.getOrNull().orEmpty()
+    if (ctors.isEmpty()) {
+        logOnce("MISS: av constructors (av tint)")
+        return
+    }
+
+    for (ctor in ctors) {
+        runCatching { ctor.isAccessible = true }
+        runCatching { module.deoptimize(ctor) }
+        module.hook(ctor).intercept { chain ->
+            val tintResId = (chain.args.getOrNull(2) as? Int) ?: 0
+            val resources = chain.args.getOrNull(0) as? Resources
+            chain.proceed()
+            runCatching {
+                // ⚠️ 纠正必须在 proceed() **之后**：拦截器体执行在原始构造函数体之前，
+                // 那时 cslField 还是 null；构造函数随后才写入真正的 ColorStateList，
+                // 先写会被它覆盖（实测纠正后 fieldBefore 读到的仍是映射值 #2b2b34）。
+                val name = entryName(resources, tintResId)
+                if (name == null || name.lowercase() !in AV_ICON_TINT_COLORS) return@runCatching
+                val self = chain.thisObject
+                val old = cslField.get(self) as? ColorStateList ?: return@runCatching
+                val fixed = fixAvIconTint(old) ?: return@runCatching
+                cslField.set(self, fixed)
+                // 构造函数体里那次 onStateChange 已经用旧值设过 filter，这里刷新一次。
+                // 递归保护：字段已换成不含面色的 CSL，再进来 fixAvIconTint 返回 null。
+                runCatching {
+                    val states = (self as? android.graphics.drawable.Drawable)?.state ?: IntArray(0)
+                    findMethodStrict(cls, setOf("onStateChange"), IntArray::class.java)
+                        ?.invoke(self, states)
+                    (self as? android.graphics.drawable.Drawable)?.invalidateSelf()
+                }
+                if (avIconLog++ < 6) {
+                    Log.i(
+                        TAG,
+                        "av icon tint ($name) #" + Integer.toHexString(old.defaultColor) +
+                            " -> #" + Integer.toHexString(fixed.defaultColor)
+                    )
+                }
+            }
+            null
+        }
+    }
+    logOnce("hook installed: com.tencent.av.utils.av<init> (av tint)")
+}
+
+/**
+ * 把"图标着色 CSL"里被错映射成**面色**的那些状态改回 `onSurface`。
+ *
+ * 只改"约等于面色"的状态：选中态的强调色（如 `#bfc4ee`）保留，
+ * 图标不至于在选中时又和底同色。
+ *
+ * @return 需要重建时返回新的 CSL；无需改动返回 null。
+ */
+private fun fixAvIconTint(csl: ColorStateList): ColorStateList? {
+    val specs = runCatching {
+        cachedField(csl.javaClass, "mStateSpecs")?.also { it.isAccessible = true }
+            ?.get(csl) as? Array<IntArray>
+    }.getOrNull() ?: return null
+    val colors = runCatching {
+        cachedField(csl.javaClass, "mColors")?.also { it.isAccessible = true }
+            ?.get(csl) as? IntArray
+    }.getOrNull() ?: return null
+    val onSurface = MonetPalette.palette().onSurface
+    var changed = false
+    val fixed = IntArray(colors.size) { i ->
+        val c = colors[i]
+        // 面色判据：不带 alpha 的浅色被映射后落进 surfaceContainer 家族。
+        // 用 BgResolver 的"是不是一块面"判据，保持判据单一来源。
+        if (BgResolver.isSurfaceColorOf(c) || c == TokenMapper.bgPage(true)) {
+            changed = true
+            ColorMath.keepAlpha(onSurface, c)
+        } else {
+            c
+        }
+    }
+    if (!changed) return null
+    return runCatching { newSkinCsl(specs, fixed) }.getOrNull()
+}
+
+/**
+ * AV（语音/视频通话）里 `com.tencent.av.utils.av` 的**图标前景色**资源名集合。
+ *
+ * 反编译（TIM 4.1.0）逐个核对过 `av.a(resources, drawable, R.color.X)` 的调用点：
+ * ```
+ *   rl  utils.n.b/c/d            → 通话底部按钮的图标（QavPanel.setBtnTopDrawable）
+ *   rm  AudioHelperApiImpl:200   → 视频通话菜单项图标；TraeHelper 多处
+ *   rn  AudioHelperApiImpl:200   → 同上（文字/描边）
+ *   qm  AudioHelperApiImpl:202   → 语音通话菜单项图标；TraeHelper
+ *   qn  AudioHelperApiImpl:202   → 同上
+ *   amp QavOperationMenuView:201 → 美颜入口图标
+ *   b0x com/tencent/av/ui/u.w()  → 菜单项图标（`setImageDrawable` 路径）
+ * ```
+ * **不在**此列的 `b0w` / `ro` 是按钮**底叠加层**（半透明白 → 半透明面），
+ * 那是正确的映射，不能一起改。
+ *
+ * 为什么需要纠正：这些 selector 原本是纯白/浅色（`#ffffffff`、`#5e6379`），
+ * 模块的 `TypedArray.getColor`「内联白 → 面色」规则会把它们一并映射成
+ * `#2B2B34`(surfaceContainer) —— 对"底"是对的，对"前景符号"就是
+ * 图标压在深色底上几乎看不见。这里按资源名把它们改回 `onSurface`。
+ */
+private val AV_ICON_TINT_COLORS = setOf("rl", "rm", "rn", "qm", "qn", "amp", "b0x")
 
 private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         val cls = try {
