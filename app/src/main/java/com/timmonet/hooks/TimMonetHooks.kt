@@ -294,6 +294,11 @@ object TimMonetHooks {
         }
         installAttachDispatcher(module)
         installSetBackgroundArgReplacers(module)
+        hookSearchBarIcon(module)
+        hookNearBlackHint(module)
+        hookPopupBeak()
+        hookQuiRowSurface()
+        hookQuiGroupRadii()
         hookAttachedTinyBg()
         hookAttachedNoticeBar()
         hookTextContrast()
@@ -6127,6 +6132,386 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  前几轮分别挂在 tintDrawable / setBackgroundDrawable / setBackground 上
      *  都没命中 —— 说明那个背景根本没经过这些 setter（TIM 的自定义 inflater
      *  或直接在构造器里赋值）。这里不再关心它是怎么设进来的，只看最终状态。 */
+    /** 该 View 是否 QUI 设置页的列表行（最多向上找 6 层）。 */
+    private fun isQuiListRow(v: View): Boolean {
+        var cur: View? = v
+        var depth = 0
+        while (cur != null && depth < 6) {
+            val n = cur.javaClass.name
+            if (n.startsWith("com.tencent.mobileqq.setting.") ||
+                n.startsWith("com.tencent.mobileqq.widget.listitem.")
+            ) {
+                return true
+            }
+            cur = cur.parent as? View
+            depth++
+        }
+        return false
+    }
+
+    /**
+     * QUI 列表行的**面色统一**。
+     *
+     * 背景（都有实证）：行底由 `QUIListItemBackgroundType.getBackground()` 生成，
+     * 每个分支用的颜色资源不同，其中 `FullWidthWithTransparent` 用的是
+     * `R.color.ajr` = `@color/fm` = `#00000000` **全透明**（TIM 有意让下层透出）。
+     * 实测该工厂对设置页**每一行**返回同一个颜色（29 次调用全为 `#2B2B34`
+     * = `TokenMapper.bgCard(true)`）→ 同组各行本该同色。
+     * 但 `AccountManageView` / `SingleLineRedTouchView` 两类行会取到别的颜色。
+     * 这里统一到工厂的规范值，**全透明的行原样放过**。
+     */
+    private fun hookQuiRowSurface() {
+        val normalize = { v: View, d: Drawable ->
+            runCatching {
+                if (!MonetPalette.isDarkNow()) return@runCatching
+                if (!isQuiListRow(v)) return@runCatching
+                val container = d as? DrawableContainer ?: return@runCatching
+                val cur = solidColorOf(container) ?: return@runCatching
+                if (ColorMath.isTransparent(cur)) return@runCatching
+                val want = TokenMapper.bgCard(true)
+                if (ColorMath.opaque(cur) == ColorMath.opaque(want)) return@runCatching
+                if (!BgResolver.isSurfaceColorOf(cur) &&
+                    BgResolver.luma(ColorMath.opaque(cur)) > BgResolver.BRIGHT
+                ) {
+                    return@runCatching
+                }
+                val st = container.constantState as?
+                    android.graphics.drawable.DrawableContainer.DrawableContainerState
+                val kids = st?.children ?: return@runCatching
+                for (i in kids.indices) {
+                    val k = kids[i] ?: continue
+                    when (k) {
+                        is GradientDrawable -> {
+                            k.mutate(); k.setColor(want)
+                        }
+                        is android.graphics.drawable.ColorDrawable -> {
+                            k.mutate(); k.color = want
+                        }
+                        is LayerDrawable -> {
+                            for (j in 0 until k.numberOfLayers) {
+                                val lj = k.getDrawable(j) ?: continue
+                                if (lj is GradientDrawable) {
+                                    lj.mutate(); lj.setColor(want)
+                                } else {
+                                    ColorMath.recolorInPlace(lj, want)
+                                }
+                            }
+                        }
+                        else -> ColorMath.recolorInPlace(k, want)
+                    }
+                }
+                if (quiRowLog++ < 10) {
+                    Log.i(
+                        TAG,
+                        "qui row surface #" + Integer.toHexString(cur) +
+                            " -> #" + Integer.toHexString(want) +
+                            " on " + v.javaClass.simpleName
+                    )
+                }
+            }
+        }
+        onSetBackgroundArg { v, incoming ->
+            if (incoming != null) normalize(v, incoming)
+            null
+        }
+        onViewAttached { v ->
+            v.background?.let { normalize(v, it) }
+        }
+    }
+
+    /** QUI 行面色统一的日志额度（仅日志用）。 */
+    private var quiRowLog = 0
+
+    /** 收集同一个列表里所有 QUI 行，按屏幕 y 排序。 */
+    private fun collectQuiRows(root: View?): List<View> {
+        if (root == null) return emptyList()
+        val out = ArrayList<View>()
+        val stack = java.util.ArrayDeque<View>()
+        stack.add(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard < 400) {
+            val v = stack.removeFirst(); guard++
+            if (isQuiListRow(v) && v.height > 0 && v.background != null) out.add(v)
+            if (v is ViewGroup) for (i in 0 until v.childCount) stack.addLast(v.getChildAt(i))
+        }
+        return out.sortedBy {
+            val l = IntArray(2); it.getLocationOnScreen(l); l[1]
+        }
+    }
+
+    /**
+     * QUI 列表行**圆角按组内位置纠正**。
+     *
+     * 症状：组内首/末行本应"上圆角 / 下圆角"（相接那侧直角），坏态却变成
+     * 四角全圆（AllRound = 单条目组的形状）。
+     * 成因：这两类行都带 `RedTouch`，走 **payload 局部重绑**，而 TIM 的 binder
+     * 在 payload 路径上不重设背景类型，RecyclerView 复用 View 时把上一处的圆角
+     * 带了过来（进设置子页再返回会自愈 —— 那时是全量重绑）。
+     * 修法：按几何判断同组邻居（组内行距 2–3px、组间 48px），半径沿用行上已有的值。
+     */
+    private fun fixQuiGroupRadii(anyRow: View) {
+        var list: View? = anyRow
+        var up = 0
+        while (list != null && up < 8) {
+            val n = list.javaClass.name
+            if (n.contains("RecyclerView") || n.contains("ListView") ||
+                n.contains("xlistview") || n.contains("XListView")
+            ) {
+                break
+            }
+            list = list.parent as? View
+            up++
+        }
+        val rows = collectQuiRows(list ?: anyRow)
+        if (rows.size < 2) return
+        var radius = 0f
+        for (r in rows) {
+            forEachRadiusTarget(r.background) { gd ->
+                gd.cornerRadii?.let { arr -> arr.forEach { if (it > radius) radius = it } }
+                if (gd.cornerRadius > radius) radius = gd.cornerRadius
+            }
+        }
+        if (radius <= 0f) return
+        val gapPx = 12
+        fun topOf(v: View): Int {
+            val l = IntArray(2); v.getLocationOnScreen(l); return l[1]
+        }
+        for ((i, r) in rows.withIndex()) {
+            val top = topOf(r)
+            val bottom = top + r.height
+            val prevBottom = if (i > 0) topOf(rows[i - 1]) + rows[i - 1].height else Int.MIN_VALUE
+            val nextTop = if (i < rows.size - 1) topOf(rows[i + 1]) else Int.MAX_VALUE
+            val joinedAbove = i > 0 && (top - prevBottom) in 0..gapPx
+            val joinedBelow = i < rows.size - 1 && (nextTop - bottom) in 0..gapPx
+            val radii = if (!joinedAbove && !joinedBelow) {
+                floatArrayOf(radius, radius, radius, radius, radius, radius, radius, radius)
+            } else if (!joinedAbove) {
+                floatArrayOf(radius, radius, radius, radius, 0f, 0f, 0f, 0f)
+            } else if (!joinedBelow) {
+                floatArrayOf(0f, 0f, 0f, 0f, radius, radius, radius, radius)
+            } else {
+                FloatArray(8)
+            }
+            forEachRadiusTarget(r.background) { gd ->
+                gd.mutate()
+                gd.cornerRadii = radii
+            }
+        }
+    }
+
+    /** 对背景里所有 GradientDrawable（含 selector 子项与 layer 内层）执行 [apply]。 */
+    private inline fun forEachRadiusTarget(bg: Drawable?, apply: (GradientDrawable) -> Unit) {
+        when (bg) {
+            is GradientDrawable -> apply(bg)
+            is LayerDrawable -> {
+                for (i in 0 until bg.numberOfLayers) {
+                    val l = bg.getDrawable(i) ?: continue
+                    if (l is GradientDrawable) apply(l)
+                }
+            }
+            is DrawableContainer -> {
+                val st = bg.constantState as?
+                    android.graphics.drawable.DrawableContainer.DrawableContainerState
+                st?.children?.forEach { k ->
+                    when (k) {
+                        is GradientDrawable -> apply(k)
+                        is LayerDrawable -> {
+                            for (i in 0 until k.numberOfLayers) {
+                                val l = k.getDrawable(i) ?: continue
+                                if (l is GradientDrawable) apply(l)
+                            }
+                        }
+                        else -> {}
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun hookQuiGroupRadii() {
+        onViewAttached { v ->
+            runCatching {
+                if (!isQuiListRow(v)) return@runCatching
+                v.post { runCatching { fixQuiGroupRadii(v) } }
+            }
+        }
+    }
+
+    /**
+     * 深色下"近黑的 hint（占位）文字色" → `onSurfaceVariant`。
+     *
+     * 实测：首页搜索栏的占位文字「搜索」是 `#8c000000`（半透明纯黑），压在
+     * `#1E1F26` 的栏底上几乎看不见。它与遮罩**颜色签名完全相同**（半透明纯黑），
+     * 但语义相反 —— 遮罩要原样保留、占位文字必须提亮。颜色值分不出来，
+     * 所以在 **TextView 层面**兜底：不管 hint 色是 XML 还是代码设的，
+     * 只按"当前生效的 hint 色是不是近黑"判据修正。颜色与 AIO 输入框占位文字一致。
+     */
+    private fun fixNearBlackHint(tv: TextView) {
+        runCatching {
+            if (!MonetPalette.isDarkNow()) return@runCatching
+            val hint = tv.hintTextColors?.defaultColor ?: return@runCatching
+            if (ColorMath.isTransparent(hint)) return@runCatching
+            val op = ColorMath.opaque(hint)
+            if (!BgResolver.isGray(op)) return@runCatching
+            if (BgResolver.luma(op) >= BgResolver.DARK) return@runCatching
+            val want = MonetPalette.palette().onSurfaceVariant
+            tv.setHintTextColor(want)
+            if (nearBlackHintLog++ < 12) {
+                Log.i(
+                    TAG,
+                    "hint color #" + Integer.toHexString(hint) + " -> #" +
+                        Integer.toHexString(want) + " on " + tv.javaClass.simpleName
+                )
+            }
+        }
+    }
+
+    private fun hookNearBlackHint(module: XposedModule) {
+        onViewAttached { v ->
+            val tv = v as? TextView ?: return@onViewAttached
+            fixNearBlackHint(tv)
+            // hint 常在 attach 之后才设：下一帧再核一次（只读当前状态，不是猜时间）
+            v.post { fixNearBlackHint(tv) }
+        }
+        findMethod(TextView::class.java, setOf("setHintTextColor"), INT_TYPE)
+            ?.let { m ->
+                module.hook(m).intercept { chain ->
+                    val r = chain.proceed()
+                    (chain.thisObject as? TextView)?.let { fixNearBlackHint(it) }
+                    r
+                }
+            }
+        findMethod(TextView::class.java, setOf("setHintTextColor"), ColorStateList::class.java)
+            ?.let { m ->
+                module.hook(m).intercept { chain ->
+                    val r = chain.proceed()
+                    (chain.thisObject as? TextView)?.let { fixNearBlackHint(it) }
+                    r
+                }
+            }
+    }
+
+    /** 占位文字提亮的日志额度（仅日志用）。 */
+    private var nearBlackHintLog = 0
+
+
+    /**
+     * 弹层尖角（popup beak）—— 必须与弹层**面板同色**。
+     *
+     * 实测：首页右上角菜单上方那个小三角是 25x11 的白色位图，经 ImageView 的
+     * inflate 期 tint 落成 `onSurface`(`#E6E4F0`)，而菜单面板是 `surfaceContainer`
+     * (`#181920`) → 菜单顶上顶着一个亮三角。
+     * 识别判据（不依赖混淆名）：`ImageView` + drawable 宽扁（宽 ≥ 1.6×高、高 ≤ 24px）
+     * + 根 View 是 `PopupWindow` 的 decor。
+     */
+    private fun isPopupBeakView(v: View): Boolean {
+        val iv = v as? ImageView ?: return false
+        val d = iv.drawable ?: return false
+        val w = d.intrinsicWidth
+        val h = d.intrinsicHeight
+        if (w <= 0 || h <= 0 || h > 24) return false
+        if (w < h * 1.6f) return false
+        val root = runCatching { v.rootView?.javaClass?.name }.getOrNull().orEmpty()
+        return root.contains("Popup")
+    }
+
+    /** 该 View 是否在搜索栏内（最多向上 8 层）。 */
+    private fun insideSearchBar(v: View?): Boolean {
+        var c: View? = v
+        var d = 0
+        while (c != null && d < 8) {
+            if (c.javaClass.name.contains("QUISearchBar")) return true
+            c = c.parent as? View
+            d++
+        }
+        return false
+    }
+
+    /**
+     * 搜索栏里的图标（放大镜等）染色。
+     *
+     * 实测：首页搜索栏的 🔍 是 `SkinnableBitmapDrawable`（72x72），
+     * **既没有 colorFilter 也没有 tint** —— 它没进 `tintDrawable` 的白名单路径，
+     * 于是保留 TIM 浅色主题的深色素材，压在 `#1E1F26` 的栏底上几乎看不见
+     * （实测 `#0F0F13`）。这里在 View 层按"搜索栏内的方形小图标"兜底染成
+     * `onSurfaceVariant`（与占位文字同角色）。
+     */
+    private fun fixSearchBarIcon(iv: ImageView) {
+        runCatching {
+            if (!MonetPalette.isDarkNow()) return@runCatching
+            if (!insideSearchBar(iv)) return@runCatching
+            val d = iv.drawable ?: return@runCatching
+            if (d.colorFilter != null) return@runCatching
+            val w = d.intrinsicWidth
+            val h = d.intrinsicHeight
+            if (w !in 1..96 || h !in 1..96) return@runCatching
+            // 只认方形/近方形的小图标：尖角那种宽扁的（w >= 1.6h）不碰
+            if (w >= h * 1.6f) return@runCatching
+            val want = MonetPalette.palette().onSurfaceVariant
+            ColorMath.recolorInPlace(d, want)
+            if (searchIconLog++ < 8) {
+                Log.i(
+                    TAG,
+                    "search bar icon d=" + d.javaClass.simpleName +
+                        " " + w + "x" + h + " -> #" + Integer.toHexString(want)
+                )
+            }
+        }
+    }
+
+    private fun hookSearchBarIcon(module: XposedModule) {
+        onViewAttached { v ->
+            val iv = v as? ImageView ?: return@onViewAttached
+            if (!insideSearchBar(v)) return@onViewAttached
+            fixSearchBarIcon(iv)
+            v.post { fixSearchBarIcon(iv) }
+        }
+        findMethod(ImageView::class.java, setOf("setImageDrawable"), Drawable::class.java)
+            ?.let { m ->
+                module.hook(m).intercept { chain ->
+                    val r = chain.proceed()
+                    (chain.thisObject as? ImageView)?.let { fixSearchBarIcon(it) }
+                    r
+                }
+            }
+        findMethod(ImageView::class.java, setOf("setImageResource"), INT_TYPE)
+            ?.let { m ->
+                module.hook(m).intercept { chain ->
+                    val r = chain.proceed()
+                    (chain.thisObject as? ImageView)?.let { fixSearchBarIcon(it) }
+                    r
+                }
+            }
+    }
+
+    /** 搜索栏图标染色的日志额度（仅日志用）。 */
+    private var searchIconLog = 0
+
+    private fun hookPopupBeak() {
+        onViewAttached { v ->
+            runCatching {
+                if (!MonetPalette.isDarkNow()) return@runCatching
+                if (!isPopupBeakView(v)) return@runCatching
+                val iv = v as ImageView
+                val d = iv.drawable ?: return@runCatching
+                val want = TokenMapper.bgPage(true)
+                ColorMath.recolorInPlace(d, want)
+                runCatching { iv.imageTintList = android.content.res.ColorStateList.valueOf(want) }
+                if (popupBeakLog++ < 6) {
+                    Log.i(
+                        TAG,
+                        "popup beak -> #" + Integer.toHexString(want) +
+                            " iw=" + d.intrinsicWidth + " ih=" + d.intrinsicHeight
+                    )
+                }
+            }
+        }
+    }
+
+    /** 弹层尖角纠正的日志额度（仅日志用）。 */
+    private var popupBeakLog = 0
+
     private fun hookAttachedTinyBg() {
         onViewAttached { v ->
             runCatching {
@@ -9845,7 +10230,13 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                 mapped ?: result
                             }
                             // 纯黑文字:深色模式下归一为 onSurface
-                            dark && opaque == 0xFF000000.toInt() -> scheme.onSurface
+                            // ⚠️ 半透明纯黑 = 遮罩/蒙层：原样保留（判据用的是已抹掉
+                            // alpha 的 `opaque`，所以 #80000000 之类也会命中这里；
+                            // 之前直接返回不透明的 onSurface 会把遮罩刷实）。
+                            dark && opaque == 0xFF000000.toInt() -> {
+                                if (ColorMath.alpha(result) != 0xFF) result
+                                else scheme.onSurface
+                            }
                             // 其余:仅深色模式下的灰阶(白/浅灰底)做面色映射,
                             // 彩色一律保持原样(此前按颜色值盲目映射会改成更浅的面色)
                             dark -> TokenMapper.inlineBgColor(result, true) ?: result
@@ -9977,6 +10368,8 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             "black->? name=" + name + " #" + Integer.toHexString(op)
                         )
                     }
+                    // 半透明纯黑 = 遮罩/蒙层：原样保留（同上）
+                    if (ColorMath.alpha(color) != 0xFF) return color
                     if (name != null && (name.contains("divider") ||
                             name.contains("separator") || name.contains("line") ||
                             name.contains("border"))

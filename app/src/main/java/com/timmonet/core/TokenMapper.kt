@@ -302,6 +302,16 @@ object TokenMapper {
     private fun resolve(role: Role, original: Int, scheme: DynamicScheme): Int {
         if (role == Role.KEEP || role == Role.UNKNOWN) return original
         val alpha = ColorMath.alpha(original)
+        // ⚠️ **半透明纯黑 = 遮罩/蒙层，原样保留**（与"全透明不参与映射"同一类约定）。
+        //
+        // 为什么必须在这里短路：下面的 `TEXT_ROLES` 分支会**强制 alpha = 0xFF**
+        // （文字色不该半透明），可"纯黑 + 半透明"在 TIM 里是**压暗遮罩**的惯用写法
+        // （首页右上角菜单、各种弹层）。一旦按名字落进文字角色，遮罩就被刷成
+        // 不透明的 `onSurface` —— 下方内容全被盖死（用户实测：首页菜单遮罩
+        // 变成实心 `#FFE6E4F0`）。
+        // 注意只认"RGB 全黑"的：半透明白/灰是另一类叠加层（如 30% 白），
+        // 它们必须继续参与映射，否则深色主题下会留下一块白。
+        if (alpha != 0xFF && (original and 0x00FFFFFF) == 0) return original
         // AMOLED 纯黑：所有表面槽位置黑
         if (MonetPalette.isAmoled() && role in SURFACE_ROLES) {
             // ⚠️ 全透明的槽位按约定**原样返回**。以前这里写 `return 0`，虽然

@@ -230,6 +230,56 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     兜底既兜不住快的也兜不住慢的（实测"颜色闪一下又消失"）。要挂在**设置背景的
     入口**上（`onSetBackgroundArg`），它与加载快慢无关、且覆盖后续每次重设。
 
+20. **设置页列表行的面色 / 圆角会被"复用残留"破坏**（两个独立症状，同一个来源）。
+    行的背景由 `QUIListItemBackgroundType.getBackground()` 生成，**每个分支用的颜色
+    资源不同**（`qui_common_fill_light_secondary` 之类），其中
+    `FullWidthWithTransparent` 用的是 `R.color.ajr` = `@color/fm` = **`#00000000` 全透明**
+    （TIM 有意让下层分组卡片透出来）。
+    - **颜色**：实测该工厂对设置页**每一行**返回同一个颜色
+      （29 次调用全为 `#2B2B34` = `TokenMapper.bgCard(true)`）→ **同组各行本该同色**，
+      所以"哪一档才对"有据可依：就是工厂的返回值，不要自己挑角色。
+      但坏态下 `AccountManageView` / `SingleLineRedTouchView` 两类行会取到别的颜色。
+      修法见 `hookQuiRowSurface()`：统一到 `bgCard`，**全透明的行原样放过**。
+    - **圆角**：组内首/末行本应"上圆角 / 下圆角"（相接那侧直角），坏态却变成
+      **四角全圆**（AllRound = 单条目组的形状）。成因是这两类行都带 `RedTouch`，
+      走 **payload 局部重绑**，而 TIM 的 binder 在 payload 路径上**不重设背景类型**，
+      RecyclerView 复用 View 时把上一处（单条目组）的圆角带了过来
+      （**进设置子页再返回会自愈**——那时是全量重绑，这一条正是判据）。
+      修法见 `hookQuiGroupRadii()`：按几何判断同组邻居（组内行距 2–3px、组间 48px），
+      首行只圆上方、末行只圆下方、中间直角，**半径沿用行上已有的值**。
+    ⚠️ 判据必须用**实测对照**：先量"正常态"的几何，再量"坏态"，两者一比就知道
+    目标形状是什么 —— 我在这一步凭想象编过一次"原版本来就更深一档"，是严重错误。
+21. **`palette()` 在真实调色板就绪前会返回"兜底方案"**：
+    `MonetPalette.palette()` 里 `if (scheme != null) return scheme` 否则
+    `fallbackScheme()` —— 用 `DEFAULT_SEED` 现搭的 TonalSpot 方案（**另一套颜色**）。
+    实测同一条日志里 `palette()` 先返回兜底（`bgPage=#1d2024`）、8ms 后真实方案就绪
+    （`bgPage=#181920`）。**这段时间内构建的控件会拿到与之后不一样的配色**
+    （表现为同一页面里颜色不一致、重建后自愈）。排查"同页颜色不一致"时，
+    先看 `palette rebuilt` 的时间戳是否**晚于**这些控件的构建时间。
+
+22. **同一段"半透明纯黑"既是遮罩、又是占位文字色 —— 颜色值分不出来**。
+    `#8c000000` 这种色有两个相反语义：
+    - **遮罩/蒙层**（首页菜单背后的压暗层）→ 必须**原样保留**，一旦被换成不透明的
+      `onSurface`，下方内容全被盖死（实测遮罩变实心亮片）。
+    - **占位文字**（首页搜索栏的「搜索」）→ 必须**提亮**成 `onSurfaceVariant`，
+      否则压在深色栏底上几乎看不见。
+    实测两者的 alpha/RGB 完全同签名，**任何基于颜色值的判据都必然二选一错**。
+    最终修法：
+    - 颜色路径里对"半透明 + RGB 全黑"**原样放过**（`TokenMapper.resolve` 与
+      `remapColorByName` 各一处短路）—— 保证遮罩不被刷实；
+    - 文字的那一侧**改在 View 层兜底**：`hookNearBlackHint()` 只看"当前生效的
+      hint 色是不是近黑"，与它从 XML 还是代码来无关。
+    **方法论**：当同一个颜色值承载相反语义时，别在颜色层硬分，去**语义明确的层**
+    （这里是 TextView 的 hint）判。
+23. **inflate 期就定好的颜色，View 层的 setter 钩子全都看不到**：首页搜索栏的
+    🔍 是 `SkinnableBitmapDrawable`，**既无 colorFilter 也无 tint**，从没进过
+    `tintDrawable` 的白名单路径；「搜索」占位色同理（XML 的 `textColorHint`）。
+    排查这类"某个控件就是没被染"时，**先 dump 它的最终状态**
+    （TextView 的 `hintTextColors` / ImageView 的 `drawable.colorFilter`），
+    拿不到再去追 setter —— 我在这上面先后白试了 `setHintTextColor`、
+    `setImageDrawable`、`QUITokenThemeManager.k` 三条路径。
+    修法也是在 View 层兜底（`hookSearchBarIcon()` / `hookNearBlackHint()`）。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`
