@@ -345,6 +345,35 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     标注了已修/待处理与各自的高危级别）。**新增 hook 前请先读它**，
     尤其是"宽松判据 + 破坏性动作（替换背景 / SRC_IN 单色化 / alpha=0）"的组合。
 
+27. **"填充"类颜色：低 alpha 在深色面上必然看不见 —— 颜色层修不了，要按身份在 View 层修**。
+    转发弹窗里的「输入留言」框在**普通文字转发**时和弹窗同色、整个框看不见
+    （Ark 卡片转发那条走另一套 token，所以时好时坏 —— 这种"分路径不同"最容易误判）。
+    排查出来的完整链条（都是实证，别再靠猜）：
+    - 输入框那一层是 `LinearLayout id=dmo`（`XEditTextEx id=input` 的直接父），
+      它的底是 TIM 的 **`fill_standard_*` 系列**：`#1447122a` = **8% alpha** 的填充；
+    - `computeRole` 把 `fill_standard*` 判成 `SURFACE_VARIANT`，`resolve` **保留 TIM 的
+      alpha** → 8% 的深色叠在深色弹窗上 ≈ 同色。
+    ⚠️ **这件事在颜色层是修不掉的**：同一个 `fill_standard_*` token 既被用作
+    "整块控件的底"、也被用作"压在上面的细微叠加"，颜色值分不出这两种语义
+    （与坑 22 / 27 前半是同一类）。所以按颜色值怎么调都不对。
+    **修法（三层，缺一不可）**：
+    1. **View 层按身份**：`fixInputFieldBg()` —— "自身或直接子 View 是 `EditText`"
+       的容器就是输入框那一层，把它的**半透明**填充换成不透明的 `INPUT_BG`
+       （`surfaceContainerHigh`）。挂在 `onSetBackgroundArg` + `onViewAttached` 两个入口。
+    2. **必须直接改形状的填充色，不能用 `recolorInPlace`**：后者走 filter/tint，而
+       **`GradientDrawable` 的 tint 只染色、会保留填充自身的 alpha** —— 实测日志显示
+       "已改成 `#3D0D23`"、屏幕上却是"`#3D0D23` @ 8%"叠出来的 `#4F162F`，等于没改。
+       `setShapeSolidColor()` 递归 selector/layer 里的 `GradientDrawable` 直接 `setColor`
+       （圆角/描边/多状态都保留）。
+    3. **`INPUT_BG` 强制不透明**（`resolve` 里）：输入框没有"半透明"这种语义；
+       跨端 token 表里 `fill_light_tertiary` 也按 `INPUT_BG` 且**不保留 alpha**。
+    另外两条经验：
+    - 判"宿主面是什么"**不能在 `setBackground` 那一刻问**：那时 View 还没 attach，
+      `rootView` 就是它自己、背景为 null（实测）。要看就在 attach 之后看。
+    - 排查这类问题**先 dump 祖先链**（类名 / id / 尺寸 / y / 背景色）再动手：
+      我一开始把**聊天页**那条输入框的链当成了弹窗的（根是 `ChatFragmentRootView`），
+      白改了好几版；dump 里加上 `ctx=` / `isDialog=` 才能分清对象。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`

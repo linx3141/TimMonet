@@ -295,7 +295,11 @@ object TimMonetHooks {
         // 只要 TIM 再设一次背景就会重做一遍纠正，与加载快慢无关。
         // 判据前两步（是否全宽、高度是否在范围内）极便宜，绝大多数 setBackground
         // 会在头两行就返回。
+        onViewAttached { v ->
+            runCatching { fixInputFieldBg(v, v.background) }
+        }
         onSetBackgroundArg { v, incoming ->
+            runCatching { fixInputFieldBg(v, incoming) }
             if (incoming != null) runCatching { fixThinBrightLineDrawable(v, incoming) }
             null
         }
@@ -6884,6 +6888,105 @@ private fun hookSummaryBadge(module: XposedModule) {
         return maxL - minL <= 12
     }
 
+    /**
+     * 这个 View 是不是"输入框那一层"：自身是 EditText，或**直接子 View 里有 EditText**
+     * （TIM 的输入框底画在容器上，EditText 自己背景是 `@null` —— 见 `jt.xml` 的
+     * `LinearLayout id=dmo` + `EditText id=input`）。
+     */
+    /**
+     * 输入框的底必须是**看得见的面**。
+     *
+     * 实测（转发弹窗）：输入框容器 `LinearLayout id=dmo` 的底是 TIM 的
+     * `fill_standard_*` 系列 —— 那是 **8% 的深色叠加层**（`#1447122a`）。
+     * 颜色层分不出"用作整块控件底的填充"和"压在上面的细微叠加"（同一个 token
+     * 两处都用），所以按颜色值怎么调都不对；这里按**身份**修：
+     * "自身或直接子 View 是 EditText"的容器就是输入框那一层 → 把它的
+     * **半透明**底换成不透明的 `INPUT_BG`。
+     *
+     * 不透明/已经是我们角色色的底一律不动（聊天页输入条走它自己的 guestBubble 逻辑）。
+     */
+    private fun fixInputFieldBg(v: View?, d: Drawable?) {
+        runCatching {
+            if (v == null || d == null) return@runCatching
+            if (!MonetPalette.isDarkNow()) return@runCatching
+            if (!isInputFieldHost(v)) return@runCatching
+            val solid = solidColorOf(d) ?: return@runCatching
+            val alpha = ColorMath.alpha(solid)
+            // 只处理"半透明填充"（TIM 的 fill_standard_* 那种叠加层）；
+            // 不透明或全透明的都不碰。
+            if (alpha == 0 || alpha >= 0x80) return@runCatching
+            val want = TokenMapper.inputBg(true)
+            // ⚠️ 不能只用 recolorInPlace：它走 filter/tint，而 **GradientDrawable 的
+            // tint 会保留填充自身的 alpha** —— 实测改完仍是"#3D0D23 @ 8%"叠出来的
+            // #4F162F，屏幕上等于没改。这里对形状 drawable **直接改填充色**（不透明），
+            // 圆角/描边/多状态都保留。
+            if (!setShapeSolidColor(d, want)) {
+                ColorMath.recolorInPlace(d, want)
+            }
+            if (inputFieldLog++ < 8) {
+                Log.i(
+                    TAG,
+                    "input field bg #" + Integer.toHexString(solid) + " -> #" +
+                        Integer.toHexString(want) + " on " + v.javaClass.simpleName
+                )
+            }
+        }
+    }
+
+    /** 输入框底纠正的日志额度（仅日志用）。 */
+    private var inputFieldLog = 0
+
+    /**
+     * 把 drawable（含 selector / layer 内层）里的**形状填充色**直接改成 [color]。
+     *
+     * 与 `ColorMath.recolorInPlace` 的区别：这条会连 **alpha 一起改**，而 filter/tint
+     * 那条**会保留填充原本的 alpha**（见 [fixInputFieldBg] 的注释）。
+     *
+     * @return 是否至少改到一处（没改到则调用方回退到 recolorInPlace）
+     */
+    private fun setShapeSolidColor(d: Drawable?, color: Int): Boolean {
+        var hit = false
+        fun apply(gd: android.graphics.drawable.GradientDrawable) {
+            runCatching { gd.mutate(); gd.setColor(color); hit = true }
+        }
+        when (d) {
+            is android.graphics.drawable.GradientDrawable -> apply(d)
+            is android.graphics.drawable.LayerDrawable -> {
+                for (i in 0 until d.numberOfLayers) {
+                    val l = d.getDrawable(i) ?: continue
+                    if (l is android.graphics.drawable.GradientDrawable) apply(l)
+                }
+            }
+            is android.graphics.drawable.DrawableContainer -> {
+                val st = d.constantState as?
+                    android.graphics.drawable.DrawableContainer.DrawableContainerState
+                st?.children?.forEach { k ->
+                    when (k) {
+                        is android.graphics.drawable.GradientDrawable -> apply(k)
+                        is android.graphics.drawable.LayerDrawable -> {
+                            for (i in 0 until k.numberOfLayers) {
+                                val l = k.getDrawable(i) ?: continue
+                                if (l is android.graphics.drawable.GradientDrawable) apply(l)
+                            }
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+            else -> Unit
+        }
+        return hit
+    }
+
+    private fun isInputFieldHost(v: View): Boolean {
+        if (v is android.widget.EditText) return true
+        val g = v as? android.view.ViewGroup ?: return false
+        for (i in 0 until g.childCount) {
+            if (g.getChildAt(i) is android.widget.EditText) return true
+        }
+        return false
+    }
+
     private fun fixTinySolidBg(v: View, d: Drawable) {
         if (!MonetPalette.isDarkNow()) return
         // 极光卡片（QUIPolarLightView）由 hookPolarLightCard 统一成**卡片色**，
@@ -6914,11 +7017,15 @@ private fun hookSummaryBadge(module: XposedModule) {
         // 判据统一走 BgResolver（彩色排除 + 亮度档位）：以前这里各写一套阈值，
         // 同一个颜色经不同入口会落到不同结果。
         if (!BgResolver.isLightLeftover(c, true)) return
+        // ⚠️ 输入框容器另走一档：TIM 浅色下"页面底"和"输入框底"都是浅灰，
+        // 一律压成页面底色会让输入框与弹窗/卡片割裂（转发弹窗实测）。语义上它该用 INPUT_BG。
+        val targetBg = if (isInputFieldHost(v)) TokenMapper.inputBg(true)
+        else TokenMapper.bgPage(true)
         // ⚠️ 保留原 drawable 的**形状**，只改颜色 —— 绝不能手工造一个
         // GradientDrawable 去替换：那会丢掉圆角、九宫格留白、描边与多状态
         // （历史上"卡片圆角被削平"就是这个原因）。双写 filter+tint 的原因见
         // ColorMath.recolorInPlace 的文档（TIM 皮肤 drawable 不认 setTint）。
-        ColorMath.recolorInPlace(d, TokenMapper.bgPage(true))
+        ColorMath.recolorInPlace(d, targetBg)
         // ⚠️ 注意：这里以前**漏了实际应用**（只构造了 gd 却没 setBackground），
         // 于是整条"亮底压暗"规则是空操作、却照打"已改成页面底色"的日志 ——
         // 排查时极具误导性。现在改成上面就地改色，既生效又不破坏形状。
@@ -7929,6 +8036,12 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             return
         }
         // 与对方消息气泡完全同色：深色=surfaceBright、浅色=surface（含 AMOLED 语义）
+        // ⚠️ 输入框的颜色要**按它坐在什么面上**选，不能写死：
+        //   · 聊天页 AIO：宿主是**页面底**(surfaceContainer #34081D) → 浅一档的
+        //     `guestBubble`(=surfaceBright #501730) 正好是"抬起来的输入条" ✓
+        //   · 转发**弹窗**：宿主本身就是 surfaceBright(#501730) → 再用同一个颜色
+        //     就等于"输入框和弹窗同色"、整个框看不见（用户报"输入框变成背景色"）
+        //     → 这里改用深一档的 `INPUT_BG`(surfaceContainerHigh #3D0D23) 做**内嵌**输入框。
         val inputColor: () -> Int = {
             TokenMapper.guestBubble(MonetPalette.isDarkNow())
         }

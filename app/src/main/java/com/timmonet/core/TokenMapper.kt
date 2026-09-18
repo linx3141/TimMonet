@@ -69,6 +69,19 @@ object TokenMapper {
      */
     fun mapPageToken(key: String, color: Int, dark: Boolean): Int {
         if (key.contains("bg_top_light")) return resolve(Role.BG_CARD, color, MonetPalette.palette())
+        // ⚠️ `fill_light_tertiary` 是"输入框/字段"的**填充**语义。
+        // TIM 深色 token 给的是**低 alpha 的深色**（实测 `#1A34081D` = 10% 的深紫），
+        // 我们若保留那个 alpha，就成了"10% 深色叠在深色面上"= **完全看不见**
+        // （转发弹窗的输入框实测与弹窗底 `#501730` 分不出来，用户报"输入框变成背景色"）。
+        // 填充语义应当是一块**不透明的面** —— 按 `INPUT_BG`（深色下 surfaceContainerHigh）
+        // 给，pass 不透明原值让 resolve 输出的 alpha 为 0xFF。
+        if (key.contains("fill_light_tertiary")) {
+            return resolve(
+                Role.INPUT_BG,
+                ColorMath.opaque(color),
+                MonetPalette.palette()
+            )
+        }
         return mapColor(key, color, dark)
     }
 
@@ -232,6 +245,14 @@ object TokenMapper {
     fun outlineVariant(dark: Boolean): Int =
         resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette())
 
+    /** 输入框/搜索框底色（`Role.INPUT_BG`）：深色下 surfaceContainerHigh。
+     *
+     *  与 [bgPage] 的区别很重要：TIM 浅色下"页面底"和"输入框底"都是浅灰，
+     *  "亮底压暗"这类兜底如果一律给页面底色，输入框就会和弹窗/卡片割裂
+     *  （转发弹窗实测：普通文字转发时输入框变成页面色）。 */
+    fun inputBg(dark: Boolean): Int =
+        resolve(Role.INPUT_BG, 0xFF000000.toInt(), MonetPalette.palette())
+
     fun bgCard(dark: Boolean): Int =
         resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette())
 
@@ -382,6 +403,11 @@ object TokenMapper {
         // 文字/前景类角色强制不透明:TIM 的次要文字色自带 alpha(实测
         // "我的"页说明文字映射后为 #8C87B0CC,alpha=140),保留下来在深色
         // 主题里显得暗淡。背景类仍保留原 alpha(半透明蒙层是设计需要)。
+        // ⚠️ 输入框底必须是**不透明**的面：TIM 的 QUI token 在深色档给的是
+        // 低 alpha 的填充（实测 `fill_light_tertiary` = 10% 深紫），保留 alpha 就是
+        // "深色叠深色"= **完全看不见**（转发弹窗输入框实测与弹窗底 `#501730`
+        // 分不出来，用户报"输入框变成背景色"）。输入框没有"半透明"这种语义。
+        if (role == Role.INPUT_BG) return ColorMath.opaque(c)
         val outAlpha = if (role in TEXT_ROLES) 0xFF else alpha
         return ColorMath.withAlpha(c, outAlpha)
     }
@@ -576,7 +602,9 @@ object TokenMapper {
         // 设置页 QUIListItem 等“二级填充”行背景：TIM 亮色下和
         // fill_light_primary 同为白色卡片，深色莫奈也应同为卡片色。
         if (n.contains("fill_light_secondary")) return Role.BG_CARD
-        if (n.contains("fill_light_tertiary")) return Role.BG_LIST
+        // `fill_light_tertiary` = **输入框/字段的填充**（TIM 的 jt.xml 输入行、
+        // 转发弹窗的输入框都用它）。它是"输入框底"语义，不是普通列表底。
+        if (n.contains("fill_light_tertiary")) return Role.INPUT_BG
         if (n.contains("fill_standard")) return Role.SURFACE_VARIANT
 
         // 白色/卡片底（Ark 聊天记录卡等直接用 white/bg_card 语义 token）
@@ -611,6 +639,26 @@ object TokenMapper {
         // AIO 输入栏背景 drawable
         if (n.contains("aio_input") || n.contains("input_full_screen") || n.contains("searchbar")) {
             return Role.INPUT_BG
+        }
+        // 转发/新版弹窗的输入框底：`SimpleModeHelper` 用
+        // `R.color.skin_color_forward_dialog_new_version_editbox_bg` 建 GradientDrawable
+        // 设给输入框容器(`R.id.dmo`)。
+        // ⚠️ 以前这里没有规则 → `roleOf` 返回 null → 落到 `inferByColor` 的灰阶阶梯，
+        // 而该色在浅色皮肤里是**近黑**（tone ≤ 12）→ 被判成 `onSurface`（前景色），
+        // 于是输入框被刷成一块**亮色底**（转发 Ark 卡片时实测 #FFDDE6，与弹窗底割裂）。
+        // 名字里明确是 `_bg`（背景），按"输入框底"角色走才对。
+        if (n.contains("editbox_bg") || (n.contains("forward_dialog") && n.contains("_bg"))) {
+            return Role.INPUT_BG
+        }
+
+        // ⚠️ 通用兜底（必须放在所有具体规则之后）：名字明确是"**背景**"
+        // （`_bg` 结尾 / 含 `_bg_` / 含 background）却一条具体规则都没命中时，
+        // **绝不能**继续走到 `computeRole` 返回 null 之后的"按颜色猜"
+        // （`inferByColor` 的灰阶阶梯会把近黑的底判成 onSurface/onSurfaceVariant
+        // 这类**前景**角色 → 整块底被刷成亮色）。
+        // 统一按"面"处理：宁可平淡，也不要把底染成前景色。
+        if (n.endsWith("_bg") || n.contains("_bg_") || n.contains("background")) {
+            return Role.BG_LIST
         }
 
         // 经典皮肤的列表项背景
