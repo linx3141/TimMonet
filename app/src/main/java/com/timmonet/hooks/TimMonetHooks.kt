@@ -4211,6 +4211,38 @@ private fun hookSummaryBadge(module: XposedModule) {
                     }.onFailure { Log.w(TAG, "profile content card bg failed", it) }
                 }
             }
+            // 资料卡的卡面 = `ProfileCellView` 这些行，统一成**对方气泡色**。
+            //
+            // 为什么挂"设置背景"的入口而不是 attach 后定时补染：反编译实证
+            //     ProfileCardAdapter.getContentView():
+            //         view2.setBackgroundDrawable(getProfileDrawable(i2));
+            // 行背景是**每次绑定时重新设置**的（`setBackgroundDrawable`，独立方法、
+            // 不转发给 `setBackground`），而且各行的加载时机不同；用固定延时兜底
+            // 既兜不住快的也兜不住慢的（实测表现为"颜色闪一下又消失"）。
+            // 挂在设置入口上则与加载快慢无关。
+            val cellCls = try {
+                Class.forName("com.tencent.mobileqq.profilecard.ProfileCellView", false, cl)
+            } catch (t: Throwable) {
+                null
+            }
+            if (cellCls != null) {
+                val cardBg = { TokenMapper.guestBubble(true) }
+                onSetBackgroundArg { view, incoming ->
+                    if (!cellCls.isInstance(view)) return@onSetBackgroundArg null
+                    // 返回 incoming 本身 = 只改色、不换对象（保形：圆角/按压态都在）
+                    incoming?.let { ColorMath.recolorInPlace(it, cardBg()) }
+                    incoming
+                }
+                // 兜底：inflate 期直接赋给字段的背景不走任何 setter
+                onViewAttached { v ->
+                    if (!cellCls.isInstance(v)) return@onViewAttached
+                    runCatching {
+                        v.background?.let { ColorMath.recolorInPlace(it, cardBg()) }
+                    }
+                }
+                logOnce("hook installed: ProfileCellView bg (card surface = guestBubble)")
+            }
+
             // rebuildProfileContent：内容重建后整棵子树重刷一遍卡片
             val cardInfoType = try {
                 Class.forName("com.tencent.mobileqq.profilecard.data.ProfileCardInfo", false, cl)
@@ -6151,28 +6183,48 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private fun installSetBackgroundArgReplacers(module: XposedModule) {
-        findMethod(View::class.java, setOf("setBackground"), Drawable::class.java)
-            ?.let { method ->
-                logOnce("hook installed: View.setBackground (arg replacers)")
-                runCatching { module.deoptimize(method) }
-                module.hook(method).intercept { chain ->
-                    val v = chain.thisObject as? View
-                    val incoming = chain.getArg(0) as? Drawable
-                    var arg = incoming
-                    var replaced = false
-                    if (v != null) {
-                        for (i in bgArgReplacers.indices) {
-                            val r = runCatching { bgArgReplacers[i](v, arg) }.getOrNull()
-                            if (r != null) {
-                                arg = r
-                                replaced = true
-                                break
-                            }
-                        }
+        // ⚠️ `setBackground` 与 `setBackgroundDrawable` 是**两个独立方法**，互不转发，
+        // 必须都挂 —— 反编译实证：资料卡的行走的是后者
+        //     ProfileCardAdapter.getContentView():
+        //         view2.setBackgroundDrawable(getProfileDrawable(i2));
+        // 只挂前者时，这类背景完全绕过 `bgArgReplacers`（卡片因此与页面底同色、边界消失）。
+        // 两个入口共用同一段逻辑，避免以后新增规则只改一边。
+        installBackgroundInterceptor(
+            module,
+            "View.setBackground",
+            findMethod(View::class.java, setOf("setBackground"), Drawable::class.java)
+        )
+        installBackgroundInterceptor(
+            module,
+            "View.setBackgroundDrawable",
+            findMethod(View::class.java, setOf("setBackgroundDrawable"), Drawable::class.java)
+        )
+    }
+
+    private fun installBackgroundInterceptor(
+        module: XposedModule,
+        label: String,
+        method: java.lang.reflect.Method?
+    ) {
+        method ?: return
+        logOnce("hook installed: $label (arg replacers)")
+        runCatching { module.deoptimize(method) }
+        module.hook(method).intercept { chain ->
+            val v = chain.thisObject as? View
+            var arg = chain.getArg(0) as? Drawable
+            var replaced = false
+            if (v != null) {
+                for (i in bgArgReplacers.indices) {
+                    val r = runCatching { bgArgReplacers[i](v, arg) }.getOrNull()
+                    if (r != null) {
+                        arg = r
+                        replaced = true
+                        break
                     }
-                    if (replaced) chain.proceed(arrayOf<Any?>(arg)) else chain.proceed()
                 }
             }
+            if (replaced) chain.proceed(arrayOf<Any?>(arg)) else chain.proceed()
+        }
     }
 
     /** 统一的 View attach 处理器注册表。

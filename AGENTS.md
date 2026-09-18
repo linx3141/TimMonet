@@ -47,7 +47,8 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 1. **资源层** —— `Resources.getDrawable / getColor / getColorStateList /
    `loadDrawable`、`TypedArray.getDrawable / getColor`、`SkinEngine`（腾讯皮肤引擎）
    → 按**资源名**或**颜色值**映射到配色角色。
-2. **View 层** —— `View.setBackground(Drawable)`（参数替换注册表 `bgArgReplacers`）、
+2. **View 层** —— `View.setBackground(Drawable)` **与 `View.setBackgroundDrawable(Drawable)`**
+   （两者是独立方法，不互相转发；都接 `bgArgReplacers`，见「坑 17」）、
    `View.onAttachedToWindow`（`attachHandlers` 合并成的 dispatcher）、
    `ViewGroup.dispatchDraw`（每帧纠正，用于会被 TIM 覆盖的东西）。
 3. **图片层** —— `ImageView.setImageDrawable` → 采样主色后重染
@@ -211,6 +212,23 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     先写会被构造函数体随后覆盖（实测：写完立刻回读仍是旧值，构造函数里那次
     `onStateChange` 读到的还是 `#2b2b34`）。纠正字段后还要手动再调一次
     `onStateChange` 刷新 drawable 的 colorFilter。
+17. **`setBackgroundDrawable` 是独立方法，不转发给 `setBackground`**：只 hook
+    `View.setBackground(Drawable)` 会漏掉一整类背景。资料卡的卡面就是这么漏的 ——
+    反编译 `ProfileCardAdapter.getContentView()`：
+    `view2.setBackgroundDrawable(getProfileDrawable(i2));`
+    这类背景从不经过 `bgArgReplacers`，于是**所有**按"设置背景"入口做的规则
+    （替换入参 / 按名按值染色 / 定时补染）全都命中不到它。表现：资料卡的行保留
+    inflater 的面色 `surfaceContainer`，与页面底**完全同色** → 卡片边界消失。
+    **教训：排查"某个背景没被染"时，第一步就去反编译里搜它是用哪个 setter 设的**，
+    而不是在现有 hook 上加探针 —— 这次在探针上耗了十几轮，而源码里一行
+    `setBackgroundDrawable(...)` 就是答案。
+18. **卡面不一定是"卡片类"那个 View**：资料卡页里 `ProfileContentView` 的几何是
+    `1248x0`（**没在画**），真正铺满卡片区域的是 5 个
+    `ProfileCellView [48,608 1248x168]` 行。按类名想当然地染"内容卡"会一无所获 ——
+    定位卡面要看**几何 + 最终取色**，别只看类名。
+19. **不要用固定延时"兜底"**：TIM 各行/各卡的加载时机不同，`postDelayed(300)` 这类
+    兜底既兜不住快的也兜不住慢的（实测"颜色闪一下又消失"）。要挂在**设置背景的
+    入口**上（`onSetBackgroundArg`），它与加载快慢无关、且覆盖后续每次重设。
 
 ## 调试手段
 
