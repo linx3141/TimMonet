@@ -13,7 +13,6 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -82,6 +81,7 @@ import com.timmonet.ui.component.material.SegmentedColumn
 import com.timmonet.ui.component.material.SegmentedSwitchItem
 import com.timmonet.ui.component.material.SegmentedDropdownItem
 import com.timmonet.ui.component.material.TonalCard
+import com.timmonet.core.MonetPalette
 import com.timmonet.ui.component.material.TopBarBackButton
 import com.timmonet.ui.component.material.expressiveTopAppBarColors
 import com.timmonet.ui.theme.ColorMode
@@ -129,7 +129,9 @@ fun ThemeScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            val isDark = colorMode.isDark || colorMode.isSystem && isSystemInDarkTheme()
+            // 同 TimMonetTheme：系统深浅必须走 systemDarkNow()（宿主进程里
+            // Compose 的 isSystemInDarkTheme() 恒为 false，见那里的注释）
+            val isDark = colorMode.isDark || colorMode.isSystem && MonetPalette.systemDarkNow()
             val isAmoled = colorMode.isAmoled
             ThemePreviewCard(
                 keyColor = keyColor,

@@ -231,6 +231,22 @@ object MonetPalette {
         else -> systemDark()
     }
 
+    /**
+     * 系统当前是否深色（**唯一可信的系统深浅判据**）。
+     *
+     * ⚠️ UI 层不要用 Compose 的 `isSystemInDarkTheme()`：模块设置面板跑在 TIM 进程里，
+     * 而 TIM 把**应用级** uiMode 固定成浅色（night=NO），那个 API 在宿主里恒为 false
+     * —— 表现就是"系统深色 + 自动模式，从 TIM 设置打开的面板却是浅色"。
+     * 这里以 `Resources.getSystem()` 的全局配置为准（必要时退回 UiModeManager）。
+     */
+    fun systemDarkNow(): Boolean {
+        val mode = runCatching { Resources.getSystem().configuration.uiMode }.getOrDefault(0)
+        if ((mode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES) {
+            return true
+        }
+        return systemDark()
+    }
+
     private fun systemDark(): Boolean {
         val ctx = appContext ?: return false
         return try {

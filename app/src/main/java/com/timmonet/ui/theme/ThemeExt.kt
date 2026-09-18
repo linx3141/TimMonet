@@ -3,7 +3,6 @@
 package com.timmonet.ui.theme
 
 import android.util.Log
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialExpressiveTheme
 import androidx.compose.material3.MotionScheme
@@ -16,6 +15,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowInsetsControllerCompat
 import com.materialkolor.PaletteStyle
+import com.timmonet.core.MonetPalette
 import com.materialkolor.dynamiccolor.ColorSpec
 import com.materialkolor.rememberDynamicColorScheme
 
@@ -61,7 +61,10 @@ fun TimMonetTheme(
     content: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
-    val systemDarkTheme = isSystemInDarkTheme()
+    // ⚠️ 不能用 Compose 的 isSystemInDarkTheme()：宿主(TIM)进程里应用级 uiMode 被
+    // TIM 固定成浅色 → 恒为 false，"系统深色 + 自动"时会渲染成浅色面板。
+    // MonetPalette.systemDarkNow() 读的是系统全局配置，两个进程都对。
+    val systemDarkTheme = MonetPalette.systemDarkNow()
     val darkTheme = appSettings.colorMode.isDark || (appSettings.colorMode.isSystem && systemDarkTheme)
     val amoledMode = appSettings.amoledBlack && darkTheme
     val dynamicColor = appSettings.keyColor == 0
