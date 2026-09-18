@@ -283,23 +283,27 @@ object TimMonetHooks {
                 runCatching {
                     // TabLayout 的选中指示器（自绘，不走 View.background）
                     fixTabIndicator(v)
-                    // TIM 会在 attach 之后重新设置它的背景（实测处理过又被覆盖回
-                    // 亮色），所以在后续几个时间点各补一次 —— 同 hookPolarLightLate
-                    // 处理极光卡片的思路。
                     fixThinBrightLine(v)
-                    v.postDelayed({ runCatching { fixThinBrightLine(v) } }, 300L)
-                    v.postDelayed({ runCatching { fixThinBrightLine(v) } }, 1200L)
                 }
             }
         }
         installAttachDispatcher(module)
         installSetBackgroundArgReplacers(module)
+        // 细亮线兜底的另一半：TIM 会在 attach **之后**重设背景（实测处理过又被覆盖回
+        // 亮色）。以前这里用 `postDelayed(300/1200)` 猜时间补染（坑 19 明令禁止：
+        // 既兜不住快的也兜不住慢的），现在挂在**设置背景的入口**上 ——
+        // 只要 TIM 再设一次背景就会重做一遍纠正，与加载快慢无关。
+        // 判据前两步（是否全宽、高度是否在范围内）极便宜，绝大多数 setBackground
+        // 会在头两行就返回。
+        onSetBackgroundArg { v, incoming ->
+            if (incoming != null) runCatching { fixThinBrightLineDrawable(v, incoming) }
+            null
+        }
         hookBubbleCompoundIcon(module)
         hookSearchBarIcon(module)
         hookNearBlackHint(module)
         hookPopupBeak()
         hookQuiRowSurface()
-        hookQuiGroupRadii()
         hookAttachedTinyBg()
         hookAttachedNoticeBar()
         hookTextContrast()
@@ -1568,6 +1572,10 @@ private fun buildPlusItemPlate(density: Float): Drawable {
 private fun fixPlusItemPlate(v: View) {
     if (v is ImageView) return
     if (plusPlateViews.contains(v)) return
+    // 双保险：只有**确实在 PlusPanel 里**的 View 才允许换底板。
+    // 这个函数会把背景整个换成自绘的 12dp 全圆角底板，一旦误伤普通页面的行容器，
+    // 那一行就会变成独立的全圆角卡片（真踩过）。
+    if (!isPlusPanelHost(v)) return
     if (v.background !is DrawableContainer) return
     // ⚠️ 先设置成功再登记：原来在赋值**之前**就 add，一旦赋值抛异常，这个 View
     // 就被永久标记为"已处理"且永不重试（面板底板再也修不好）。
@@ -1901,6 +1909,9 @@ private fun hookDispatchDraw(module: XposedModule) {
                             for (i in 0 until vg0.childCount) {
                                 val ch = vg0.getChildAt(i) ?: continue
                                 if (ch.width != sw || ch.height !in 1..ch.dpPx(2f)) continue
+                                // 有交互语义的细线（选中下划线、进度/滑块填充）不碰：
+                                // 它们的"亮"是有意为之，压成页面底色等于把高亮抹掉。
+                                if (ch.isClickable || ch.isSelected) continue
                                 val bg = ch.background as? ColorDrawable ?: continue
                                 val c = bg.color
                                 if (c == TokenMapper.bgPage(true)) continue
@@ -2188,7 +2199,13 @@ private fun tintBadgeDigitText(tv: TextView, scheme: DynamicScheme): Boolean {
                 val g0 = runCatching { d.color?.defaultColor }.getOrNull() ?: 0
                 isPrimaryColor(g0)
             }
-            else -> d.colorFilter != null || runCatching {
+            // ⚠️ 这里曾经有一条兜底 `d.colorFilter != null ||` —— 它与"是不是 primary 底"
+            // 毫无关系：我们自己的 recolorInPlace 会给大量普通图标挂 colorFilter。
+            // 于是"白字数字 + 3 层内有个被我们染过的 ImageView 兄弟"就被判成
+            // "数字压在 primary 底上"，文字被强制改成 onPrimary（深色方案里 onPrimary
+            // 是深色），压在非 primary 的底上几乎看不见。判不出来就返回 false，
+            // 宁可漏染也不要改错文字色。
+            else -> runCatching {
                 val dom = sampleBitmapColorOfDrawable(d) ?: return@runCatching false
                 isPrimaryColor(dom)
             }.getOrDefault(false)
@@ -5120,15 +5137,21 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun isPlusPanelHost(view: View?): Boolean {
         var v: View? = view
         var depth = 0
-        var sawViewPager = false
         while (v != null && depth < 8) {
             val n = v.javaClass.name
             if (n.contains("pluspanel") || n.contains("PlusPanel")) return true
-            if (n.contains("QQViewPager")) sawViewPager = true
             v = v.parent as? View
             depth++
         }
-        return sawViewPager && depth >= 3
+        // ⚠️ 这里曾经有一条兜底：`sawViewPager && depth >= 3` —— 即"向上 8 层里
+        // 出现过 QQViewPager 就算面板宿主"。它**过宽**：TIM 很多普通页面（设置页等）
+        // 的层级里也有 QQViewPager，于是页面里的 ImageView 被误判成面板项，
+        // 进而把**行容器的背景换成了自绘的 12dp 全圆角底板**（见 fixPlusItemPlate
+        // 的调用点），表现为"设置页每一行都变成独立的全圆角卡片"。
+        // 又因为调用点带 `panelSeen` 前置条件，症状只在**打开过"+"面板**
+        // （如文件发送页）之后才出现 —— 直接进设置页则正常。
+        // 面板宿主的类名足够明确，不需要这种几何/层级兜底。
+        return false
     }
 
 
@@ -5944,10 +5967,11 @@ private fun hookSummaryBadge(module: XposedModule) {
             depth++
         }
 
-        // 只要祖先链上没有**亮色**背景(luma > BgResolver.DARK_TEXT)就提亮：
-        // 深色底(#003045 luma=36)、透明底(bgLuma=-1)都算；
-        // 白卡片上的黑字(luma=255)保持不动，那是正常的。
-        if (bgLuma <= BgResolver.DARK_TEXT) {
+        // 只有**确实读到深色背景**才提亮。
+        // ⚠️ `bgLuma == -1` 表示"祖先链上没读到背景色"（背景可能是图片/自绘/在更上层），
+        // 以前把它也当成深底 —— 于是压在**浅色图片**上的灰字被提亮成白字，反而看不见。
+        // 读不到就不动（宁可漏提亮，也不要把能看清的文字改瞎）。
+        if (bgLuma in 0..BgResolver.DARK_TEXT) {
             val scheme = MonetPalette.palette()
             // 返回 null = "这个颜色不需要提亮"，保持原色
             tv.setTextColor(BgResolver.foregroundForDimText(opaque, scheme) ?: opaque)
@@ -6000,6 +6024,9 @@ private fun hookSummaryBadge(module: XposedModule) {
      *
      *  只有"跟随系统"的自动模式才需要重启：那时配色确实跟着系统变了；
      *  固定浅色/深色时系统怎么切都不影响配色。 */
+    /** 夜间模式回调注册的尝试次数（有上限，见函数内注释）。 */
+    private var nightCallbackAttempts = 0
+
     private fun registerSystemNightCallback() {
         val app = runCatching {
             Class.forName("android.app.ActivityThread")
@@ -6007,8 +6034,13 @@ private fun hookSummaryBadge(module: XposedModule) {
         }.getOrNull() ?: run {
             // 模块加载常常早于 Application 创建（这时 currentApplication() 是
             // null，注册会直接失败 —— 实测就是因此完全没注册上）。隔 500ms 重试。
-            android.os.Handler(android.os.Looper.getMainLooper())
-                .postDelayed({ registerSystemNightCallback() }, 500L)
+            // ⚠️ 必须有上限：TIM 的插件进程里 currentApplication() 可能**永远**是 null，
+            // 无上限重试就是一个永不退出的主线程定时器（每 500ms 还要 Class.forName +
+            // 反射）。这里最多 10 次（≈5 秒）后放弃，冷启动时再自然注册。
+            if (nightCallbackAttempts++ < 10) {
+                android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed({ registerSystemNightCallback() }, 500L)
+            }
             return
         }
         systemNightLast = runCatching {
@@ -6135,20 +6167,19 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  或直接在构造器里赋值）。这里不再关心它是怎么设进来的，只看最终状态。 */
     /** 该 View 是否 QUI 设置页的列表行（最多向上找 6 层）。 */
     private fun isQuiListRow(v: View): Boolean {
-        var cur: View? = v
-        var depth = 0
-        while (cur != null && depth < 6) {
-            val n = cur.javaClass.name
-            if (n.startsWith("com.tencent.mobileqq.setting.") ||
-                n.startsWith("com.tencent.mobileqq.widget.listitem.")
-            ) {
-                return true
-            }
-            cur = cur.parent as? View
-            depth++
-        }
-        return false
+        // ⚠️ 只认**自身**类名（以及直接父容器），**不要**向上多找几层：
+        // `QUISettingsRecyclerView`（群聊设置页的列表根）本身就在
+        // `com.tencent.mobileqq.widget.listitem` 包里，一旦"向上找 N 层"，
+        // 列表里**所有** View（含列表自身、行内 TextView、角标、卡片容器）
+        // 都会被判成"行" —— 排序后间距全乱、分组必错（群聊设置页圆角就是这么坏的）。
+        fun hit(n: String) = n.startsWith("com.tencent.mobileqq.setting.") ||
+            n.startsWith("com.tencent.mobileqq.widget.listitem.") ||
+            n.startsWith("com.tencent.qui.quilistitem.")
+        if (hit(v.javaClass.name)) return true
+        val p = v.parent as? View
+        return p != null && hit(p.javaClass.name)
     }
+
 
     /**
      * QUI 列表行的**面色统一**。
@@ -6223,121 +6254,21 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** QUI 行面色统一的日志额度（仅日志用）。 */
     private var quiRowLog = 0
 
-    /** 收集同一个列表里所有 QUI 行，按屏幕 y 排序。 */
-    private fun collectQuiRows(root: View?): List<View> {
-        if (root == null) return emptyList()
-        val out = ArrayList<View>()
-        val stack = java.util.ArrayDeque<View>()
-        stack.add(root)
-        var guard = 0
-        while (stack.isNotEmpty() && guard < 400) {
-            val v = stack.removeFirst(); guard++
-            if (isQuiListRow(v) && v.height > 0 && v.background != null) out.add(v)
-            if (v is ViewGroup) for (i in 0 until v.childCount) stack.addLast(v.getChildAt(i))
-        }
-        return out.sortedBy {
-            val l = IntArray(2); it.getLocationOnScreen(l); l[1]
-        }
-    }
 
-    /**
-     * QUI 列表行**圆角按组内位置纠正**。
-     *
-     * 症状：组内首/末行本应"上圆角 / 下圆角"（相接那侧直角），坏态却变成
-     * 四角全圆（AllRound = 单条目组的形状）。
-     * 成因：这两类行都带 `RedTouch`，走 **payload 局部重绑**，而 TIM 的 binder
-     * 在 payload 路径上不重设背景类型，RecyclerView 复用 View 时把上一处的圆角
-     * 带了过来（进设置子页再返回会自愈 —— 那时是全量重绑）。
-     * 修法：按几何判断同组邻居（组内行距 2–3px、组间 48px），半径沿用行上已有的值。
-     */
-    private fun fixQuiGroupRadii(anyRow: View) {
-        var list: View? = anyRow
-        var up = 0
-        while (list != null && up < 8) {
-            val n = list.javaClass.name
-            if (n.contains("RecyclerView") || n.contains("ListView") ||
-                n.contains("xlistview") || n.contains("XListView")
-            ) {
-                break
-            }
-            list = list.parent as? View
-            up++
-        }
-        val rows = collectQuiRows(list ?: anyRow)
-        if (rows.size < 2) return
-        var radius = 0f
-        for (r in rows) {
-            forEachRadiusTarget(r.background) { gd ->
-                gd.cornerRadii?.let { arr -> arr.forEach { if (it > radius) radius = it } }
-                if (gd.cornerRadius > radius) radius = gd.cornerRadius
-            }
-        }
-        if (radius <= 0f) return
-        val gapPx = 12
-        fun topOf(v: View): Int {
-            val l = IntArray(2); v.getLocationOnScreen(l); return l[1]
-        }
-        for ((i, r) in rows.withIndex()) {
-            val top = topOf(r)
-            val bottom = top + r.height
-            val prevBottom = if (i > 0) topOf(rows[i - 1]) + rows[i - 1].height else Int.MIN_VALUE
-            val nextTop = if (i < rows.size - 1) topOf(rows[i + 1]) else Int.MAX_VALUE
-            val joinedAbove = i > 0 && (top - prevBottom) in 0..gapPx
-            val joinedBelow = i < rows.size - 1 && (nextTop - bottom) in 0..gapPx
-            val radii = if (!joinedAbove && !joinedBelow) {
-                floatArrayOf(radius, radius, radius, radius, radius, radius, radius, radius)
-            } else if (!joinedAbove) {
-                floatArrayOf(radius, radius, radius, radius, 0f, 0f, 0f, 0f)
-            } else if (!joinedBelow) {
-                floatArrayOf(0f, 0f, 0f, 0f, radius, radius, radius, radius)
-            } else {
-                FloatArray(8)
-            }
-            forEachRadiusTarget(r.background) { gd ->
-                gd.mutate()
-                gd.cornerRadii = radii
-            }
-        }
-    }
 
-    /** 对背景里所有 GradientDrawable（含 selector 子项与 layer 内层）执行 [apply]。 */
-    private inline fun forEachRadiusTarget(bg: Drawable?, apply: (GradientDrawable) -> Unit) {
-        when (bg) {
-            is GradientDrawable -> apply(bg)
-            is LayerDrawable -> {
-                for (i in 0 until bg.numberOfLayers) {
-                    val l = bg.getDrawable(i) ?: continue
-                    if (l is GradientDrawable) apply(l)
-                }
-            }
-            is DrawableContainer -> {
-                val st = bg.constantState as?
-                    android.graphics.drawable.DrawableContainer.DrawableContainerState
-                st?.children?.forEach { k ->
-                    when (k) {
-                        is GradientDrawable -> apply(k)
-                        is LayerDrawable -> {
-                            for (i in 0 until k.numberOfLayers) {
-                                val l = k.getDrawable(i) ?: continue
-                                if (l is GradientDrawable) apply(l)
-                            }
-                        }
-                        else -> {}
-                    }
-                }
-            }
-            else -> {}
-        }
-    }
+    /** 【实验开关】临时关掉几何覆盖，用来观察 TIM 原生圆角。 */
 
-    private fun hookQuiGroupRadii() {
-        onViewAttached { v ->
-            runCatching {
-                if (!isQuiListRow(v)) return@runCatching
-                v.post { runCatching { fixQuiGroupRadii(v) } }
-            }
-        }
-    }
+
+
+
+    /** 【诊断】行圆角日志额度。 */
+
+
+    /** 上一次滚动触发的圆角重算时间（节流用）。 */
+
+    /** 已经挂过全局布局监听的列表根（每个根只挂一次）。 */
+
+
 
     /**
      * 深色下"近黑的 hint（占位）文字色" → `onSurfaceVariant`。
@@ -6604,6 +6535,17 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** 气泡内图标对齐的日志额度（仅日志用）。 */
     private var bubbleIconLog = 0
 
+    /** 【诊断·运行时开关】从 TIM 外部目录读被禁用的 hook 名（逗号分隔），免装机二分。 */
+
+
+
+    /** 【诊断】应用上下文（写外部文件用）。 */
+
+
+
+    /** 【诊断】当前 Activity（用于按需 dump 视图树）。 */
+
+
     private fun hookPopupBeak() {
         onViewAttached { v ->
             runCatching {
@@ -6791,12 +6733,16 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  它既不走 setBackground 的可识别路径，颜色采样也常拿不到，所以按
      *  "全宽 + 极扁 + 亮色且不在配色内"这个组合特征兜底压暗。 */
     private fun fixThinBrightLine(v: View) {
+        fixThinBrightLineDrawable(v, v.background ?: return)
+    }
+
+    /** 对**指定的**背景 drawable 做细亮线纠正（供"设置背景入口"在背景生效前调用）。 */
+    private fun fixThinBrightLineDrawable(v: View, d: Drawable) {
         // 高度放宽到 120px：那条线的 View 本身可能有一个"安全区"的高度，
         // 只是背景只在底部若干像素显色（实测 3px 亮、上方是卡片色）。
         if (!isFullWidth(v) || v.height !in 1..v.dpPx(40f)) return
         if (bgIsIcon(v)) return
         if (!MonetPalette.isDarkNow()) return
-        val d = v.background ?: return
         // 用 solidColorOf（超集）而不是 colorOfDrawable（最弱的一个：非
         // Color/Gradient 一律返回 0）—— 否则皮肤引擎包出来的背景素材
         // （SkinnableNinePatch/SkinnableBitmap 等）永远取不到色，
@@ -6874,6 +6820,46 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun bgIsIcon(v: View): Boolean =
         v is ImageButton || (v is ImageView && v.drawable == null)
 
+    /**
+     * 位图型背景是否"接近纯色"。
+     *
+     * 用于 [fixTinySolidBg]：那条规则是"深色下把遗留的**亮底**压成页面底色"，
+     * 而它靠 `solidColorOf` 取色、对位图是**采样**主色 —— 一张主色偏亮的
+     * 照片/插画也会被采出亮色，压暗后整张图就成一块纯色（真踩过）。
+     * 这里对位图做 4×4 粗采样：亮度跨度小 = 纯色/均匀底（皮肤九宫格等），
+     * 跨度大 = 图片/渐变，交回给上层跳过。
+     * 非位图（Color/Gradient/自定义矢量）一律返回 true，不改变原有行为。
+     */
+    private fun isUniformBitmapBg(d: Drawable): Boolean {
+        val bmp = when (d) {
+            is android.graphics.drawable.BitmapDrawable -> d.bitmap
+            else -> runCatching {
+                cachedField(d.javaClass, "mBitmap")?.also { it.isAccessible = true }
+                    ?.get(d) as? Bitmap
+            }.getOrNull()
+        } ?: return true
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return true
+        var minL = 255
+        var maxL = 0
+        var seen = 0
+        for (i in 0..3) {
+            for (j in 0..3) {
+                val x = (w - 1) * i / 3
+                val y = (h - 1) * j / 3
+                val c = runCatching { bmp.getPixel(x, y) }.getOrDefault(0)
+                if ((c ushr 24) < 8) continue
+                val l = BgResolver.luma(c and 0x00FFFFFF)
+                if (l < minL) minL = l
+                if (l > maxL) maxL = l
+                seen++
+            }
+        }
+        if (seen < 4) return true
+        return maxL - minL <= 12
+    }
+
     private fun fixTinySolidBg(v: View, d: Drawable) {
         if (!MonetPalette.isDarkNow()) return
         // 极光卡片（QUIPolarLightView）由 hookPolarLightCard 统一成**卡片色**，
@@ -6895,6 +6881,10 @@ private fun hookSummaryBadge(module: XposedModule) {
         // intrinsic 尺寸又常被替换成拉伸后的值，按类型/尺寸判断全都会漏
         // （前几版就是这样一条都没中）。
         // 按钮等用的是配色方案内的 primary/container 色，被 isSchemeColor 挡掉。
+        // ⚠️ 位图型背景先要求"接近纯色"：`solidColorOf` 会**采样位图**，
+        // 主色偏亮的**照片/插画**背景同样会被采样出一个亮色 —— 一旦被就地染成
+        // 页面底色，整张图就变成一块纯色。均匀的皮肤九宫格/纯色位图不受影响。
+        if (!isUniformBitmapBg(d)) return
         val c = solidColorOf(d) ?: return
         if (isSchemeColor(c)) return
         // 判据统一走 BgResolver（彩色排除 + 亮度档位）：以前这里各写一套阈值，
@@ -9948,6 +9938,19 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         }
     }
 
+    /**
+     * 名字里是否是"线"（分隔线/边框线）语义。
+     *
+     * ⚠️ 不能只写 `name.contains("line")` —— `outline` / `underline` / `baseline`
+     * 这些**完全不是线**的名字都会命中（`outline` 图标会被踢出图标判据、
+     * `outline` 文字色会被当成分割线映射成 outlineVariant）。这里显式排除。
+     */
+    private fun isLineName(name: String): Boolean {
+        val l = name.lowercase()
+        if (!l.contains("line")) return false
+        return !(l.contains("outline") || l.contains("underline") || l.contains("baseline"))
+    }
+
     /** 资源名 → 是否"单色暗图标"(0 未知/1 命中/2 不命中)。 */
     private var iconNameLog = 0
 
@@ -9965,7 +9968,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             l.contains("_pic") || l.startsWith("img") || l.contains("screenshot")
         ) return false
         if (l.contains("bg") || l.contains("background") || l.contains("shape") ||
-            l.contains("divider") || l.contains("line") || l.contains("mask") ||
+            l.contains("divider") || isLineName(l) || l.contains("mask") ||
             l.contains("shadow") || l.contains("corner") || l.contains("progress") ||
             l.contains("seek") || l.contains("border") || l.contains("stroke") ||
             l.contains("plate") || l.contains("button")
@@ -10512,7 +10515,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                     // 半透明纯黑 = 遮罩/蒙层：原样保留（同上）
                     if (ColorMath.alpha(color) != 0xFF) return color
                     if (name != null && (name.contains("divider") ||
-                            name.contains("separator") || name.contains("line") ||
+                            name.contains("separator") || isLineName(name) ||
                             name.contains("border"))
                     ) {
                         return TokenMapper.outlineVariant(dark)

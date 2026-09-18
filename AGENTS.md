@@ -240,15 +240,15 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
       所以"哪一档才对"有据可依：就是工厂的返回值，不要自己挑角色。
       但坏态下 `AccountManageView` / `SingleLineRedTouchView` 两类行会取到别的颜色。
       修法见 `hookQuiRowSurface()`：统一到 `bgCard`，**全透明的行原样放过**。
-    - **圆角**：组内首/末行本应"上圆角 / 下圆角"（相接那侧直角），坏态却变成
-      **四角全圆**（AllRound = 单条目组的形状）。成因是这两类行都带 `RedTouch`，
-      走 **payload 局部重绑**，而 TIM 的 binder 在 payload 路径上**不重设背景类型**，
-      RecyclerView 复用 View 时把上一处（单条目组）的圆角带了过来
-      （**进设置子页再返回会自愈**——那时是全量重绑，这一条正是判据）。
-      修法见 `hookQuiGroupRadii()`：按几何判断同组邻居（组内行距 2–3px、组间 48px），
-      首行只圆上方、末行只圆下方、中间直角，**半径沿用行上已有的值**。
-    ⚠️ 判据必须用**实测对照**：先量"正常态"的几何，再量"坏态"，两者一比就知道
-    目标形状是什么 —— 我在这一步凭想象编过一次"原版本来就更深一档"，是严重错误。
+    - **圆角**：曾经的判断是"组内首/末行变成四角全圆，成因是 payload 局部重绑时
+      TIM 不重设背景类型" —— **这个成因是错的，据此写的几何修正整套已经删除**
+      （见下面「坑 26」）。反编译实证：圆角根本不由几何决定，而是
+      `Group.java:215-222` 按数据算 `PositionType(Only/Top/Middle/Bottom/Other)`
+      → `b.java:85-113` 映射成 `QUIListItemBackgroundType`（AllRound/TopRound/
+      NoneRound/BottomRound/None）→ `QUIListItem.setBackgroundType()` 应用；
+      而 `QUIListItemAdapter` 的 payload 路径**是转发到完整绑定的**
+      （`QUIListItemAdapter.java:103-106`），类型每次绑定都会重设。
+      也就是说 **TIM 自己算的就是对的**，坏掉的另有其人（见坑 26）。
 21. **`palette()` 在真实调色板就绪前会返回"兜底方案"**：
     `MonetPalette.palette()` 里 `if (scheme != null) return scheme` 否则
     `fallbackScheme()` —— 用 `DEFAULT_SEED` 现搭的 TonalSpot 方案（**另一套颜色**）。
@@ -321,6 +321,30 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     遇到"改了 A 就坏 B"时先问一句：**这两个消费方读的是不是一个键、语义是否相同**。
     判据优先取**消费方自己的样式定义**（这里是页面 CSS），别只依据名字猜。
 
+26. **"判据过宽"会去打别的页面 —— 一个兜底把设置页所有行都改成了圆角卡片**。
+    `isPlusPanelHost()` 原本是"向上 8 层里有 `pluspanel`/`PlusPanel` 类名"，
+    后面还挂了一条兜底：**`sawViewPager && depth >= 3`**（途经 `QQViewPager` 就算）。
+    而 TIM 很多**普通页面**（设置页等）的层级里也有 `QQViewPager` → 页面里的
+    ImageView 被判成"面板项"，于是 `handleImage` 里那条分支把**祖先 3 层的背景
+    整个换成了自绘的 12dp 全圆角底板**（`buildPlusItemPlate`，12dp×1.5=18px）
+    → **设置页每一行都变成独立的全圆角卡片**。
+    这个 bug 的排查价值在于它的"伪装"：
+    - 调用点带 `panelSeen` 前置条件 → **只有先打开过"+"面板（如文件发送页）再进
+      设置页才复现**，直接进设置页完全正常 → 看起来像"页面间的状态污染"；
+    - TIM 侧的类型分配（用探针实测）**全是正确的**（AllRound/TopRound/NoneRound/
+      BottomRound 成套）→ 看起来像"TIM 自己的设计"；
+    - 只有含 ImageView 的行会被扫到 → 看起来像"部分行的问题"。
+    结论：**兜底判据必须和主判据一样"身份明确"**。能用类名/资源名精确判定时，
+    不要用"途经某个通用控件""尺寸像""颜色像"来兜底 —— 这类兜底迟早会在别的页面命中。
+    修法：删掉 `QQViewPager` 兜底（只认类名），并给 `fixPlusItemPlate()` 加
+    "不在 PlusPanel 里就 return" 的双保险。
+    **同一条也适用于"改形状"**：我们是**染色**模块，圆角由 TIM 的数据层决定，
+    不要用几何去覆盖它（曾经的 `hookQuiGroupRadii` 整套就是反例，已删除）。
+    ⚠️ 同类问题在仓库里**不止一处**：事后做过一次全量审计，见
+    `.audit/2026-09-18-loose-heuristics-and-delays.md`（列出 15 条，
+    标注了已修/待处理与各自的高危级别）。**新增 hook 前请先读它**，
+    尤其是"宽松判据 + 破坏性动作（替换背景 / SRC_IN 单色化 / alpha=0）"的组合。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`
@@ -338,6 +362,8 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
   改 TIM 侧行为前先在这里查实现（尤其混淆名与布局结构）。
   查"某个 drawable 认不认 setTint"这类问题**必须**看这里的实现：
   `com/tencent/theme/SkinnableBitmapDrawable.java` 只重写了 `setColorFilter`。
+- `.audit/2026-09-18-loose-heuristics-and-delays.md` —— **判据过宽 / 定时兜底**专项审计
+  （15 条，含已修与待处理）。新写身份判据、或要用"延时补一次"之前先看它。
 - `.audit/` —— 一次完整代码审查的清单（重复代码 / 可通用化 / 正确性 / 性能）。
   **大部分已落地**；做新审查前先读它，避免重复报同一个问题
   （例如 `hookChatsUtils` 无条件覆盖"错误红"是**有意设计**，别再报）。
