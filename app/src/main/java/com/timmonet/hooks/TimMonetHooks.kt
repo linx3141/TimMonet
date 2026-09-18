@@ -142,12 +142,9 @@ object TimMonetHooks {
 
     private var navIconTintLogCount = 0
 
-    private var profileBtnLogCount = 0
-
     private var switchColorLogCount = 0
 
     private var unreadBubbleLogCount = 0
-
 
     /** 转发页行绑定耗时统计（定位分享页卡顿）。 */
 
@@ -326,7 +323,11 @@ object TimMonetHooks {
         hookSummaryBadge(module)
         hookChatsSummaryHighlight(module, classLoader)
         hookProfileContentCard(module, classLoader)
-        hookProfileAddFriendButton(module, classLoader)
+        // 「加好友」等次级按钮的底色不再在这里特判：改由 QUI 按钮填充 token
+        // (`button_bg_secondary_*`) 在 TokenMapper 里给**不透明的面色**
+        // （见 Role.BUTTON_FILL 的 KDoc）。理由：TIM 会在 setType 之后用自己
+        // 的 token 重设背景（状态切换/数据绑定都会重设），按"文字 + 时机"染色
+        // 迟早被覆盖 —— 之前那套 `text == "加好友"` 的实现就是这么修好又坏掉的。
         hookSwitchColors(module, classLoader)
         hookUnreadBubble(module, classLoader)
         hookImageViewRedDot(module)
@@ -648,7 +649,6 @@ object TimMonetHooks {
             null
         }
     }
-
 
     /** 品牌横幅判定(蓝族+黑/白族、近乎零彩噪的纯矢量图)：
      *  用于 Resources 层对"短名+长宽≥1.3 大图"的通用识别(资源短名随构建漂移)。 */
@@ -1611,7 +1611,6 @@ private fun isInPanelItem(view: View?): Boolean {
     return false
 }
 
-
 /** drawable 实例 → 资源名(Resources 层加载时记录,供绘制期查名)。 */
 private val drawableNameMemo =
     java.util.Collections.synchronizedMap(java.util.WeakHashMap<Drawable, String>())
@@ -1626,7 +1625,6 @@ private val drawableNameMemo =
  * 详见 [ColorMath.instanceCache]。
  */
 private val drawableStateNameMemo: MutableMap<Any, String> = ColorMath.instanceCache()
-
 
 /** 群聊头衔徽标(群主/管理员,TroopMemberLevelView2):
  *  徽标是自绘的(背景 drawable + 等级图 + 数字图 + VIP 动态特效),
@@ -2040,9 +2038,6 @@ private fun hookPlusPanelPlate() {
     }
 }
 
-
-
-
 /** “+”扩展面板(照片/拍照/通话/文件/收藏/红包/收钱…)的入口图标:
  *  TIM 在 item bind 时按浅色主题把图标 tint 成黑色(实测"收藏/文件/收钱"
  *  先亮后黑),Resources 层染色会被它覆盖。这里在 bind / attach 之后
@@ -2184,7 +2179,6 @@ private fun hookQuickMenuTheme(cl: ClassLoader) {
                 }
     }
 }
-
 
 /** 徽标数字染色：数字 TextView 若处于 primary 底(自身背景、父容器背景或
  *  兄弟 ImageView 的 background/drawable 呈 primary 样)且为白字 → 染
@@ -3851,7 +3845,6 @@ private fun recolorSourceBinding(component: Any, color: Int, linkColor: Int, cl:
     }
 }
 
-
 /** 群摘要角标"精确文案"命中（有人@我/有新文件 带不带方括号 4 串 + 正则兜底）。 */
 /** 摘要徽标文字（N条消息 / N条新消息）。提升到顶层：原来每次 setText 都
  *  现场编译一次 Pattern（全项目唯一一处 Regex，恰在最热的文字路径上）。 */
@@ -4070,7 +4063,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             }
         }
 }
-
 
     // ------------------------------------------------------------------
     // 聊天列表摘要高亮前缀（“有人@我 / 群待办 / xx条新消息”等红/橙前缀字符）：
@@ -4338,146 +4330,6 @@ private fun hookSummaryBadge(module: XposedModule) {
                 }
         } catch (t: Throwable) {
             Log.w(TAG, "ProfileContentView not found", t)
-        }
-    }
-
-    /** “加好友”按钮：识别文字后把背景按按压态双色重染，文字换 onSurface。 */
-    private fun hookProfileAddFriendButton(module: XposedModule, cl: ClassLoader) {
-        try {
-            val quiButtonCls = Class.forName(
-                "com.tencent.biz.qui.quibutton.QUIButton",
-                false,
-                cl
-            )
-            findMethod(quiButtonCls, setOf("setType"), INT_TYPE)
-                ?.let { method ->
-                    logOnce("hook installed: QUIButton.setType (profile add friend bg)")
-                    runCatching { module.deoptimize(method) }
-                    module.hook(method).intercept { chain ->
-                        val result = chain.proceed()
-                        val view = try {
-                            chain.thisObject as? View
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "profile add friend button failed", t)
-                            null
-                        }
-                        if (view == null) return@intercept result
-                        val textView = view as? TextView
-                        val text = textView?.text?.toString()
-                        if (text != null && text.contains("加")) {
-                            if (profileBtnLogCount++ < 8) {
-                                Log.i(
-                                    TAG,
-                                    "profile add friend probe text='$text' ctx=" +
-                                        view.context.javaClass.name +
-                                        " inProfile=" + isProfileActivityView(view)
-                                )
-                            }
-                        }
-                        if (text == "加好友" && textView != null && isProfileActivityView(view)) {
-                            val scheme = MonetPalette.palette()
-                            textView.background?.let { bg ->
-                                recolorProfileAddFriendBg(
-                                    bg,
-                                    TokenMapper.bgCard(),
-                                    TokenMapper.bgList()
-                                )
-                            }
-                            textView.setTextColor(scheme.onSurface)
-                            logOnce("profile add friend button -> surfaceBright")
-                        }
-                        result
-                    }
-                }
-        } catch (t: Throwable) {
-            Log.w(TAG, "QUIButton not found", t)
-        }
-    }
-
-    /** 视图是否位于资料卡页面（context 链 Activity 类名 / profilecard 命名判定）。 */
-    private fun isProfileActivityView(view: View): Boolean {
-        var ctx: Context? = view.context
-        var depth = 0
-        while (ctx != null && depth < 8) {
-            if (ctx is Activity) {
-                val name = ctx.javaClass.name
-                if (name.contains("Profile", ignoreCase = true) ||
-                    name.contains("profilecard", ignoreCase = true)
-                ) {
-                    return true
-                }
-            }
-            ctx = (ctx as? android.content.ContextWrapper)?.baseContext
-            depth++
-        }
-        if (insideProfilePage(view)) return true
-        return insideProfileRootTree(view)
-    }
-
-    /** 沿父链到根后 BFS 子树找 profilecard 系容器（兜底判定资料卡页）。 */
-    private fun insideProfileRootTree(view: View): Boolean {
-        var root: View = view
-        var parent: View? = view.parent as? View
-        while (parent != null) {
-            root = parent
-            parent = parent.parent as? View
-        }
-        val stack = java.util.ArrayDeque<View>()
-        stack.add(root)
-        var count = 0
-        while (stack.isNotEmpty() && count < 600) {
-            val current = stack.removeFirst()
-            count++
-            if (current.javaClass.name.contains("profilecard")) return true
-            if (current is ViewGroup) {
-                for (i in 0 until current.childCount) {
-                    stack.addLast(current.getChildAt(i))
-                }
-            }
-        }
-        return false
-    }
-
-    /** 沿父链（最多 20 层）找 profilecard 系容器。 */
-    private fun insideProfilePage(view: View): Boolean {
-        var parent: View? = view.parent as? View
-        var depth = 0
-        while (parent != null && depth < 20) {
-            if (parent.javaClass.name.contains("profilecard")) return true
-            parent = parent.parent as? View
-            depth++
-        }
-        return false
-    }
-
-    /** 加好友按钮背景：容器子项按“后两个 normal、其余 pressed”分发，纯色直接替换。 */
-    private fun recolorProfileAddFriendBg(drawable: Drawable?, normal: Int, pressed: Int) {
-        if (drawable == null) return
-        drawable.mutate()
-        when (drawable) {
-            is GradientDrawable -> {
-                recolorButtonState(drawable, normal)
-                return
-            }
-            is ColorDrawable -> {
-                drawable.setColor(normal)
-                drawable.invalidateSelf()
-                return
-            }
-            is DrawableContainer -> {
-                // 遍历交给公共骨架；**选色策略保留在这里**（按索引：倒数第二个起用
-                // normal，其余用 pressed）—— 这是本函数特有的语义，不能"统一掉"。
-                val n = runCatching {
-                    (drawable.constantState as? DrawableContainer.DrawableContainerState)
-                        ?.childCount ?: 0
-                }.getOrDefault(0)
-                var idx = 0
-                forEachContainerChild(drawable, recurse = false) { child ->
-                    recolorButtonState(child, if (idx < n - 2) pressed else normal)
-                    idx++
-                }
-                drawable.invalidateSelf()
-            }
         }
     }
 
@@ -5181,8 +5033,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         return false
     }
 
-
-
     /** 红包类图标（名字里带 hongbao/redpacket 的红包图形）→ 保持 TIM 原版配色。 */
     private fun isHongbaoIconDrawable(drawable: Drawable): Boolean {
         val name = drawableNameMemo[drawable] ?: runCatching {
@@ -5693,7 +5543,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         }
     }
 
-
     private fun sampleBitmapColorOfDrawable(drawable: Drawable): Int? {
         if (drawable is android.graphics.drawable.BitmapDrawable) {
             return sampleBitmapColor(drawable.bitmap)
@@ -5962,7 +5811,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             }
     }
 
-
     private fun fixLowContrastText(tv: TextView) {
         // ⚠️ 必须用**实际生效**的配色判断明暗：MonetPalette.palette() 内部走
         // effectiveDark()，而 MonetPalette.isDarkNow() 在"只设了模块内配色、没跟随
@@ -6117,18 +5965,11 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     private var redFilterDiag = 0
 
-
     private var tabIndicatorLog = 0
 
     private var forceLightDiag = 0
 
     private var forceLightCfgLog = 0
-
-
-
-
-
-
 
     /** 被我们重建过的顶栏分段 tab 背景（用于识别这类 RadioButton 并改文字色）。 */
     private val headerTabDrawables: MutableSet<Drawable> =
@@ -6206,7 +6047,6 @@ private fun hookSummaryBadge(module: XposedModule) {
         return p != null && hit(p.javaClass.name)
     }
 
-
     /**
      * QUI 列表行的**面色统一**。
      *
@@ -6280,21 +6120,13 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** QUI 行面色统一的日志额度（仅日志用）。 */
     private var quiRowLog = 0
 
-
-
     /** 【实验开关】临时关掉几何覆盖，用来观察 TIM 原生圆角。 */
 
-
-
-
     /** 【诊断】行圆角日志额度。 */
-
 
     /** 上一次滚动触发的圆角重算时间（节流用）。 */
 
     /** 已经挂过全局布局监听的列表根（每个根只挂一次）。 */
-
-
 
     /**
      * 深色下"近黑的 hint（占位）文字色" → `onSurfaceVariant`。
@@ -6352,7 +6184,6 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 占位文字提亮的日志额度（仅日志用）。 */
     private var nearBlackHintLog = 0
-
 
     /**
      * 弹层尖角（popup beak）—— 必须与弹层**面板同色**。
@@ -6563,14 +6394,9 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 【诊断·运行时开关】从 TIM 外部目录读被禁用的 hook 名（逗号分隔），免装机二分。 */
 
-
-
     /** 【诊断】应用上下文（写外部文件用）。 */
 
-
-
     /** 【诊断】当前 Activity（用于按需 dump 视图树）。 */
-
 
     private fun hookPopupBeak() {
         onViewAttached { v ->
@@ -6604,7 +6430,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             }
         }
     }
-
 
     /** QUI 通知条（com.tencent.biz.qui.noticebar）的背景。
      *
@@ -6814,7 +6639,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             }
         }
     }
-
 
     /** 背景设置的统一拦截。
      *
@@ -7364,7 +7188,6 @@ private fun hookSummaryBadge(module: XposedModule) {
      */
     private val drawableTintMemo: MutableMap<Any, Long> = ColorMath.instanceCache()
 
-
     /** 文字改色直写字段（绕过 setTextColor 的 hook 链与框架开销），失败退回 API。 */
     private fun setTextColorFast(tv: TextView, color: Int) {
         try {
@@ -7853,7 +7676,6 @@ private fun hookPayPwdGridSetColor(module: XposedModule) {
 
 /** 密码格底色的硬编码值：`PasswordEditText.init()` 里的 `-1184275`。 */
 private const val PAY_PWD_GRID_COLOR = 0xFFEDEDED.toInt()
-
 
 /**
  * 通话界面（语音/视频）由 `com.tencent.av.utils.av` 着色的图标 —— 纠正**图标**的着色源。
@@ -9321,7 +9143,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
 
     private var fileIconLogCount = 0
 
-
     // ------------------------------------------------------------------
     // 深色模式下纯黑/纯白文字归一为 onSurface：
     // 修复转发搜索里用户名/群名纯黑、自己发的聊天记录纯白的问题。
@@ -9670,7 +9491,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
 
     private var brandLogoLogCount = 0
 
-
     /** 栅格判定：透明底上 ≥85% 的不透明像素落在暖橙区间。结果按实例记忆化。 */
     private fun isWarmMonoGlyph(drawable: Drawable): Boolean {
         warmGlyphMemo[drawable]?.let { return it }
@@ -9992,7 +9812,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             java.util.Collections.newSetFromMap(java.util.WeakHashMap<Drawable, Boolean>())
         )
 
-
     private var uniformIconLog = 0
 
     /** 面板图标统一重染:把所有非透明像素画成 onSurface(保留 alpha),
@@ -10142,7 +9961,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
 
     /** 资源名 → 是否"单色暗图标"(0 未知/1 命中/2 不命中)。 */
     private var iconNameLog = 0
-
 
     /** 名字是否"图标类"(排除图片/头像/表情类与背景/形状/装饰类)。
      *  图标资源命名不统一:qui_tui_icon_image_primary 这类含 icon,
@@ -10618,6 +10436,9 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
 
     private var whiteSrcLogCount = 0
 
+    /** 临时探针：次级按钮填充 token 的映射结果（验证后删）。 */
+    private var btnFillProbe = 0
+
     /** 诊断：钱包页那片纯白背景到底是谁设的（限次）。 */
     private fun logWhiteSource(source: String, color: Int) {
         if (color == 0 || whiteSrcLogCount >= 40) return
@@ -10841,7 +10662,17 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         // 变化时自动失效。
                         tokenColorMemoized(resId) {
                             val name = entryName(ctx?.resources, resId)
-                            TokenMapper.mapColor(name, original)
+                            val mapped = TokenMapper.mapColor(name, original)
+                            if (name != null && name.contains("button_bg_secondary") &&
+                                btnFillProbe++ < 10
+                            ) {
+                                Log.i(
+                                    TAG,
+                                    "btn fill token $name #" + Integer.toHexString(original) +
+                                        " -> #" + Integer.toHexString(mapped)
+                                )
+                            }
+                            mapped
                         }
                     } catch (t: Throwable) {
                         Log.e(TAG, "map getQuiColor failed", t)

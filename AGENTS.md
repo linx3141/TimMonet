@@ -426,6 +426,37 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
       `qui_tui_common_text_allwhite_primary` 这类**文字**色也会被它按面色映射；
       真要判"这是底还是字"必须回到消费方（View/attr 名），颜色值分不出来（坑 22 同族）。
 
+30. **QUI 次级按钮：TIM 的"透明填充"必须翻译成一块不透明的面，且描边要跟着面走**。
+    症状：资料卡「加好友」按钮与页面**同色**（用户："应该是 surface 而不是背景色"）。
+    - 反编译实证（`com/tencent/biz/qui/quibutton/b.java` + `color/*.xml`）：
+      `QUIButton` 的背景由 `b.a(ctx, type, size, themeId)` **按 type 现场生成**
+      GradientDrawable，颜色全部来自 QUI token：
+      | type | fill token | border token |
+      |---|---|---|
+      | 0 PRIMARY | `qui_tui_button_bg_primary_default` | 同一个 token（fill=border）|
+      | 1 SECONDARY | `qui_button_bg_secondary_default` = **`#00FFFFFF`（全透明）** | `qui_button_border_secondary_default` = `#CCCCCC` |
+      | 2 GHOST | `qui_button_bg_ghost_default`（透明） | ghost 描边 |
+    即 TIM 浅色下"加好友"是**透明底 + 灰描边**；我们的深色页面里描边被按浅灰
+    映射成页面色 → 整颗按钮消失。
+    - 修法（**在 token 层**，`TokenMapper.computeRole` + `Role.BUTTON_FILL`）：
+      `button_bg_secondary*` → `BUTTON_FILL`（= `surfaceBright`，并在 `resolve` 里
+      **强制 alpha=FF**，照搬 `#00FFFFFF` 的 alpha 等于没染）；`_pressed` 另给
+      `BUTTON_FILL_PRESSED`（`surfaceContainerHigh`）以保留按压反馈；
+      **描边 `button_border_secondary*` 必须映射成和 fill 同一个角色**
+      （同色 = 看不见线）—— 给它 `OUTLINE_VARIANT` 会在实心面上多出一圈线
+      （实测用户报"多了一个线框，不要这样"）；TIM 自己对 PRIMARY 就是 fill=border。
+      ghost（纯文字按钮）保持 `KEEP`，别一起改成实心块。
+    - **为什么不在 View 层修**（上一版就是这么坏的）：旧实现
+      `hookProfileAddFriendButton` 拦 `QUIButton.setType`、按 `text == "加好友"`
+      认按钮，再把背景**平染**成 `bgCard()`。TIM 会在 setType **之后**用 token
+      重设背景（状态切换/数据绑定都会），于是"修好过又坏掉"；它还按索引猜
+      selector 里的 pressed/normal 子项，且平染会**抹掉描边与状态**。
+      该实现已连同 `isProfileActivityView`/`insideProfilePage`/`insideProfileRootTree`
+      三个判定一起删除 —— **判据挂在"按钮自己的 token"上，与文字、时机、页面都无关**。
+    - 一般规律：TIM 里"透明 = 没有填充"的 token，到了深色莫奈面上要主动补一块面；
+      而补面时**别忘描边**（要么同色、要么显式给 outline 角色），否则会多出一圈线
+      或者留下一条亮边。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`

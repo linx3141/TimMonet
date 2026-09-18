@@ -41,6 +41,8 @@ object TokenMapper {
         BG_LIST,     // 列表灰底
         BG_AIO,      // 聊天页底
         INPUT_BG,    // 输入框/搜索框（比页面浅一档）
+        BUTTON_FILL, // 次级按钮底（TIM 原值是全透明，必须给成不透明的面）
+        BUTTON_FILL_PRESSED, // 次级按钮按下态（原值是 30% 灰，给另一档面以保留按压反馈）
         SURFACE_CONTAINER_LOW,
         SURFACE_CONTAINER,
         SURFACE_CONTAINER_HIGH,
@@ -391,6 +393,8 @@ object TokenMapper {
             // 深色下用 surfaceContainerHigh，避免在深色页面里显得过亮
             Role.INPUT_BG ->
                 if (scheme.isDark) scheme.surfaceContainerHigh else scheme.surfaceBright
+            Role.BUTTON_FILL -> scheme.surfaceBright
+            Role.BUTTON_FILL_PRESSED -> scheme.surfaceContainerHigh
             Role.SURFACE_CONTAINER_LOW -> scheme.surfaceContainerLow
             Role.SURFACE_CONTAINER -> scheme.surfaceContainer
             Role.SURFACE_CONTAINER_HIGH -> scheme.surfaceContainerHigh
@@ -407,6 +411,11 @@ object TokenMapper {
         // "深色叠深色"= **完全看不见**（转发弹窗输入框实测与弹窗底 `#501730`
         // 分不出来，用户报"输入框变成背景色"）。输入框没有"半透明"这种语义。
         if (role == Role.INPUT_BG) return ColorMath.opaque(c)
+        // 次级按钮底：TIM 给的是 `#00FFFFFF`（全透明 = "没有填充"），照搬 alpha
+        // 就等于没染（按钮与页面同色）。按钮底没有"半透明"这种语义 → 强制不透明。
+        if (role == Role.BUTTON_FILL || role == Role.BUTTON_FILL_PRESSED) {
+            return ColorMath.opaque(c)
+        }
         val outAlpha = if (role in TEXT_ROLES) 0xFF else alpha
         return ColorMath.withAlpha(c, outAlpha)
     }
@@ -527,9 +536,33 @@ object TokenMapper {
         if (n.contains("button_text_primary_outline")) return Role.PRIMARY
         if (n.contains("button_text_primary")) return Role.ON_PRIMARY
         if (n.contains("button_text_secondary")) return Role.ON_SURFACE
-        if (n.contains("button_bg_secondary") ||
-            n.contains("button_bg_ghost") ||
-            n.contains("button_text_ghost")
+        // 次级按钮（QUIButton type=SECONDARY）的**底色**。
+        //
+        // ⚠️ TIM 浅色下这个 token 是 `#00FFFFFF`（**全透明**），形状只靠
+        // `#CCCCCC` 描边（`qui_button_border_secondary_default`）定义 ——
+        // 原版浅色页面上它是"白底上的灰描边按钮"。
+        // 我们的深色页面里"透明底 + 描边"读不出来：描边色 #CCCCCC 会按浅灰
+        // 映射成页面底色，于是整颗按钮**与背景同色、完全消失**
+        // （资料卡「加好友」实测，用户报"应该是 surface 而不是背景色"）。
+        // 所以这里给它一块**不透明的面色**（`Role.BUTTON_FILL` 在 resolve 里
+        // 强制 alpha=FF，见那里的注释）。
+        // 语义上这不是"改 TIM 的设计"，而是把"透明=没有填充"翻译成我们的
+        // 面上等价物；浅色档同样成立（白底页面上给 surfaceBright 也看得见）。
+        // 按下态另给一档面：TIM 原值 `#4DCCCCCC`（30% 灰）在深色面上不可见，
+        // 若与默认态同色就**完全没有按压反馈**了。
+        if (n.contains("button_bg_secondary_pressed")) return Role.BUTTON_FILL_PRESSED
+        if (n.contains("button_bg_secondary")) return Role.BUTTON_FILL
+        // 描边**必须跟着面走**（同色 = 看不见线）。
+        // ⚠️ 别给 `OUTLINE_VARIANT`：那会在实心面上多出一圈线，与"一块面"的
+        // 设计冲突（实测：用户报"多了一个线框，不要这样"）。TIM 自己对 primary
+        // 按钮就是这么做的 —— `quibutton/b.java` 里 primary 的 fill 与 border
+        // 传的是**同一个 token**。
+        if (n.contains("button_border_secondary_pressed")) return Role.BUTTON_FILL_PRESSED
+        if (n.contains("button_border_secondary")) return Role.BUTTON_FILL
+        // ghost（纯文字按钮）本来就是"无底无框"，保持原样，别一起改成实心块。
+        if (n.contains("button_bg_ghost") ||
+            n.contains("button_text_ghost") ||
+            n.contains("button_border_ghost")
         ) return Role.KEEP
 
         // 文字
