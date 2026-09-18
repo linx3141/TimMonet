@@ -19,7 +19,7 @@
 
 ## 一、判据过宽
 
-### 1. `fixNoticeBar` —— 几何 + 通用九宫格当"微云提示条"身份 ⚠️ 待处理（高危）
+### 1. `fixNoticeBar` —— 几何 + 通用九宫格当"微云提示条"身份 ✅ 已修（高危）
 - 位置：`TimMonetHooks.kt:6860`（判据 6862-6869；调用点 1935、6913）
 - 现状：`背景类名含 SkinnableNinePatch` + `全宽` + `高度 32–48dp` + `y 在屏高 4%–20%`
 - 危险：这只是"某种皮肤底"，不是"微云提示条"。搜索栏/顶栏/各种全宽提示条都在这
@@ -38,7 +38,7 @@
   触发面很大：`probeWhiteNumberText` 挂在 `TextView.setText`，任何 1–4 位纯数字都进来。
 - 修法：删掉该兜底，只保留"颜色≈primary"；判不出来返回 false（宁可漏染）。
 
-### 3. `fixThinBrightLineDrawable` —— 全宽 + 高度 ≤40dp + 亮色 即压成页面底色 ⚠️ 待处理
+### 3. `fixThinBrightLineDrawable` —— 全宽 + 高度 ≤40dp + 亮色 即压成页面底色 🟡 部分修
 - 位置：`TimMonetHooks.kt:6722`（入口：attach 与 `onSetBackgroundArg`）
 - 危险：原始实证只是"设置页底部一条 3px 亮线"，代码把高度放宽到 40dp 且没有位置
   条件 → 搜索栏/输入栏/全宽浅色条/浅色分隔条都会被刷成页面底色、边界消失。
@@ -53,7 +53,7 @@
 - 已做：排除 `ch.isClickable || ch.isSelected`（有交互语义的线不碰）。
 - 待做：改按资源名在 `setBackground`/`setBackgroundColor` 入口判定。
 
-### 5. `isJumpArrowDrawable` 的尺寸兜底 + `alpha = 0` 隐藏 ⚠️ 待处理（高危）
+### 5. `isJumpArrowDrawable` 的尺寸兜底 + `alpha = 0` 隐藏 ✅ 已修（高危）
 - 位置：`TimMonetHooks.kt:3540`（几何兜底 3555-3564；隐藏 3428；调用 5180）
 - 危险：名字查不到时用"≤24dp 的方形图"当引用跳转箭头 → 引用块里**所有**小图被判成
   箭头并栅格化重染（彩色图形变单色）；推不出颜色时 `view.alpha = 0f` 直接把图标藏起来。
@@ -61,7 +61,7 @@
   `alpha=0` 兜底一并去掉，判不出来就原样放过。
 - 注意：改这里前先用探针确认命中面（该功能是坑 11 硬啃出来的，别盲改）。
 
-### 6. `isPopupBeakView` —— 宽扁 + 高 ≤24 **px** + 根类名含 "Popup" ⚠️ 待处理
+### 6. `isPopupBeakView` —— 宽扁 + 高 ≤24 **px** + 根类名含 "Popup" 🟡 暂不改（已评估）
 - 位置：`TimMonetHooks.kt:6322`（调用 6531）
 - 危险：`rootView` 含 "Popup" 只说明"这是弹窗"；叠加"宽≥1.6×高、高≤24px"
   （**px 非 dp**，阈值随密度漂移）会命中弹窗里所有横向小图；命中后改成 `bgPage`
@@ -75,7 +75,7 @@
   压在**浅色图片**上的灰字被提亮成白字，反而看不见。
 - 修法：只在实际读到深色背景时才提亮（`bgLuma in 0..DARK_TEXT`）。
 
-### 8. `isIconLikeName` 兜底：`startsWith("qui_")` / `contains("_ic")` ⚠️ 待处理
+### 8. `isIconLikeName` 兜底：`startsWith("qui_")` / `contains("_ic")` ✅ 已修
 - 位置：`TimMonetHooks.kt:9900`（返回 9925-9927）
 - 危险：`qui_` 是 TIM 通用前缀（背景/装饰/插画都会用），`_ic` 会命中 `topic`/`magic`
   之类词 —— 彩色图形被整体 SRC_IN 成一块纯色。
@@ -89,7 +89,7 @@
 - 修法：新增 `isUniformBitmapBg()`：位图背景先做 4×4 采样，亮度跨度 >12 视为
   图片/渐变直接跳过；非位图不受影响（保留原来"不按类型/尺寸筛"的目标）。
 
-### 10. `insideProfileRootTree` 从窗口根 BFS 找 `profilecard` ⚠️ 待处理（低危）
+### 10. `insideProfileRootTree` 从窗口根 BFS 找 `profilecard` 🟡 暂不改（低危，已记录）
 - 位置：`TimMonetHooks.kt:4382`（返回 4395）
 - 危险：判据从"这个 View 在资料卡页"变成"本窗口任何位置有 profilecard 容器"，
   弹层/半屏卡都会让整窗被判成资料卡页；当前调用点影响有限，但易被后续改动放大。
@@ -97,9 +97,24 @@
 
 ---
 
+## 本轮修法摘要（2026-09-18 收尾）
+
+| # | 修法 |
+|---|---|
+| 1 | `fixNoticeBar` 判据换成**身份**：`isNoticeBarClass()`（类名含 `qui.noticebar`，即反编译里的 `VQUINoticeBarLayout`），几何条件全删；图标改为**只提单色图形**（`isMonochromeIcon()`，复用栅格化路径的"彩色像素 >40% 即跳过"，按实例弱引用缓存） |
+| 3 | 增加两条本质排除：`isClickable/isSelected` 与**带子 View 的容器**都不是"一条线"（实测那条线是 3px 叶子 View）；40dp 的放宽保留（原实证需要） |
+| 4 | 每帧细线扫描排除 `isClickable/isSelected`（选中下划线、进度条不碰） |
+| 5 | 几何兜底加 `insideReplyBlock(view)`（向上 6 层找类名含 Reply 的容器）—— 引用块之外的小图不再被判成跳转箭头 |
+| 8 | `tintIconOnSurface` 加单色门槛：**显式含 "icon" 命名的照旧**，宽匹配（`qui_`/`_ic`）必须通过单色判定 |
+| 9 | 新增 `isUniformBitmapBg()`：位图背景先 4×4 采样，亮度跨度 >12 视为图片/渐变，直接跳过 |
+| 11 | 改**对象身份**：hook `PasswordEditText.init` 与 `SixPasswdDialogEditText.init`，在执行完之后直接写它自己的 `mPaintBackground`/`mPaintForeground`；`Paint.setColor` 里的圆点分支与 120ms 时间窗**整条删除**（格子底那条按精确色值的兜底保留） |
+| 14 | 推不出颜色时不再 `alpha = 0f`（改为原样放过并记日志）—— 宁可短暂原色，也不要不可见 |
+
+---
+
 ## 二、定时兜底（"过了 xx 毫秒再补一次"）
 
-### 11. 支付密码：用 120ms 时间窗当"这个 #333333 是密码圆点"的身份 ⚠️ 待处理（高危）
+### 11. 支付密码：用 120ms 时间窗当"这个 #333333 是密码圆点"的身份 ✅ 已修（高危）
 - 位置：`TimMonetHooks.kt:7578`（时间戳 7570，常量 7606）
 - 危险：`#333333` 是 TIM 通用深灰；而格子底**每帧重画都会刷新时间戳**，只要弹窗在屏上
   这个窗就一直开着 → 该进程里任何 `Paint.setColor(#FF333333)`（金额/标题/自绘图形）
@@ -115,14 +130,14 @@
   （每次还要 `Class.forName` + 反射）。
 - 修法：最多 10 次（≈5 秒）后放弃。
 
-### 13. `hookPolarLightLate` 的 `postDelayed(150)` ⚠️ 待处理
+### 13. `hookPolarLightLate` 的 `postDelayed(150)` ⚠️ 待处理（需实测后再改）
 - 位置：`TimMonetHooks.kt:6752`（延时 6757-6764）
 - 危险：靠 150ms 后再设一次 colorFilter 去压过通用路径 —— 正是坑 19 禁止的猜时间：
   TIM 若在 150ms 之后重设/换新 drawable 仍被覆盖（"颜色闪一下又回去"）。
 - 建议：改成事件入口（`setImageDrawable`/`onSetBackgroundArg` 后立即纠正；
   或 dispatchDraw 里带缓存判断的每帧纠正），删掉 150ms。
 
-### 14. `handleReplyJumpIcon` 推不出颜色就 `alpha=0` + 200ms 恢复 ⚠️ 待处理
+### 14. `handleReplyJumpIcon` 推不出颜色就 `alpha=0` + 200ms 恢复 ✅ 已修
 - 位置：`TimMonetHooks.kt:3420`（隐藏 3428、恢复 3429-3431）
 - 危险：用"先隐藏 200ms"掩盖"暂时不知道颜色"＝猜时间；若该 View 因误判（第 5 条）
   被反复 setImage，会不断重新计时 → "图标时有时无"；用 alpha 当开关还会盖掉 TIM
@@ -148,11 +163,20 @@
 
 ---
 
-## 高危 Top 5（按"误伤面 × 动作破坏性"排序）
+## 高危 Top 5 处理状态
 
-1. **#1 `fixNoticeBar`**：几何 + 通用九宫格当身份，命中即刷背景 + 单色化整子树图标，
-   且每帧/每次 attach 都跑 —— 与 `isPlusPanelHost` 事故同形态。
-2. **#5 `isJumpArrowDrawable` 尺寸兜底 + `alpha=0`**：≤24dp 图片即当箭头，推不出色就隐藏。
-3. **#11 支付密码 120ms 时间窗**：格子底每帧刷新使窗常开，同进程任意 `#333333` 被改色。
-4. **#3 `fixThinBrightLineDrawable`**：全宽 + ≤40dp + 亮色即压成页面底色，每次 setBackground 都跑。
-5. **#2 `dIsPrimary`**（**本轮已修**，列此以说明其危害级别）。
+1. **#1 `fixNoticeBar`** —— ✅ 已修（身份判据 + 单色门槛）
+2. **#5 `isJumpArrowDrawable` 尺寸兜底 + `alpha=0`** —— ✅ 已修
+3. **#11 支付密码 120ms 时间窗** —— ✅ 已修（改对象身份）
+4. **#3 `fixThinBrightLineDrawable`** —— 🟡 已加两条排除（交互语义 / 带子 View），
+   仍需在搜索栏、输入栏页面上回归确认
+5. **#2 `dIsPrimary`** —— ✅ 已修
+
+### 仍未处理（已评估，需要实测或收益有限）
+
+- **#6 `isPopupBeakView`**：当前判据在 1.5 密度设备上实测正常（用户已验证弹层尖角修复），
+  改阈值单位会同时改变命中面，**盲改风险大于收益**；要改就先在 2.0/3.0 密度上实测。
+- **#10 `insideProfileRootTree`**：全窗 BFS 兜底，当前调用点影响有限（低危）。
+- **#13 `hookPolarLightLate` 的 150ms**：要改成事件驱动，得先在该页面实测出
+  "到底是哪条通用路径在之后覆盖它"（`fixTinySolidBg` 已排除 PolarLight），否则会回归。
+- **#15 `SettingsBridge` 的 300ms**：可接受（配置已写远端，最坏只是杀早/杀晚）。

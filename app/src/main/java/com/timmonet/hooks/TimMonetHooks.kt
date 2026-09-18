@@ -311,6 +311,7 @@ object TimMonetHooks {
         hookAioEditText(module, classLoader)
         hookAvTintDrawable(module, classLoader)
         hookPayPwdGridSetColor(module)
+        hookPayPwdPaints(module, classLoader)
         hookAioBubbleText(module, classLoader)
         hookAioBubbleBg(module, classLoader)
         hookResconfig(module, classLoader)
@@ -3434,18 +3435,19 @@ private fun handleReplyJumpIcon(view: ImageView, drawable: Drawable): Boolean {
     val stash = known?.second
     val color = stash ?: inferReplyColor(known?.first ?: block)
     if (color == null) {
-        view.alpha = 0f
-        view.postDelayed({
-            runCatching { if (view.alpha == 0f) view.alpha = 1f }
-        }, 200L)
+        // ⚠️ 以前这里 `view.alpha = 0f` + 200ms 后恢复 —— 用"先藏起来"掩盖
+        // "暂时不知道颜色"，是猜时间，而且一旦颜色始终算不出来（或该 View 被反复
+        // 重新 setImage 导致不断重新计时）图标就**一直不亮**；用 alpha 当开关还会
+        // 盖掉 TIM 自己对 alpha 的使用（动画/禁用态）。
+        // 现在判不出来就原样放过：宁可短暂是原色，也不要不可见。
         if (replyIconSetLogCount++ < 40) {
             Log.i(
                 TAG,
-                "reply icon set hidden(no color) block=" + block.javaClass.simpleName +
+                "reply icon kept(no color) block=" + block.javaClass.simpleName +
                     " w=" + view.width + " h=" + view.height
             )
         }
-        return true
+        return false
     }
     val replaced = rasterizeIconColor(drawable, color)
     if (replaced != null) {
@@ -3546,6 +3548,18 @@ private fun setJumpArrowColor(d: Drawable, color: Int) {
  *  所以：名字拿得到就按名字（含 arrow 命中、图片类排除），拿不到就按尺寸 ——
  *  引用区里 16dp 级别的小图标就是跳转箭头，引用缩略图要大得多。
  */
+/** host 是否在引用块里（向上 6 层找类名含 Reply 的容器）。 */
+private fun insideReplyBlock(view: View): Boolean {
+    var c: View? = view
+    var depth = 0
+    while (c != null && depth < 6) {
+        if (c.javaClass.name.contains("Reply", ignoreCase = true)) return true
+        c = c.parent as? View
+        depth++
+    }
+    return false
+}
+
 private fun isJumpArrowDrawable(d: Drawable, host: View?): Boolean {
     if (replyTintedDrawables.containsKey(d)) return false // 已是我们生成的位图
     val name = drawableNameMemo[d] ?: runCatching {
@@ -3566,6 +3580,11 @@ private fun isJumpArrowDrawable(d: Drawable, host: View?): Boolean {
     if (hostName.contains("Async") || hostName.contains("Bubble") || hostName.contains("Round")) {
         return false
     }
+    // ⚠️ 几何兜底**必须确实在引用块里**：这里以前只看"尺寸 ≤24dp 的方图"，
+    // 于是引用块之外任何小图（列表箭头、星级、占位图…）都可能被判成跳转箭头，
+    // 被栅格化重染（彩色图形拉成单色）；而 `handleReplyJumpIcon` 在推不出颜色时
+    // 还会把它 alpha=0 藏起来 —— 误判的代价是"图标直接不见"。
+    if (!insideReplyBlock(view)) return false
     val density = view.resources.displayMetrics.density
     val maxPx = (24f * density).toInt()
     val w = if (d.intrinsicWidth > 0) d.intrinsicWidth else view.width
@@ -6738,9 +6757,14 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 对**指定的**背景 drawable 做细亮线纠正（供"设置背景入口"在背景生效前调用）。 */
     private fun fixThinBrightLineDrawable(v: View, d: Drawable) {
-        // 高度放宽到 120px：那条线的 View 本身可能有一个"安全区"的高度，
+        // 高度放宽到 40dp：那条线的 View 本身可能有一个"安全区"的高度，
         // 只是背景只在底部若干像素显色（实测 3px 亮、上方是卡片色）。
+        // ⚠️ 但"全宽 + 矮 + 亮"这个签名也覆盖搜索栏/输入栏/浅色全宽条，
+        // 所以补两条本质排除（审计 #3）：有交互语义的、或**带子 View**的容器
+        // 都不是"一条线"（实测那条线是 3px 的叶子 View）。
         if (!isFullWidth(v) || v.height !in 1..v.dpPx(40f)) return
+        if (v.isClickable || v.isSelected) return
+        if ((v as? android.view.ViewGroup)?.childCount ?: 0 > 0) return
         if (bgIsIcon(v)) return
         if (!MonetPalette.isDarkNow()) return
         // 用 solidColorOf（超集）而不是 colorOfDrawable（最弱的一个：非
@@ -6919,16 +6943,46 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  它的背景是皮肤引擎包的 SkinnableNinePatchDrawable，isNight 与取色两个
      *  判据实测都不可靠（一个 false 一个 #0），所以只能靠几何定位。
      *  里面的"云"图标是 ImageView 的彩色位图，也走不到常规图标染色路径。 */
+    /** QUI 提示条类名判定缓存（这个函数每次 attach / 每帧都会调）。 */
+    private val noticeBarClassMemo = java.util.concurrent.ConcurrentHashMap<Class<*>, Boolean>()
+
+    /** 该 View（或其祖先，6 层内）是不是 QUI 提示条控件。 */
+    private fun isNoticeBarClass(v: View?): Boolean {
+        var c = v
+        var depth = 0
+        while (c != null && depth < 6) {
+            val cls = c.javaClass
+            val hit = noticeBarClassMemo.getOrPut(cls) { cls.name.contains("qui.noticebar") }
+            if (hit) return true
+            c = c.parent as? View
+            depth++
+        }
+        return false
+    }
+
+    /** 已确认是"单色图形"的 drawable（弱引用缓存，避免热路径反复采样像素）。 */
+    private val monochromeIcons: MutableSet<Drawable> = ColorMath.weakIdentitySet()
+
+    /**
+     * 该 drawable 是不是"单色图形"（可以安全地单色化）。
+     * 复用 [rasterizeIconUniform] 的判据：彩色像素占比 >40% 即视为彩色图标（返回 null），
+     * 结果是 null 的会被它自己的 `rasterizeDenied` 记住；命中的在这里缓存。
+     */
+    private fun isMonochromeIcon(d: Drawable): Boolean {
+        if (monochromeIcons.contains(d)) return true
+        val ok = runCatching { rasterizeIconUniform(d) != null }.getOrDefault(false)
+        if (ok) monochromeIcons.add(d)
+        return ok
+    }
+
     private fun fixNoticeBar(v: View) {
-        // ① 本质特征（最可靠）：微云提示条的背景是皮肤引擎包出来的九宫格。
-        if (!v.background?.javaClass?.name.orEmpty().contains("SkinnableNinePatch")) return
-        // ② 几何兜底，一律设备无关（屏宽比例 + dp，不写死像素）。
-        if (!isFullWidth(v)) return
-        if (v.height !in v.dpPx(32f)..v.dpPx(48f)) return
-        val loc = IntArray(2)
-        runCatching { v.getLocationOnScreen(loc) }
-        val screenH = v.resources.displayMetrics.heightPixels
-        if (screenH <= 0 || loc[1] < screenH * 0.04f || loc[1] > screenH * 0.20f) return
+        // ⚠️ 身份判据：QUI 提示条控件本身。
+        // 反编译：`com.tencent.biz.qui.noticebar.view.VQUINoticeBarLayout extends FrameLayout`
+        // （本文件上方 `hookNoticeBarBg` 挂的就是它的背景工厂 `noticebar.a.a.c`）。
+        // 这里以前用的是"背景是皮肤九宫格 + 全宽 + 高度 32–48dp + 屏高 4%–20%" ——
+        // 那只说明"某种全宽栏"，搜索栏/顶栏/别的提示条都在这个区间里，必然误伤；
+        // 命中后动作还很重（刷背景 + 把子树图标全 SRC_IN 成单色）。
+        if (!isNoticeBarClass(v)) return
         val scheme = MonetPalette.palette()
         // ① 背景 -> 页面底色（只在第一次设；本方法会被每帧调用）
         if (noticeBarPainted.add(v)) {
@@ -6949,14 +7003,18 @@ private fun hookSummaryBadge(module: XposedModule) {
                         // 已经有 colorFilter 的说明染过了（TIM 没换新 drawable），
                         // 直接跳过 —— 所以每帧实际只做一次判空，几乎零开销。
                         // 一旦 TIM 重设成新 drawable，filter 为空，就会重染一次。
+                        // ⚠️ 只提亮**单色图形**：以前是无差别 SRC_IN，彩色图标
+                        // （微云 logo 这类）会被压成一块纯色（审计 #1）。
+                        // `isMonochromeIcon` 复用栅格化路径的"彩色像素占比"门槛
+                        // （>40% 即判彩色），并按 drawable 实例缓存，热路径只做一次查表。
                         is android.widget.ImageView -> child.drawable?.let { d ->
-                            if (d.colorFilter == null) {
+                            if (d.colorFilter == null && isMonochromeIcon(d)) {
                                 d.mutate()
                                 d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
                             }
                         }
                         is TextView -> child.compoundDrawables?.forEach { d ->
-                            if (d != null && d.colorFilter == null) {
+                            if (d != null && d.colorFilter == null && isMonochromeIcon(d)) {
                                 d.mutate()
                                 d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
                             }
@@ -7620,6 +7678,57 @@ private fun hookSummaryBadge(module: XposedModule) {
  * ⚠️ 这是**热方法**（每帧大量调用），所以：不匹配颜色时只做一次 int 比较、
  * 立即 `proceed()`，不做任何其它判断。仅在命中那个硬编码色时才改写参数。
  */
+/**
+ * 支付密码格子的**身份路径**：hook 两个 `init(Context, AttributeSet)`，
+ * 在它自己设完颜色之后，把它自己的两个 Paint 字段改成我们的配色。
+ *
+ * 反编译实证（成对设置，就在 init 里）：
+ *   `com/tenpay/password/PasswordEditText.java:60-62`
+ *       mPaintBackground.setColor(-1184275)                    // #FFEDEDED 格子底
+ *       mPaintForeground.setColor(COLOR_BUTTON_BACKGROUND_DARK) // #FF333333 圆点
+ *   `com/tenpay/sdk/view/SixPasswdDialogEditText.java:131/135`
+ *       mPaintBackground.setColor(#BBBBBB) / mPaintForeground.setColor(COLOR_BLACK)
+ * 以前圆点是靠 `Paint.setColor` + "120ms 时间邻接"猜的（审计 #11：格子底每帧刷新
+ * 时间戳 → 窗口常开 → 同进程任意 #333333 都被改色）。这里按对象身份做，时间窗删除。
+ */
+private fun hookPayPwdPaints(module: XposedModule, cl: ClassLoader) {
+    val targets = listOf(
+        "com.tenpay.password.PasswordEditText",
+        "com.tenpay.sdk.view.SixPasswdDialogEditText"
+    )
+    for (name in targets) {
+        runCatching {
+            val cls = Class.forName(name, false, cl)
+            findMethod(cls, setOf("init"), Context::class.java, android.util.AttributeSet::class.java)
+                ?.let { m ->
+                    logOnce("hook installed: $name.init (pay pwd paints)")
+                    module.hook(m).intercept { chain ->
+                        val r = chain.proceed()
+                        runCatching {
+                            if (!MonetPalette.isDarkNow()) return@runCatching
+                            val bg = cachedField(cls, "mPaintBackground")?.also { it.isAccessible = true }
+                                ?.get(chain.thisObject) as? Paint
+                            val fg = cachedField(cls, "mPaintForeground")?.also { it.isAccessible = true }
+                                ?.get(chain.thisObject) as? Paint
+                            val scheme = MonetPalette.palette()
+                            bg?.setColor(TokenMapper.guestBubble(true))
+                            fg?.setColor(scheme.primary)
+                            if (payPwdLog++ < 8) {
+                                Log.i(
+                                    TAG,
+                                    "pay pwd paints -> grid #" +
+                                        Integer.toHexString(TokenMapper.guestBubble(true)) +
+                                        " dot #" + Integer.toHexString(scheme.primary)
+                                )
+                            }
+                        }
+                        r
+                    }
+                }
+        }.onFailure { Log.w(TAG, "hook $name.init failed", it) }
+    }
+}
+
 private fun hookPayPwdGridSetColor(module: XposedModule) {
     findMethod(Paint::class.java, setOf("setColor"), INT_TYPE)?.let { mm ->
         logOnce("hook installed: Paint.setColor (pay pwd grid)")
@@ -7628,27 +7737,19 @@ private fun hookPayPwdGridSetColor(module: XposedModule) {
             val c = chain.getArg(0) as Int
             when {
                 c == PAY_PWD_GRID_COLOR -> {
-                    // 6 个密码格的底（#FFEDEDED 纯白）
-                    gridSeenAt = android.os.SystemClock.uptimeMillis()
+                    // 6 个密码格的底（#FFEDEDED 纯白）。按**精确色值**命中（这个值很特殊），
+                    // 作为 init 那条身份路径之外的兜底保留。
                     val mapped = TokenMapper.guestBubble(true)
                     if (payPwdLog++ < 4) {
                         Log.i(TAG, "pay pwd grid painted -> #" + Integer.toHexString(mapped))
                     }
                     chain.proceed(arrayOf<Any>(mapped))
                 }
-                c == PAY_PWD_DOT_COLOR &&
-                    android.os.SystemClock.uptimeMillis() - gridSeenAt < PAY_PWD_DOT_WINDOW_MS -> {
-                    // 密码圆点。它和格子底是**同一个 init() 里成对设置**的：
-                    //     mPaintBackground.setColor(#FFEDEDED)
-                    //     mPaintForeground.setColor(COLOR_BUTTON_BACKGROUND_DARK = #FF333333)
-                    // 所以用"紧随格子底之后"这个时间邻接关系来消歧 ——
-                    // #333333 本身是通用深灰（别处也当文字色用），不能无条件替换。
-                    val mapped = MonetPalette.palette().primary
-                    if (payPwdLog++ < 8) {
-                        Log.i(TAG, "pay pwd dot painted -> #" + Integer.toHexString(mapped))
-                    }
-                    chain.proceed(arrayOf<Any>(mapped))
-                }
+                // ⚠️ 圆点色**不再在这里按"时间邻接"替换**：#333333 是 TIM 的通用深灰，
+                // 以前靠"紧随格子底之后 120ms"来消歧，而格子底每帧重画都会刷新那个时间戳
+                // —— 只要弹窗在屏上，窗口就一直开着，同进程任何 setColor(#333333)
+                // （金额/标题/自绘图形）都会被换成 primary。现在改在对象身份上做：
+                // 见 hookPayPwdPaints()（hook 两个 init，直接写它自己的两个 Paint 字段）。
                 else -> chain.proceed()
             }
         }
@@ -7660,16 +7761,12 @@ private const val PAY_PWD_GRID_COLOR = 0xFFEDEDED.toInt()
 
 /**
  * 密码圆点的硬编码值：`DownloadCardView.COLOR_BUTTON_BACKGROUND_DARK = -13421773`
- * = `#FF333333`（实测真机圆点就是这个色，压在 #2B2B34 的格子上几乎看不见）。
+ * = `#FF333333`（真机圆点就是这个色，压在 #2B2B34 的格子上几乎看不见）。
+ * ⚠️ 现在**只作记录**：不再按这个色值匹配（那是通用深灰，会误伤别处），
+ * 圆点改走身份路径 `hookPayPwdPaints()`。
  */
+@Suppress("unused")
 private const val PAY_PWD_DOT_COLOR = 0xFF333333.toInt()
-
-/** 圆点必须在格子底之后这个时间窗内出现（两者在同一 init() 里紧挨着设置）。 */
-private const val PAY_PWD_DOT_WINDOW_MS = 120L
-
-/** 上次把 Paint 设成密码格底色的时刻（用于识别紧随其后的圆点色）。 */
-@Volatile
-private var gridSeenAt = 0L
 
 
 /**
@@ -10071,6 +10168,13 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         return try {
             val scheme = MonetPalette.palette()
             if (!scheme.isDark) return drawable
+            // ⚠️ 宽匹配（`qui_` 前缀 / 含 `_ic`）命中的资源里混着背景/装饰/插画，
+            // 无差别 SRC_IN 会把**彩色图形压成一块纯色**（审计 #8）。
+            // 规则：显式含 "icon" 命名的照旧（那是明确的图标语义），
+            // 其余宽匹配必须通过"单色图形"门槛（彩色像素占比 >40% 即跳过）。
+            if (!name.lowercase().contains("icon") && !isMonochromeIcon(drawable)) {
+                return drawable
+            }
             val c = scheme.onSurface
             if (iconNameLog++ < 200) {
                 Log.i(
