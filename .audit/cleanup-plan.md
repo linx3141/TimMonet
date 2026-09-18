@@ -23,6 +23,7 @@
 | 未使用字符串 4 条（`settings_theme_mode_amoled`/`settings_auto_color`/`_summary`/`settings_apply_hint`） | 删（`apply_hint` 的内容还是过期的："无需重启"已不成立） |
 | **未使用形参 22 个**（`darkTextFallback`/`dialogMonetizePass`/`monetizeForwardPopup`/`hookQuickMenuTheme`/`hookFileDownloadIcons`/`loginPageMonetizePass`/`findRowCardColor`/`mappedBitmapBgColor`/`mapTokenString`/`forwardConfirmDialogMonetize`/`hookResumeRefresh`/`installBackgroundInterceptor` 等） | 全部删除；顺带删掉因此变成孤儿的 9 个局部 `val dark = isDarkNow()` |
 | **`dark` 形参整族**（`bgPage/bgList/bgCard/outlineVariant/inputBg/guestBubble` + `mapColor/tintColorFor/inlineBgColor/bgColorForDrawable/mapPageToken`）——只当缓存键或从未被读 | 全部去掉形参：**64 个调用点**同步改；`tintMemoLight/Dark` 合并为 `tintMemo`（M10/C12/C14 收口） |
+| `tokenColorMemoized(resId, dark)` / `remapColorStateList(..., dark)`（hooks 内）同样只把 `dark` 当缓存键位 | 去掉形参与键里的 dark 位；`TOKEN_NIGHT` 常量随之无人用，删 |
 | `patchInPlace(blockRegex)` 形参从未使用 | **不是纯死代码**：它本该在 MARKER 升版本时剥掉旧补丁块。已接上（见坑 10） |
 | 注释位置错误：`Paint.setColor` 的 KDoc 挂在 `hookPayPwdPaints` 上、AIOEditText 的横幅注释挂在支付密码段 | 各自移回对应函数 |
 | 编译器标记的冗余：2 处 `as ViewGroup`、2 处 `!!`、1 处 `?.`、1 处多余 cast | 删（另有 1 处 `decorView ?: return` 是平台类型恒真判断，作为防御保留） |

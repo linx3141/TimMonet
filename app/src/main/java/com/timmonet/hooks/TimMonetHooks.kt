@@ -90,8 +90,6 @@ object TimMonetHooks {
      *  那只是"默认/未设置"，不是浅色主题。 */
     private const val THEME_ID_DAYMODE_SIMPLE_WHITE = "2971"
 
-    private const val TOKEN_NIGHT = 1002
-
     private val INT_TYPE: Class<*> = Int::class.javaPrimitiveType!!
 
     @Volatile
@@ -10754,7 +10752,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             !name.startsWith("skin_input_theme") &&
             !name.startsWith("troop_aiosm")
         ) return null
-        return remapColorStateList(resId, csl, name, MonetPalette.isDarkNow())
+        return remapColorStateList(resId, csl, name)
     }
 
     private fun entryName(resources: Resources?, resId: Int): String? {
@@ -10792,13 +10790,13 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
     @Volatile
     private var tokenColorGen = -1L
 
-    private fun tokenColorMemoized(resId: Int, dark: Boolean, compute: () -> Int): Int {
+    private fun tokenColorMemoized(resId: Int, compute: () -> Int): Int {
         val gen = MonetPalette.generation()
         if (tokenColorGen != gen) {
             tokenColorGen = gen
             tokenColorMemo.clear()
         }
-        val key = (resId shl 1) or (if (dark) 1 else 0)
+        val key = resId
         tokenColorMemo[key]?.let { return it }
         val v = compute()
         if (tokenColorMemo.size > 2048) tokenColorMemo.clear()
@@ -10835,7 +10833,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         // QQ NT 主取色入口(每帧大量调用):(resId,深色档) 记忆化,
                         // 免去每次 entryName 反查 + mapColor 计算;palette 代次
                         // 变化时自动失效。
-                        tokenColorMemoized(resId, themeId == TOKEN_NIGHT) {
+                        tokenColorMemoized(resId) {
                             val name = entryName(ctx?.resources, resId)
                             TokenMapper.mapColor(name, original)
                         }
@@ -10861,7 +10859,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         val themeId = chain.getArg(2) as Int
                         MonetPalette.ensureInitialized(ctx)
                         val name = entryName(ctx?.resources, resId)
-                        remapColorStateList(resId, csl, name, themeId == TOKEN_NIGHT) ?: csl
+                        remapColorStateList(resId, csl, name) ?: csl
                     } catch (t: Throwable) {
                         Log.e(TAG, "map getQuiColorStateList failed", t)
                         csl
@@ -10916,7 +10914,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         val resId = chain.getArg(0) as Int
                         val resources = resourcesOf(chain.thisObject)
                         val name = entryName(resources, resId)
-                        remapColorStateList(resId, csl, name, MonetPalette.isDarkNow()) ?: csl
+                        remapColorStateList(resId, csl, name) ?: csl
                     } catch (t: Throwable) {
                         Log.e(TAG, "map SkinEngine.loadColorStateList failed", t)
                         csl
@@ -11133,8 +11131,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
     private fun remapColorStateList(
         resId: Int,
         csl: ColorStateList,
-        name: String?,
-        dark: Boolean
+        name: String?
     ): ColorStateList? {
         val specs = try {
             val field = cachedField(csl.javaClass, "mStateSpecs") ?: return null
@@ -11152,10 +11149,10 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             null
         } ?: return null
 
-        // 三段位域分开存放，避免 dark 标志与颜色哈希最低位互相覆盖造成误命中。
+        // 两段位域分开存放，避免 resId 与颜色哈希互相覆盖造成误命中。
+        // （历史上还有一段 `dark` 标志位 —— 那个参数不参与取色，只是让缓存多存一份。）
         val cacheKey = (resId.toLong() shl 33) xor
-            ((Arrays.hashCode(colors).toLong() and 0xFFFFFFFFL) shl 1) xor
-            (if (dark) 0x1L else 0x0L)
+            ((Arrays.hashCode(colors).toLong() and 0xFFFFFFFFL) shl 1)
         val generation = MonetPalette.generation()
         cslCache[cacheKey]?.let { cached ->
             if (cached.generation == generation) return cached.csl
