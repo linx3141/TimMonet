@@ -30,10 +30,23 @@ object ModuleResources {
     @Volatile
     private var injected = false
 
+    /**
+     * 每个 Resources 实例挂过几次 loader。
+     *
+     * ⚠️ 不能只用上面那个静态 `injected` 标志：宿主在换肤 / 配置变化 / 主题重建后
+     * **会换掉 Resources 对象**（Activity 的 resources 也换），旧的 loader 随之失效。
+     * 这时如果还信 `injected == true` 就直接返回，面板里的 `R.string.*` 会落到
+     * **宿主的资源表**上 —— 模块的资源 id 在宿主表里指向别的资源，界面就会显示出
+     * 完全无关的字符串（实测：标题变成 "false"）。所以每次都用 marker 自检，
+     * 实例换了就重新挂。用弱引用表，避免长期持有 Resources。
+     */
+    private val injectAttempts = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Resources, Int>()
+    )
+
     /** 幂等；未成功则每次都会重试。必须在主线程调用（Resources.addLoaders 的要求）。 */
     fun ensureInjected(res: Resources?): Boolean {
         if (res == null) return false
-        if (injected) return true
         if (markerOk(res)) {
             injected = true
             return true
@@ -42,6 +55,14 @@ object ModuleResources {
             Log.w(TAG, "module resources need API 30+ (ResourcesLoader)")
             return false
         }
+        // 同一个 Resources 实例最多挂 3 次（挂过还解析不到，说明这个对象是只读的，
+        // 再挂也没用 —— 别在每次开面板时堆 loader）
+        val attempts = injectAttempts[res] ?: 0
+        if (attempts >= 3) {
+            Log.w(TAG, "module resources still missing after $attempts attempts")
+            return false
+        }
+        injectAttempts[res] = attempts + 1
         return try {
             val path = moduleApkPath()
             if (path == null) {
@@ -57,7 +78,7 @@ object ModuleResources {
                 res.addLoaders(loader)
                 val ok = markerOk(res)
                 injected = ok
-                Log.i(TAG, "module resources injected=$ok from $path")
+                Log.i(TAG, "module resources injected=$ok from $path (attempt ${attempts + 1})")
                 ok
             }
         } catch (t: Throwable) {

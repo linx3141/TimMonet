@@ -77,6 +77,13 @@ class SettingsDialogHost private constructor(
         savedStateController.performRestore(savedInstanceState)
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
         applyEdgeToEdge()
+        // 面板期间改配色 → 推迟到退出面板再重启 TIM（见 SettingsBridge.setPanelOpen）
+        SettingsBridge.setPanelOpen(true)
+        // 再确认一次模块资源可用：宿主在换肤/重建后可能换了 Resources，
+        // 这时面板里的 R.string.* 会解析成宿主的资源（标题显示成无关字符串）。
+        if (!ModuleResources.ensureInjected(context.resources)) {
+            Log.w(TAG, "panel: module resources unavailable, strings may be wrong")
+        }
         setContentView(
             ComposeView(context).apply {
                 contentView = this
@@ -178,6 +185,8 @@ class SettingsDialogHost private constructor(
         val view = contentView
         if (view == null || !view.isAttachedToWindow) {
             super.dismiss()
+            // 退出面板才让配色改动生效（重启 TIM）
+            SettingsBridge.setPanelOpen(false)
             return
         }
         // 与 QAuxiliary/TAssistant 那种"真页面"一致：向右推出、露出宿主
@@ -185,7 +194,12 @@ class SettingsDialogHost private constructor(
             .translationX(screenWidth().toFloat())
             .setDuration(EXIT_MS)
             .setInterpolator(android.view.animation.PathInterpolator(0.4f, 0f, 1f, 1f))
-            .withEndAction { super.dismiss() }
+            .withEndAction {
+                super.dismiss()
+                // 退出面板才让配色改动生效（重启 TIM）；放在 dismiss 之后，
+                // 保证重启发生在面板已经关掉之后。
+                SettingsBridge.setPanelOpen(false)
+            }
             .start()
         // 动画被系统打断(视图移除)时兜底关掉，避免面板卡住
         view.postDelayed({ runCatching { super.dismiss() } }, EXIT_MS + 120L)
@@ -234,12 +248,14 @@ class SettingsDialogHost private constructor(
         super.onStop()
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         store.clear()
+        // 兜底：任何路径关掉面板都要让待生效的配色改动落地
+        SettingsBridge.setPanelOpen(false)
     }
 
     private fun update(next: AppSettings) {
         settings = next
-        // 写远端 prefs：TIM 侧的监听器会热刷新（配色相关改动按既有设计重启 TIM）
-        SettingsBridge.write(next)
+        // 宿主侧 prefs 只读 → 通过广播让模块 App 落盘；配色相关改动在退出面板时重启 TIM
+        SettingsBridge.write(context, next)
     }
 
     companion object {

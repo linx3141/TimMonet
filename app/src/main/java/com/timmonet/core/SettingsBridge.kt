@@ -1,7 +1,10 @@
 package com.timmonet.core
 
+import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.util.Log
+import com.timmonet.settings.SettingsWriteReceiver
 import com.timmonet.settings.TimMonetSettings
 import com.timmonet.ui.theme.AppSettings
 import io.github.libxposed.api.XposedModule
@@ -18,6 +21,11 @@ import io.github.libxposed.api.XposedModule
 object SettingsBridge {
 
     private const val TAG = "TimMonet"
+
+    /** 模块自己的包名（广播目标）。 */
+    private const val MODULE_PACKAGE = "io.github.linx3141.timmonet"
+
+    private const val SETTINGS_WRITE_RECEIVER = "com.timmonet.settings.SettingsWriteReceiver"
 
     /** 远端偏好接不上时的重试间隔。 */
     private const val ATTACH_RETRY_MS = 5000L
@@ -68,17 +76,12 @@ object SettingsBridge {
                 remotePrefs.registerOnSharedPreferenceChangeListener { _, _ ->
                     val next = TimMonetSettings.read(remotePrefs)
                     // 颜色相关设置(色彩标准/深浅模式/色彩风格/色域)变化时，热刷新
-                    // 无法覆盖底栏/顶栏等已绘制区域 → 直接强停 TIM，重启后全量
-                    // 按新配色构建。
-                    val paletteChanged = next.colorMode != current.colorMode ||
-                        next.paletteStyle != current.paletteStyle ||
-                        next.colorSpec != current.colorSpec ||
-                        next.keyColor != current.keyColor ||
-                        next.amoledBlack != current.amoledBlack
+                    // 无法覆盖底栏/顶栏等已绘制区域 → 需要强停 TIM 全量重建。
+                    // ⚠️ 面板正在显示时必须**推迟到退出面板再重启**（否则用户刚点
+                    // 一个开关，整个面板连同界面一起被重启掉，看起来像"点了没反应"）。
+                    val paletteChanged = paletteDiffers(current, next)
                     current = next
-                    if (paletteChanged) {
-                        killTimProcess()
-                    }
+                    if (paletteChanged) requestTimRestart()
                     MonetPalette.onSettingsChanged()
                 }
             }
@@ -88,6 +91,58 @@ object SettingsBridge {
             Log.e(TAG, "attach remote settings failed (will retry)", t)
             prefs = null
             null
+        }
+    }
+
+    /** 配色相关字段是否有变化（监听器与 write() 共用同一份判据）。 */
+    private fun paletteDiffers(a: AppSettings, b: AppSettings): Boolean =
+        a.colorMode != b.colorMode ||
+            a.paletteStyle != b.paletteStyle ||
+            a.colorSpec != b.colorSpec ||
+            a.keyColor != b.keyColor ||
+            a.amoledBlack != b.amoledBlack
+
+    /** 模块设置面板是否正在 TIM 进程里显示（面板期间的配色改动推迟到退出再重启）。 */
+    @Volatile
+    private var panelOpen = false
+
+    /** 有配色改动等待生效（面板退出时执行）。 */
+    @Volatile
+    private var pendingRestart = false
+
+    /**
+     * 面板开/关。关闭时若攒了配色改动就重启 TIM —— 这样"改完设置退出面板"
+     * 才生效，而不是在用户还在面板里点的时候把进程杀掉。
+     */
+    fun setPanelOpen(open: Boolean) {
+        panelOpen = open
+        if (!open) applyPendingRestart()
+    }
+
+    /** 退出面板/设置页时调用：有待生效的配色改动就重启 TIM。 */
+    fun applyPendingRestart() {
+        if (!pendingRestart) return
+        pendingRestart = false
+        Log.i(TAG, "pending palette change -> restart TIM on panel exit")
+        // 广播是异步的：先确认模块 App 已经落盘（最多 2s），再重启 ——
+        // 否则可能"重启了但读到的还是旧值"。等待放在后台线程，别卡住收尾动画。
+        if (awaitingWrite == null) {
+            killTimProcess()
+            return
+        }
+        Thread {
+            awaitWriteLanded(2000)
+            killTimProcess()
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 需要重启 TIM：面板开着就先记账，等退出面板再执行。 */
+    private fun requestTimRestart() {
+        if (panelOpen) {
+            pendingRestart = true
+            Log.i(TAG, "palette changed while panel open -> defer restart to panel exit")
+        } else {
+            killTimProcess()
         }
     }
 
@@ -136,25 +191,76 @@ object SettingsBridge {
         }
     }
 
+    /** 最近一次"发出去让模块 App 落盘"的值；退出面板重启前用它确认真的写进去了。 */
+    @Volatile
+    private var awaitingWrite: AppSettings? = null
+
     /**
-     * TIM 进程侧写远端 SharedPreferences（模块设置页在 TIM 进程内显示时用）。
-     * 改动会触发上面注册的监听器：配色相关改动按既有设计重启 TIM。
+     * TIM 进程侧保存设置（模块设置面板在 TIM 进程内显示时用）。
      *
-     * @return 是否写入成功。调用方可以据此提示用户，而不是"看起来成功了"。
+     * ⚠️ **不能直接写远端 prefs**：宿主拿到的 `getRemotePreferences()` 是**只读**
+     * 实现，`edit()` 会抛 `UnsupportedOperationException: Read only implementation`
+     * —— 旧实现就是这么静默失败的（表现为"面板里改了、退出再进又变回原样，
+     * 而且 TIM 也不会重启"，因为写失败抛异常，后面的重启逻辑根本没执行）。
+     *
+     * 现在改成把新值用**显式广播**发给模块 App 的 [SettingsWriteReceiver]，
+     * 由它在模块进程写远端 prefs（那里才是可写句柄）。写完宿主的监听器/下次读取
+     * 就能看到新值。
+     *
+     * @return 是否已把写请求发出（不代表模块 App 已经写完，见 [applyPendingRestart]）。
      */
-    fun write(settings: AppSettings): Boolean {
-        // 惰性附着：早期 attach 失败过也要能继续写，不能就此永久静音。
-        val target = prefs ?: ensureRemote() ?: run {
-            Log.w(TAG, "write skipped: remote preferences unavailable")
-            return false
-        }
-        return try {
-            TimMonetSettings.write(target, settings)
-            current = settings
+    fun write(context: Context, settings: AppSettings): Boolean {
+        if (prefs == null) ensureRemote()
+        val paletteChanged = paletteDiffers(current, settings)
+        val sent = try {
+            val intent = Intent(SettingsWriteReceiver.ACTION_WRITE).apply {
+                setClassName(MODULE_PACKAGE, SETTINGS_WRITE_RECEIVER)
+                putExtra(SettingsWriteReceiver.EXTRA_PROTOCOL, SettingsWriteReceiver.PROTOCOL)
+                putExtra(SettingsWriteReceiver.EXTRA_COLOR_MODE, settings.colorMode.value)
+                putExtra(SettingsWriteReceiver.EXTRA_KEY_COLOR, settings.keyColor)
+                putExtra(
+                    SettingsWriteReceiver.EXTRA_PALETTE_STYLE,
+                    settings.paletteStyle.name
+                )
+                putExtra(SettingsWriteReceiver.EXTRA_COLOR_SPEC, settings.colorSpec.name)
+                putExtra(SettingsWriteReceiver.EXTRA_AMOLED, settings.amoledBlack)
+            }
+            context.sendBroadcast(intent)
+            Log.i(TAG, "settings write broadcast sent: ${settings.paletteStyle}/${settings.colorSpec}")
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "write remote settings failed", t)
+            Log.e(TAG, "send settings write broadcast failed", t)
             false
         }
+        current = settings
+        if (sent) awaitingWrite = settings
+        if (paletteChanged) requestTimRestart()
+        return sent
+    }
+
+    /**
+     * 等模块 App 把设置写进远端 prefs（广播是异步的，进程可能还要冷启动）。
+     *
+     * 退出面板时会先等这一步再重启 TIM —— 否则"重启"可能发生在落盘之前，
+     * 重启后读到的还是旧值，用户看到的就是"改了没用"。
+     */
+    private fun awaitWriteLanded(timeoutMs: Long): Boolean {
+        val expect = awaitingWrite ?: return true
+        val m = module ?: return false
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var last: AppSettings? = null
+        while (System.currentTimeMillis() < deadline) {
+            // RemotePreferences 是获取时的快照 → 每次都重新取一份
+            last = runCatching {
+                TimMonetSettings.read(m.getRemotePreferences(TimMonetSettings.REMOTE_PREFS_NAME))
+            }.getOrNull()
+            if (last == expect) {
+                awaitingWrite = null
+                return true
+            }
+            runCatching { Thread.sleep(80) }
+        }
+        Log.w(TAG, "settings write not visible in remote prefs yet: $last (expect $expect)")
+        return false
     }
 }

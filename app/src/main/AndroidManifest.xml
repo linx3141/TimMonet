@@ -19,6 +19,13 @@
             android:name="xposeddescription"
             android:value="@string/app_description" />
 
+        <!-- 宿主(TIM 进程)里的设置面板改设置时，通过显式广播把新值发到这里落盘：
+             宿主的 getRemotePreferences() 是只读实现，写不了远端 prefs。
+             无 intent-filter → 只能用显式组件调用。 -->
+        <receiver
+            android:name=".settings.SettingsWriteReceiver"
+            android:exported="true" />
+
         <activity
             android:name=".SettingsActivity"
             android:exported="true"
