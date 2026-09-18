@@ -207,7 +207,6 @@ object TimMonetHooks {
      * 细线兜底的扫描预算：`dispatchDraw` 是热路径，只在一段窗口内做子 View 遍历，
      * 超出后彻底跳过（避免每帧全树扫描）。纯计数、无副作用。
      */
-    private var thinLineScanBudget = 0
 
     private var redDotImgLogCount = 0
 
@@ -1908,7 +1907,13 @@ private fun hookDispatchDraw(module: XposedModule) {
                     //
                     // 这里在绘制前遍历一层子 View 按几何兜：全宽 + 极薄 + 亮 → 压成页面底色。
                     // 只在颜色确实需要改时才写，且带日志节流。
-                    if (vg0 != null && thinLineScanBudget++ < 4000) {
+                    // ⚠️ 这里以前是 `thinLineScanBudget++ < 4000` —— 一个**进程级终身预算**，
+                    // 开机头几秒就烧完，之后永远不再兜底。而 TIM 会在切页/下拉/重绑时
+                    // **重新设置**这类线的颜色，于是"早修好了、后来又变白"
+                    // （用户报：联系人页下拉后顶栏下方出现白线）。
+                    // 现在去掉终身预算：扫描本身很便宜（每个 ViewGroup 只做
+                    // 一个宽度/高度比较的循环），并保留日志节流。
+                    if (vg0 != null) {
                         runCatching {
                             val sw = vg0.resources.displayMetrics.widthPixels
                             for (i in 0 until vg0.childCount) {
@@ -1917,11 +1922,16 @@ private fun hookDispatchDraw(module: XposedModule) {
                                 // 有交互语义的细线（选中下划线、进度/滑块填充）不碰：
                                 // 它们的"亮"是有意为之，压成页面底色等于把高亮抹掉。
                                 if (ch.isClickable || ch.isSelected) continue
-                                val bg = ch.background as? ColorDrawable ?: continue
-                                val c = bg.color
+                                // ⚠️ 不能用 `as? ColorDrawable` —— 实测这条线的背景是
+                                // **SkinnableBitmapDrawable**（皮肤引擎的位图/九宫格），
+                                // ColorDrawable 闸门会把它整个跳过（"联系人页顶栏下方那条白线
+                                // 一直修不掉"就是这么来的）。统一走 solidColorOf（超集，
+                                // 位图会采样）+ recolorInPlace（保形改色，皮肤 drawable 认它）。
+                                val d = ch.background ?: continue
+                                val c = solidColorOf(d) ?: continue
                                 if (c == TokenMapper.bgPage(true)) continue
                                 if (BgResolver.luma(opaqueColor(c)) < BgResolver.LIGHT) continue
-                                bg.setColor(TokenMapper.bgPage(true))
+                                ColorMath.recolorInPlace(d, TokenMapper.bgPage(true))
                                 if (thinLineLog++ < 12) {
                                     Log.i(
                                         TAG,

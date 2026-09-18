@@ -374,6 +374,22 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
       我一开始把**聊天页**那条输入框的链当成了弹窗的（根是 `ChatFragmentRootView`），
       白改了好几版；dump 里加上 `ctx=` / `isDialog=` 才能分清对象。
 
+28. **"细线兜底"失效的两个原因：终身预算 + 类型闸门**（联系人页顶栏下方那条白线）。
+    症状：**联系人页下拉后**顶栏下方出现一条 2px 亮线（实测 `#FFDDE6` = onSurface，
+    即"把文字色当线色用"）。模块本来就有两条兜底路径，但都没命中，原因各一个：
+    - **`dispatchDraw` 的每帧扫描**写的是 `thinLineScanBudget++ < 4000` ——
+      一个**进程级终身预算**，开机头几秒就烧完，之后**永远不再兜底**；
+      而 TIM 会在切页/下拉/重绑时**重新设置**这类线的颜色 → "早修好了、后来又变白"。
+      修法：去掉终身预算（扫描本身很便宜：每个 ViewGroup 只做一次"宽度==屏宽 &&
+      高度 1..2dp"的循环 + 日志节流）。
+    - **类型闸门**：扫描里写的是 `ch.background as? ColorDrawable` —— 而实测这条线的
+      背景是 **`SkinnableBitmapDrawable`**（皮肤引擎的位图/九宫格），
+      于是被整个跳过。修法：统一走 `solidColorOf(d)`（超集，位图会采样）+
+      `ColorMath.recolorInPlace(d, bgPage)`（保形改色，皮肤 drawable 认它）。
+    **教训**：兜底逻辑不要用"终身预算"这种会**永久失效**的节流 —— 要么按对象记账、
+    要么只做日志节流；另外"背景是不是 ColorDrawable"这种类型闸门在 TIM 里几乎必然
+    漏（皮肤引擎会把一切都包成 `Skinnable*Drawable`）。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`

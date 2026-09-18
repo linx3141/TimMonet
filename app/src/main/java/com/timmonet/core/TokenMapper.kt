@@ -462,10 +462,14 @@ object TokenMapper {
         if (n.contains("tips_dot")) return Role.PRIMARY
 
         // 沉浸式顶栏底（ImmersiveTitleBar -> R.color.skin_color_title_immersive_bar）：
-        // 这是**背景**色，跟随页面底。以前它不在名字白名单里，深色皮肤给的深色
-        // 被"纯黑 -> onSurface"兜底成亮色 (#CCE9FF)，顶栏/状态栏与下方内容割裂
-        // （AMOLED 下最明显）。这一条覆盖所有用 ImmersiveTitleBar 的页面。
-        if (n.contains("title_immersive_bar")) return Role.BG_NAV_TINT
+        // ⚠️ 按 **TIM 原版的明暗关系**判：浅色下这条是**纯白 #FFFFFF**，而页面底是
+        // `#F5F6FA` —— 顶栏比页面**亮一档**、与卡片同色。所以它该走 `BG_CARD`
+        // （surfaceBright），不是页面底色。
+        // 以前这里给的是 `BG_NAV_TINT`(=surfaceContainer=页面底色)，于是
+        // "顶栏 + 状态栏"比内容**暗一档**：实测"发送给"页顶栏/状态栏 #34081D、
+        // 而搜索栏/卡片是 #501730，割裂很明显。
+        // 这一条覆盖所有用 ImmersiveTitleBar 的页面（通用）。
+        if (n.contains("title_immersive_bar")) return Role.BG_CARD
 
         // 群公告气泡（troop aiosm）：标题黑字 → onSurface，正文灰字 → onSurfaceVariant
         if (n.contains("troop_aiosm_title")) return Role.ON_SURFACE
@@ -568,7 +572,10 @@ object TokenMapper {
         if (n.contains("icon_")) return Role.ON_SURFACE
 
         // 背景
-        if (n.contains("bg_nav_primary") || n.contains("bg_bottom_brand")) return Role.BG_NAV_TINT
+        // `bg_nav_primary` 在 QUI 里是**顶栏/导航栏**底（浅色下比页面底略亮），
+        // 与上面两条同语义 → 走卡片色；`bg_bottom_brand` 是品牌底，仍走 BG_NAV_TINT。
+        if (n.contains("bg_nav_primary")) return Role.BG_CARD
+        if (n.contains("bg_bottom_brand")) return Role.BG_NAV_TINT
         if (n.contains("bg_top_dark") || n.contains("bg_bottom_dark")) return Role.KEEP
         if (n.contains("bg_page_secondary")) return Role.BG_LIST
         if (n.contains("bg_page_teriary")) return Role.BG_AIO
@@ -577,11 +584,13 @@ object TokenMapper {
         if (n.contains("bg_primary")) return Role.BG_PAGE
         if (n.contains("bottom_bar_background_gradient")) return Role.BG_PAGE
         if (n.contains("bg_top_light_pressed")) return Role.BG_LIST
-        // 顶栏底（QUI 的 bg_top_light，TIM 原版是纯白顶栏 #FFFFFF，只比页面底
-        // #F5F6FA 亮一档）：跟随**页面底色**。以前跟卡片色 surfaceBright
-        // (#003045)，比内容 surfaceContainer(#001C2A) 亮两档 —— 深色主题下
-        // 一大堆页面的顶栏/状态栏跟下方割成两截。
-        if (n.contains("bg_top_light")) return Role.BG_NAV_TINT
+        // 顶栏底（QUI 的 `bg_top_light`）：TIM 原版是**纯白顶栏**（页面底是 #F5F6FA），
+        // 即"顶栏 = 卡片色、比页面亮一档"。与 `title_immersive_bar` 同一语义，
+        // 统一走 `BG_CARD`（surfaceBright）。
+        // 历史上这里曾改成跟随页面底色（怕"顶栏跟内容割成两截"），实测那是把关系
+        // 判反了：TIM 的顶栏本来就比页面亮，跟着页面走只会让顶栏/状态栏比内容暗一档
+        // （"发送给"页实测 #34081D vs 内容 #501730）。
+        if (n.contains("bg_top_light")) return Role.BG_CARD
         // 其余 bottom/middle_light 是页面上的浅色卡片层，仍跟随卡片色。
         if (n.contains("bg_bottom_light") ||
             n.contains("bg_middle_light")
@@ -590,10 +599,14 @@ object TokenMapper {
         if (n.contains("bg_aio")) return Role.BG_AIO
         if (n.contains("bg_bottom_standard")) return Role.BG_LIST
         if (n.contains("bg_nav_bottom_aio")) return Role.INPUT_BG
-        if (n.contains("bg_nav_bottom") ||
-            n.contains("bg_nav_aio") ||
-            n.contains("bg_nav_secondary")
-        ) return Role.BG_LIST
+        if (n.contains("bg_nav_bottom") || n.contains("bg_nav_aio")) return Role.BG_LIST
+        // 二级导航栏底（`QUISecNavBar` 用的 `R.drawable.qui_bg_nav_secondary`）：
+        // 与顶栏**同一语义** —— TIM 浅色下是**白色**（页面底是 #F5F6FA），
+        // 即"比页面亮一档、与卡片同色"，是一块**看得见的面**。
+        // ⚠️ 以前它和 `bg_nav_bottom`/`bg_nav_aio`(底部栏) 归在一组 → `BG_LIST`
+        // (=页面底色)，实测"发送给"页那条「关闭 / 发送给 / 多选」变成页面底色，
+        // 与它下面的搜索栏/卡片割裂（那一整条本该一体同色）。
+        if (n.contains("bg_nav_secondary")) return Role.BG_CARD
 
         // 填充
         if (n.contains("fill_light_primary_stick")) return Role.BG_NAV_TINT
