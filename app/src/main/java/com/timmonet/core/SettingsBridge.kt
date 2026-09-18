@@ -10,12 +10,21 @@ import com.timmonet.ui.theme.AppSettings
 import io.github.libxposed.api.XposedModule
 
 /**
- * TIM 进程侧：通过 LSPosed 远端 SharedPreferences 读取/写入模块设置。
+ * TIM 进程侧：读取/保存模块设置。
  *
- * 历史坑：`attach()` 一旦抛异常，`prefs` 就停在 null，而 `write()` 是
- * `val prefs = prefs ?: return` —— 于是"在 TIM 进程内改设置"这件事**永久静默失效**：
- * Compose 界面照常显示新值（本地 state 已更新），远端一个字节都没写，
- * TIM 也永远不会按新配色重启，日志里只有 attach 那一刻的一行错误。
+ * 两条存储，按 `revision` 时间戳取新的那份（谁后改以谁为准）：
+ *  1. **LSPosed 远端偏好**（模块 App 的 `shared_prefs/tim_monet_settings.xml`）——
+ *     宿主侧是**只读**的：`getRemotePreferences()` 返回只读实现，`edit()` 抛
+ *     `UnsupportedOperationException: Read only implementation`（实测 logcat 原文）。
+ *  2. **宿主本地偏好**（TIM 私有目录 `tim_monet_host.xml`）—— 可写；TIM 设置页里
+ *     那个模块面板改的值落在这里，重启后立即生效，不依赖任何跨进程投递。
+ *
+ * 宿主的改动还会**尽力广播**给模块 App（[SettingsWriteReceiver]）以同步远端偏好
+ * 和模块界面 —— 实测部分 ROM 上宿主发出的广播投递不到模块 App，所以它只做
+ * "锦上添花"，不作为生效条件。
+ *
+ * 历史坑：`attach()` 一旦抛异常，`prefs` 就停在 null，而旧 `write()` 是
+ * `val prefs = prefs ?: return` —— 于是"在 TIM 进程内改设置"这件事**永久静默失效**。
  * 现在改成惰性重试：任何一次访问发现还没接上，就再试一次（失败有退避）。
  */
 object SettingsBridge {
@@ -26,6 +35,9 @@ object SettingsBridge {
     private const val MODULE_PACKAGE = "io.github.linx3141.timmonet"
 
     private const val SETTINGS_WRITE_RECEIVER = "com.timmonet.settings.SettingsWriteReceiver"
+
+    /** 宿主本地偏好文件名（TIM 私有目录）。 */
+    private const val HOST_PREFS_NAME = "tim_monet_host"
 
     /** 远端偏好接不上时的重试间隔。 */
     private const val ATTACH_RETRY_MS = 5000L
@@ -51,6 +63,52 @@ object SettingsBridge {
     var current: AppSettings = TimMonetSettings.defaults()
         private set
 
+    /** 宿主可写的本地偏好（TIM 私有目录）。 */
+    @Volatile
+    private var hostPrefs: SharedPreferences? = null
+
+    @Volatile
+    private var appContext: Context? = null
+
+    private fun context(): Context? {
+        appContext?.let { return it }
+        val ctx = runCatching {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? Context
+        }.getOrNull()
+        if (ctx != null) appContext = ctx
+        return ctx
+    }
+
+    private fun hostStore(): SharedPreferences? {
+        hostPrefs?.let { return it }
+        val ctx = context() ?: return null
+        return try {
+            ctx.getSharedPreferences(HOST_PREFS_NAME, Context.MODE_PRIVATE).also { hostPrefs = it }
+        } catch (t: Throwable) {
+            Log.w(TAG, "host prefs unavailable", t)
+            null
+        }
+    }
+
+    /** 两份存储里 revision 更新的那份（宿主本地 / 远端）。 */
+    private fun newestOf(local: SharedPreferences?, remote: SharedPreferences?): AppSettings? {
+        val l = local?.let { runCatching { TimMonetSettings.read(it) }.getOrNull() }
+        val r = remote?.let { runCatching { TimMonetSettings.read(it) }.getOrNull() }
+        if (l == null) return r
+        if (r == null) return l
+        val lr = runCatching { TimMonetSettings.revision(local) }.getOrDefault(0L)
+        val rr = runCatching { TimMonetSettings.revision(remote) }.getOrDefault(0L)
+        // 只留一行、可用来判断"谁后改"：面板改的落宿主本地，模块 App 改的走远端
+        Log.i(
+            TAG,
+            "settings source: host(rev=$lr) vs remote(rev=$rr) -> " +
+                if (lr >= rr) "host" else "remote"
+        )
+        return if (lr >= rr) l else r
+    }
+
     fun attach(module: XposedModule) {
         this.module = module
         ensureRemote()
@@ -70,7 +128,8 @@ object SettingsBridge {
         return try {
             val remotePrefs = m.getRemotePreferences(TimMonetSettings.REMOTE_PREFS_NAME)
             prefs = remotePrefs
-            current = TimMonetSettings.read(remotePrefs)
+            // 宿主本地（面板里改的）与远端（模块 App 改的）取 revision 新的那份
+            current = newestOf(hostStore(), remotePrefs) ?: TimMonetSettings.read(remotePrefs)
             if (!listenerRegistered) {
                 listenerRegistered = true
                 remotePrefs.registerOnSharedPreferenceChangeListener { _, _ ->
@@ -124,16 +183,8 @@ object SettingsBridge {
         if (!pendingRestart) return
         pendingRestart = false
         Log.i(TAG, "pending palette change -> restart TIM on panel exit")
-        // 广播是异步的：先确认模块 App 已经落盘（最多 2s），再重启 ——
-        // 否则可能"重启了但读到的还是旧值"。等待放在后台线程，别卡住收尾动画。
-        if (awaitingWrite == null) {
-            killTimProcess()
-            return
-        }
-        Thread {
-            awaitWriteLanded(2000)
-            killTimProcess()
-        }.apply { isDaemon = true }.start()
+        // 宿主本地偏好已在 write() 里同步写好 → 直接重启即可
+        killTimProcess()
     }
 
     /** 需要重启 TIM：面板开着就先记账，等退出面板再执行。 */
@@ -150,16 +201,14 @@ object SettingsBridge {
      *  系统深浅色切换（自动模式下）也走这里，见 hookSystemNightChange。 */
     internal fun killTimProcess() {
         try {
-            val app = Class.forName("android.app.ActivityThread")
-                .getMethod("currentApplication").invoke(null) as? android.content.Context
-                ?: return
+            val app = context() ?: return
             if (app.packageName != "com.tencent.tim") return
             Log.i(TAG, "palette settings changed, restarting TIM")
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                 try {
                     android.os.Process.killProcess(android.os.Process.myPid())
                 } catch (t: Throwable) {
-                    // 强停失败不是致命错误：设置已经写进远端，下次冷启动才全量生效。
+                    // 强停失败不是致命错误：设置已经写进本地/远端，下次冷启动才全量生效。
                     Log.w(TAG, "killProcess failed, palette applies on next cold start", t)
                 }
             }, 300L)
@@ -173,9 +222,10 @@ object SettingsBridge {
         return try {
             // RemotePreferences 是获取时的快照，模块 UI 在另一进程写入后不会自动刷新，
             // 因此每次轮询都重新向框架请求最新数据。
-            val next = TimMonetSettings.read(
+            val next = newestOf(
+                hostStore(),
                 remoteModule.getRemotePreferences(TimMonetSettings.REMOTE_PREFS_NAME)
-            )
+            ) ?: current
             if (next != current) {
                 current = next
             }
@@ -191,30 +241,51 @@ object SettingsBridge {
         }
     }
 
-    /** 最近一次"发出去让模块 App 落盘"的值；退出面板重启前用它确认真的写进去了。 */
-    @Volatile
-    private var awaitingWrite: AppSettings? = null
-
     /**
-     * TIM 进程侧保存设置（模块设置面板在 TIM 进程内显示时用）。
+     * TIM 进程侧保存设置（TIM 设置页里的模块面板用）。
      *
-     * ⚠️ **不能直接写远端 prefs**：宿主拿到的 `getRemotePreferences()` 是**只读**
-     * 实现，`edit()` 会抛 `UnsupportedOperationException: Read only implementation`
-     * —— 旧实现就是这么静默失败的（表现为"面板里改了、退出再进又变回原样，
-     * 而且 TIM 也不会重启"，因为写失败抛异常，后面的重启逻辑根本没执行）。
+     * ⚠️ **不能写远端偏好**：宿主拿到的 `getRemotePreferences()` 是只读实现，
+     * `edit()` 抛 `UnsupportedOperationException: Read only implementation`
+     * （实测 logcat 原文）。旧实现就死在这里 —— 写失败抛异常，后面的重启逻辑
+     * 根本没执行，表现为"面板里改了、退出再进又变回原样，TIM 也不重启"。
      *
-     * 现在改成把新值用**显式广播**发给模块 App 的 [SettingsWriteReceiver]，
-     * 由它在模块进程写远端 prefs（那里才是可写句柄）。写完宿主的监听器/下次读取
-     * 就能看到新值。
+     * 现在：① **写宿主本地偏好**（可写、权威）→ 宿主自己读的就是它，重启即生效；
+     * ② **尽力广播**给模块 App（[SettingsWriteReceiver]）同步远端偏好与模块界面，
+     * 投递失败不影响宿主生效。
      *
-     * @return 是否已把写请求发出（不代表模块 App 已经写完，见 [applyPendingRestart]）。
+     * @return 宿主本地是否写入成功。
      */
     fun write(context: Context, settings: AppSettings): Boolean {
+        if (appContext == null) appContext = context
         if (prefs == null) ensureRemote()
         val paletteChanged = paletteDiffers(current, settings)
-        val sent = try {
+        val stored = try {
+            val store = hostStore()
+            if (store == null) {
+                Log.w(TAG, "host prefs unavailable, settings not saved")
+                false
+            } else {
+                TimMonetSettings.write(store, settings)
+                Log.i(
+                    TAG,
+                    "settings saved to host prefs: ${settings.paletteStyle}/" +
+                        "${settings.colorSpec}/mode=${settings.colorMode}"
+                )
+                true
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "write host prefs failed", t)
+            false
+        }
+        // 尽力同步给模块 App（远端偏好 + 它的界面）。投递不到只记日志。
+        try {
             val intent = Intent(SettingsWriteReceiver.ACTION_WRITE).apply {
                 setClassName(MODULE_PACKAGE, SETTINGS_WRITE_RECEIVER)
+                // 模块 App 可能处于"停止"状态（刚安装 / 被强停）→ 不带这个 flag
+                // 系统会直接把广播丢掉（日志说"已发出"，对面什么都没收到）
+                addFlags(
+                    Intent.FLAG_INCLUDE_STOPPED_PACKAGES or Intent.FLAG_RECEIVER_FOREGROUND
+                )
                 putExtra(SettingsWriteReceiver.EXTRA_PROTOCOL, SettingsWriteReceiver.PROTOCOL)
                 putExtra(SettingsWriteReceiver.EXTRA_COLOR_MODE, settings.colorMode.value)
                 putExtra(SettingsWriteReceiver.EXTRA_KEY_COLOR, settings.keyColor)
@@ -226,41 +297,12 @@ object SettingsBridge {
                 putExtra(SettingsWriteReceiver.EXTRA_AMOLED, settings.amoledBlack)
             }
             context.sendBroadcast(intent)
-            Log.i(TAG, "settings write broadcast sent: ${settings.paletteStyle}/${settings.colorSpec}")
-            true
+            Log.i(TAG, "settings write broadcast sent (best effort)")
         } catch (t: Throwable) {
-            Log.e(TAG, "send settings write broadcast failed", t)
-            false
+            Log.w(TAG, "send settings write broadcast failed (host store already saved)", t)
         }
         current = settings
-        if (sent) awaitingWrite = settings
         if (paletteChanged) requestTimRestart()
-        return sent
-    }
-
-    /**
-     * 等模块 App 把设置写进远端 prefs（广播是异步的，进程可能还要冷启动）。
-     *
-     * 退出面板时会先等这一步再重启 TIM —— 否则"重启"可能发生在落盘之前，
-     * 重启后读到的还是旧值，用户看到的就是"改了没用"。
-     */
-    private fun awaitWriteLanded(timeoutMs: Long): Boolean {
-        val expect = awaitingWrite ?: return true
-        val m = module ?: return false
-        val deadline = System.currentTimeMillis() + timeoutMs
-        var last: AppSettings? = null
-        while (System.currentTimeMillis() < deadline) {
-            // RemotePreferences 是获取时的快照 → 每次都重新取一份
-            last = runCatching {
-                TimMonetSettings.read(m.getRemotePreferences(TimMonetSettings.REMOTE_PREFS_NAME))
-            }.getOrNull()
-            if (last == expect) {
-                awaitingWrite = null
-                return true
-            }
-            runCatching { Thread.sleep(80) }
-        }
-        Log.w(TAG, "settings write not visible in remote prefs yet: $last (expect $expect)")
-        return false
+        return stored
     }
 }

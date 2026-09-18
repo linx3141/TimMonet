@@ -50,22 +50,16 @@ class SettingsWriteReceiver : BroadcastReceiver() {
                 }.getOrDefault(ColorSpec.SpecVersion.SPEC_2025),
                 amoledBlack = intent.getBooleanExtra(EXTRA_AMOLED, false),
             )
-            // 1) 远端 prefs（宿主 getRemotePreferences 读的那份）
-            TimMonetSettings.write(
-                context.getSharedPreferences(
-                    TimMonetSettings.REMOTE_PREFS_NAME,
-                    Context.MODE_PRIVATE
-                ),
-                settings
-            )
-            // 2) 模块 App 本地 prefs（模块自己的界面用同一份值）
+            // 1) 模块 App 本地 prefs（模块自己的界面读它）
             TimMonetSettings.write(context, settings)
-            Log.i(
-                TAG,
-                "settings written from host: ${settings.colorMode}/${settings.paletteStyle}/" +
-                    "${settings.colorSpec}/key=${Integer.toHexString(settings.keyColor)}/" +
-                    "amoled=${settings.amoledBlack}"
-            )
+            // 2) 远端 prefs：必须走 XposedService 那条路（RemoteSettingsWriter.push）。
+            //    实测**直接写** `shared_prefs/tim_monet_settings.xml` 框架那边看不到
+            //    （宿主 getRemotePreferences 读出来还是旧快照，revision 差了一大截），
+            //    所以这里交给 RemoteSettingsWriter：服务没绑上它会暂存并在绑定后补推。
+            val pushed = RemoteSettingsWriter.push(settings)
+            Log.i(TAG, "settings written from host: ${settings.colorMode}/${settings.paletteStyle}" +
+                "/${settings.colorSpec}/key=${Integer.toHexString(settings.keyColor)}" +
+                "/amoled=${settings.amoledBlack} pushed=$pushed")
         } catch (t: Throwable) {
             Log.e(TAG, "settings write broadcast failed", t)
         }
