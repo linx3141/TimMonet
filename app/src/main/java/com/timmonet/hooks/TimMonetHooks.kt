@@ -294,6 +294,7 @@ object TimMonetHooks {
         }
         installAttachDispatcher(module)
         installSetBackgroundArgReplacers(module)
+        hookBubbleCompoundIcon(module)
         hookSearchBarIcon(module)
         hookNearBlackHint(module)
         hookPopupBeak()
@@ -6488,6 +6489,121 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** 搜索栏图标染色的日志额度（仅日志用）。 */
     private var searchIconLog = 0
 
+    /** 该 View 是否在消息气泡内（向上找 6 层，看祖先背景是不是气泡底）。 */
+    private fun isInsideBubble(v: View?): Boolean {
+        val scheme = MonetPalette.palette()
+        val selfBg = ColorMath.opaque(scheme.primary)
+        val guestBg = ColorMath.opaque(TokenMapper.guestBubble(true))
+        var c: View? = v?.parent as? View
+        var d = 0
+        while (c != null && d < 6) {
+            val col = c.background?.let { solidColorOf(it) } ?: 0
+            if (col != 0) {
+                val op = ColorMath.opaque(col)
+                if (op == selfBg || op == guestBg) return true
+            }
+            c = c.parent as? View
+            d++
+        }
+        return false
+    }
+
+    /**
+     * 气泡内的 **CompoundDrawable** 图标跟随该气泡的文字色。
+     *
+     * 实测：通话记录气泡「📞 通话时长 01:36」的图标是 `compoundDrawables[0]`
+     * （`SkinnableBitmapDrawable`，无 colorFilter）：
+     *   自己气泡：文字 = `onPrimary`(`#383E61`)，图标却是 `onSurface`(`#E6E4F0`)
+     *   对方气泡：文字 = `onSurface`，图标也是 `onSurface` ✓
+     * 即自己气泡里"白图标 + 深文字"不一致。文字色正是判据（`h()`/`f()` 定的），
+     * 所以只在**气泡内**把图标对齐到文字色：自己气泡 → onPrimary，
+     * 对方气泡保持 onSurface（本来就是，等于不动）。
+     */
+    private fun fixBubbleCompoundIcon(tv: TextView) {
+        runCatching {
+            if (!MonetPalette.isDarkNow()) return@runCatching
+            val scheme = MonetPalette.palette()
+            val cur = tv.currentTextColor
+            val op = ColorMath.opaque(cur)
+            val isSelf = op == ColorMath.opaque(scheme.onPrimary)
+            val isGuest = op == ColorMath.opaque(scheme.onSurface)
+            if (!isSelf && !isGuest) return@runCatching
+            if (!isInsideBubble(tv)) return@runCatching
+            for (d in tv.compoundDrawables) {
+                d ?: continue
+                if (d.colorFilter != null) continue
+                val col = solidColorOf(d) ?: continue
+                if (ColorMath.opaque(col) == op) continue
+                // 只动**无彩色**的图标：既是配色角色色、也是纯白/纯黑/灰这类
+                // 单色图形（实测视频通话的图标就是没被映射过的纯白，
+                // 之前那条 `isSchemeColor` 守卫把它整个跳过了）。彩色图标不动。
+                if (!BgResolver.isSchemeColor(col) && !BgResolver.isGray(ColorMath.opaque(col))) {
+                    continue
+                }
+                ColorMath.recolorInPlace(d, cur)
+                if (bubbleIconLog++ < 8) {
+                    Log.i(
+                        TAG,
+                        "bubble compound icon #" + Integer.toHexString(col) +
+                            " -> #" + Integer.toHexString(cur) +
+                            " self=" + isSelf
+                    )
+                }
+            }
+        }
+    }
+
+    private fun hookBubbleCompoundIcon(module: XposedModule) {
+        onViewAttached { v ->
+            val tv = v as? TextView ?: return@onViewAttached
+            fixBubbleCompoundIcon(tv)
+            v.post { fixBubbleCompoundIcon(tv) }
+        }
+        // ⚠️ 关键：TIM 会在我们染色之后**重新设置** compound drawable（重绑/复用），
+        // 一次性染色会被覆盖 —— 实测"进页面时都染对了，几秒后部分图标回到 onSurface"。
+        // 所以挂在**设置入口**上，每次设置完立刻重新对齐，与时机无关（不猜延时）。
+        val hooks: List<Pair<String, Array<Class<*>>>> = listOf(
+            "setCompoundDrawables" to arrayOf(
+                Drawable::class.java, Drawable::class.java,
+                Drawable::class.java, Drawable::class.java
+            ),
+            "setCompoundDrawablesWithIntrinsicBounds" to arrayOf(
+                Drawable::class.java, Drawable::class.java,
+                Drawable::class.java, Drawable::class.java
+            ),
+            "setCompoundDrawablesRelative" to arrayOf(
+                Drawable::class.java, Drawable::class.java,
+                Drawable::class.java, Drawable::class.java
+            ),
+            "setCompoundDrawablesRelativeWithIntrinsicBounds" to arrayOf(
+                Drawable::class.java, Drawable::class.java,
+                Drawable::class.java, Drawable::class.java
+            ),
+            "setCompoundDrawablesWithIntrinsicBounds" to arrayOf(
+                INT_TYPE, INT_TYPE, INT_TYPE, INT_TYPE
+            ),
+            "setCompoundDrawablesRelativeWithIntrinsicBounds" to arrayOf(
+                INT_TYPE, INT_TYPE, INT_TYPE, INT_TYPE
+            )
+        )
+        for ((name, params) in hooks) {
+            findMethod(TextView::class.java, setOf(name), *params)?.let { m ->
+                runCatching { module.deoptimize(m) }
+                module.hook(m).intercept { chain ->
+                    val r = chain.proceed()
+                    runCatching {
+                        (chain.thisObject as? TextView)?.let { fixBubbleCompoundIcon(it) }
+                    }
+                    r
+                }
+            }
+        }
+        logOnce("hook installed: TextView.setCompoundDrawables* (bubble icon align)")
+    }
+
+    /** 气泡内图标对齐的日志额度（仅日志用）。 */
+    private var bubbleIconLog = 0
+
     private fun hookPopupBeak() {
         onViewAttached { v ->
             runCatching {
@@ -7929,10 +8045,12 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                         isSelf -> scheme.onPrimary
                                         else -> scheme.onSurface
                                     }
+                                    // 自己气泡内的链接与正文**同色**（onPrimary）。
+                                    // 以前这里用的是"对方气泡底色"（surfaceBright/surface），
+                                    // 实测在浅色气泡上虽然读得清，但与正文是两种颜色，观感不一致。
                                     val linkColor = when {
                                         MonetPalette.isAmoled() -> scheme.primary
-                                        isSelf ->
-                                            if (scheme.isDark) scheme.surfaceBright else scheme.surface
+                                        isSelf -> scheme.onPrimary
                                         else -> scheme.primary
                                     }
                                     cachedMethod(cInfo.javaClass, "g", Integer::class.java)

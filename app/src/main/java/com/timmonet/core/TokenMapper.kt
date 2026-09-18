@@ -456,7 +456,10 @@ object TokenMapper {
         // 聊天气泡：自己发的蓝色气泡
         if (n.contains("bubble_host_text_primary")) return Role.ON_PRIMARY
         if (n.contains("bubble_host_text_secondary")) return Role.ON_PRIMARY
-        if (n.contains("bubble_host_text_link")) return Role.PRIMARY_LINK_TINT
+        // 自己气泡内的链接：与正文同色（onPrimary）。
+        // 曾经用 PRIMARY_LINK_TINT（= 对方气泡底色），实测在浅色气泡上压在
+        // 链接卡片里对比度虽够、但与正文不一致，视觉上是"两种文字色"。
+        if (n.contains("bubble_host_text_link")) return Role.ON_PRIMARY
         if (n.contains("bubble_host_text")) return Role.ON_PRIMARY
         if (n.contains("bubble_host_top") || n.contains("bubble_host_bottom")) return Role.PRIMARY
         if (n.contains("bubble_host")) return Role.PRIMARY
