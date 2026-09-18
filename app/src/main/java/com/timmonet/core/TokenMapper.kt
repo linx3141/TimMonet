@@ -610,6 +610,18 @@ object TokenMapper {
         // 填充
         if (n.contains("fill_light_primary_stick")) return Role.BG_NAV_TINT
         if (n.contains("fill_standard_brand")) return Role.PRIMARY
+        // ⚠️ `fill_light_primary_darker`（联系人各 tab 的**行底**）虽然名字里带
+        // "fill_light_primary"，但 TIM 给它的填充色是 `@color/qui_tui_common_bg_page`
+        // —— **页面底色本身**，不是卡片。反编译实证：
+        //   `res/drawable/qui_tui_common_fill_light_primary_darker_bg.xml`
+        //       <solid android:color="@color/qui_tui_common_bg_page"/>
+        //   消费方全是联系人页：`BuddyListAdapter.java:907`（好友行）、
+        //   `Contacts.java:874/879/883`（新朋友/群通知那一块）、
+        //   `ContactsTroopAdapter` / `PublicAccountFragment` / `AlphabetFriendAdapter` …
+        // 以前它落到下面的 `fill_light_primary` 规则里 → BG_CARD(surfaceBright)，
+        // 于是联系人页的「新朋友/群通知」和整个通讯录列表比页面**亮一档**、浮成一片
+        // 卡片（用户报"应该和背景同色"）。必须排在 `fill_light_primary` **之前**。
+        if (n.contains("fill_light_primary_darker")) return Role.BG_PAGE
         if (n.contains("fill_light_primary")) return Role.BG_CARD
         // 设置页 QUIListItem 等“二级填充”行背景：TIM 亮色下和
         // fill_light_primary 同为白色卡片，深色莫奈也应同为卡片色。

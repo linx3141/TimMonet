@@ -408,6 +408,24 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     要么只做日志节流；另外"背景是不是 ColorDrawable"这种类型闸门在 TIM 里几乎必然
     漏（皮肤引擎会把一切都包成 `Skinnable*Drawable`）。
 
+29. **"填充"类 token 的语义要看它"真正填的颜色"，不能只按名字归族**
+    （联系人页：新朋友/群通知 + 整个通讯录列表比页面亮一档、浮成一片卡片）。
+    - 反编译实证：这些行的背景是 `R.drawable.qui_tui_common_fill_light_primary_darker_bg_selector`
+      （消费方全是联系人页：`BuddyListAdapter.java:907` 好友行、`Contacts.java:874/879/883`
+      新朋友/群通知那一块、`ContactsTroopAdapter` / `PublicAccountFragment` /
+      `AlphabetFriendAdapter` / `NTBuddyListFriend` …），而它填的是
+      **`@color/qui_tui_common_bg_page` = #F5F5F5 = 页面底色**（`res/drawable/qui_tui_common_fill_light_primary_darker_bg.xml`），
+      根本不是白卡片。
+    - `computeRole` 里 `fill_light_primary -> BG_CARD` 这条**先命中**（`fill_light_primary_darker`
+      含该子串）→ 整片行变成 surfaceBright。修法：`fill_light_primary_darker -> BG_PAGE`
+      必须排在 `fill_light_primary` **之前**（这个 `when` 里顺序就是优先级）。
+    - **通用教训**：token 名的"更暗/更亮/次级"后缀往往意味着**另一档面**，
+      命名族 ≠ 同一语义。判据取**它自己填的颜色**（`res/drawable/*.xml` 里的 `<solid>`）
+      或**消费方的样式定义**，别用前缀匹配想当然（同类：坑 25 跨端 token 同名不同义）。
+    - 顺带：`TypedArray.getColor` 的 "inline white" 兜底是**无上下文**的，
+      `qui_tui_common_text_allwhite_primary` 这类**文字**色也会被它按面色映射；
+      真要判"这是底还是字"必须回到消费方（View/attr 名），颜色值分不出来（坑 22 同族）。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`

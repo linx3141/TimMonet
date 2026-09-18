@@ -10534,10 +10534,16 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             ?: darkTextFallback(result)
                             ?: result
                         if (mapped != result && attrColorLogCount++ < 30) {
+                            val ta = chain.thisObject as? TypedArray
+                            val resName = runCatching {
+                                val id = ta?.getResourceId(index, 0) ?: 0
+                                if (id != 0) ta?.resources?.getResourceName(id) else null
+                            }.getOrNull()
                             Log.i(
                                 TAG,
                                 "attr color #" + Integer.toHexString(result) +
-                                    " -> #" + Integer.toHexString(mapped)
+                                    " -> #" + Integer.toHexString(mapped) +
+                                    " res=" + resName
                             )
                         }
                         mapped
