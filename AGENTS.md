@@ -280,6 +280,47 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
     `setImageDrawable`、`QUITokenThemeManager.k` 三条路径。
     修法也是在 View 层兜底（`hookSearchBarIcon()` / `hookNearBlackHint()`）。
 
+24. **注入到 WebView 的 JS 里，`MutationObserver` + "回调内改 DOM" = 死循环**。
+    群公告 H5（`web.qun.qq.com/mannounce`）的颜色注入脚本里，`paintDoc()` 做两件事：
+    ① 全量 `querySelectorAll` + 逐元素 `getComputedStyle`；
+    ② 末尾注册 `MutationObserver(doc, {childList,subtree,characterData})` → 回调里
+    **同步**再调 `paintDoc`。而它自己又会写 DOM（`injectPseudoRule` 往
+    `<style>.textContent += 规则`，正是 `characterData` 变更）—— 于是
+    **观察者 → paintDoc → 写 style → 观察者** 构成死循环：JS 线程 100% 占满、
+    样式表无限增长、每轮还强制重排 → **页面直接卡死**（用户报的"进群公告页很容易卡死"）。
+    Node 里搭最小 DOM 仿真对比同一次页面变更：
+    旧版观察者触发 **5561 次** / paintDoc **4774 次** / 样式写入 **5562 次**；
+    新版 **1 次 / 2 次 / 2 次**。
+    修法三件套（缺一不可）：
+    - `paintDoc` 加**重入保护**（`doc.__tmBusy`）；
+    - 观察者回调**不再同步执行**：只置 `__tmPending` 标记，真正的重扫放到
+      `setTimeout(…,150)` 里做一次（同一批变更自然合并），并限制总轮数；
+    - `injectPseudoRule` **按规则去重**（`seen[rule]`），只有内容真的变了才写 DOM —
+      这既是打破循环的关键，也避免样式表无限膨胀。
+    **通用教训**：往页面注入的 JS，只要同时满足"观察 DOM + 修改 DOM"，
+    就必须**异步 + 去重 + 重入保护**，否则一定会自激。
+    （验证方式：把注入的 JS 抠出来，用 Node 搭最小 DOM 仿真跑新旧两版对比 —
+    不用装机、不用复现，几秒就能证伪。）
+
+25. **同名 token 在"原生"和"跨端页面"里语义可能不同 —— 不能共用一条角色规则**。
+    群公告 H5 的列表卡片和页面底变成了同一个颜色（卡片直接看不见）。页面自己的
+    CSS 是实证（线上可取：`qq-web.cdn-go.cn/web.qun.qq.com_mannounce/…/index.css`）：
+    ```css
+    .announcement-main { background-color: var(--bg_bottom_standard); }  /* 页面底 */
+    .list-item         { background-color: var(--bg_top_light); }        /* 卡片底 */
+    ```
+    而 `computeRole` 里 `bg_top_light -> BG_NAV_TINT`、`bg_bottom_standard -> BG_LIST`，
+    **两者都解析成 `surfaceContainer`** → 卡片与页面底必然同色。
+    那次改动（"顶栏底跟随页面色，免得深色下顶栏和内容割成两截"）本身没错，
+    错在**没区分消费方**：同一个 token 名，原生侧是**顶栏底**、H5 侧是**卡片底**。
+    修法：把跨端 token 表单独走一个入口 `TokenMapper.mapPageToken()`，
+    按**页面 CSS 的语义**判（`bg_top_light -> BG_CARD`）；原生资源路径原样不动，
+    顶栏不会被改回去（`mapTokenString()` 已切过去）。
+    **通用教训**：`Resources.getColor`/`TypedArray` 那条路是"原生视图语义"，
+    `QUIUtil.getCurrentTokenMap()`/tint map 那条路是"页面语义"，
+    遇到"改了 A 就坏 B"时先问一句：**这两个消费方读的是不是一个键、语义是否相同**。
+    判据优先取**消费方自己的样式定义**（这里是页面 CSS），别只依据名字猜。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`

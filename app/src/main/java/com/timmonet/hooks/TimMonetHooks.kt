@@ -8822,9 +8822,16 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                   if(el.id){ sel='#'+el.id; }
                   else if(el.className&&(''+el.className).length){ sel='.'+(''+el.className).trim().split(/\s+/).join('.'); }
                   else { sel=el.tagName.toLowerCase(); }
+                  var rule=sel+pseudo+'{color:'+TAG_BG+'!important;stroke:'+TAG_BG+'!important;}';
+                  // ⚠️ 同一条规则只写一次：以前无条件 `textContent +=`，每写一次都是
+                  // 一次 characterData 变更 → 触发 MutationObserver → 又跑 paintDoc →
+                  // 又追加一次 → **死循环**（群公告页卡死就是这么来的）。
+                  var seen=doc.__tmRules||(doc.__tmRules={});
+                  if(seen[rule])return;
                   var st=doc.getElementById('__tmReadStyle');
                   if(!st){ st=doc.createElement('style'); st.id='__tmReadStyle'; (doc.head||doc.documentElement).appendChild(st); }
-                  st.textContent+=sel+pseudo+'{color:'+TAG_BG+'!important;stroke:'+TAG_BG+'!important;}';
+                  seen[rule]=1;
+                  st.textContent+=rule;
                 }catch(e){}
               }
               function iconify(doc,label){
@@ -8869,6 +8876,8 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                 }
               }
               function paintDoc(doc){
+                if(doc.__tmBusy)return;          // 重入保护：观察者回调不得嵌套进来
+                doc.__tmBusy=true;
                 var els=doc.querySelectorAll('span,div,b,em,label,i,a,p,li,time,font');
                 for(var k=0;k<els.length;k++){
                   var e=els[k];
@@ -8896,9 +8905,23 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                     }
                   }
                 }
+                doc.__tmBusy=false;
                 try{
                   if(!doc.__tmObs){
-                    doc.__tmObs=new MutationObserver(function(){ paintDoc(doc); });
+                    if(doc.__tmRuns===undefined){ doc.__tmRuns=0; }
+                    // ⚠️ 绝不在观察者回调里**同步**重跑 paintDoc：DOM 一有变更就全量
+                    // 扫一遍，而且它自己还会写 style（又产生变更）→ 死循环 + 无限增长
+                    // 的样式表 + 每轮 getComputedStyle 强制重排 = 页面直接卡死。
+                    // 这里改成"合并同一批变更 + 异步执行 + 限制总轮数"：
+                    // 观察者只负责"标记待处理"，真正干活在下一个任务里做一次。
+                    doc.__tmObs=new MutationObserver(function(){
+                      if(doc.__tmPending)return;
+                      doc.__tmPending=true;
+                      setTimeout(function(){
+                        doc.__tmPending=false;
+                        if(doc.__tmRuns++<20){ paintDoc(doc); }
+                      },150);
+                    });
                     doc.__tmObs.observe(doc,{childList:true,subtree:true,characterData:true});
                   }
                 }catch(e){}
@@ -10891,7 +10914,9 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             } catch (t: Throwable) {
                 return value
             }
-            colorToHex(TokenMapper.mapColor(key, color, dark))
+            // 跨端页面用 mapPageToken：同一个 token 名在页面里的语义可能与原生不同
+            // （bg_top_light 在群公告 H5 里是卡片底，原生侧是顶栏底）
+            colorToHex(TokenMapper.mapPageToken(key, color, dark))
         }
         return mapped.joinToString(",")
     }

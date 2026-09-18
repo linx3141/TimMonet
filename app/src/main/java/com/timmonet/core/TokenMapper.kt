@@ -52,6 +52,26 @@ object TokenMapper {
         UNKNOWN
     }
 
+    /**
+     * **跨端页面（H5 / Ark）**的 token 表映射。
+     *
+     * ⚠️ 同一个 token 名在"原生"和"页面"里语义可能不同，不能共用一条规则：
+     * `bg_top_light` 在原生侧是**顶栏底**（`computeRole` 里让它跟随页面色，
+     * 免得深色下顶栏和内容割成两截）；但群公告 H5 拿它当**列表卡片底** ——
+     * 页面自己的 CSS 是实证
+     * （`qq-web.cdn-go.cn/web.qun.qq.com_mannounce/.../index.css`）：
+     *   `.announcement-main{background-color:var(--bg_bottom_standard)}`  ← 页面底
+     *   `.list-item        {background-color:var(--bg_top_light)}`        ← 卡片底
+     * 两条都走"跟随页面色"就会撞成同一个值 —— 实测卡片和页面底完全同色、
+     * 公告列表看起来糊成一片（用户报的"卡片背景和整体背景一个颜色"）。
+     *
+     * 所以页面路径按**页面 CSS 的语义**走：这里的 `bg_top_light` 是卡片色。
+     */
+    fun mapPageToken(key: String, color: Int, dark: Boolean): Int {
+        if (key.contains("bg_top_light")) return resolve(Role.BG_CARD, color, MonetPalette.palette())
+        return mapColor(key, color, dark)
+    }
+
     fun mapColor(name: String?, color: Int, dark: Boolean): Int {
         refreshMemoGeneration()
         val key = (
