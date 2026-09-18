@@ -36,7 +36,6 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 | `core/MonetPalette.kt` | 调色板生成（种子 → DynamicScheme）、`isDarkNow()`、AMOLED 压黑 |
 | `core/TokenMapper.kt` | 资源名/颜色 → 配色**角色**的映射；`BgResolver`（判据统一入口，同文件） |
 | `core/ColorMath.kt` | **颜色位运算**（`opaque`/`keepAlpha`/`withAlpha`/`isTransparent`）、**保形改色**（`recolorInPlace`）、**实例级缓存**（`instanceCache`/`weakIdentitySet`） |
-| `core/ThemeState.kt` | **已废弃**的兼容壳，仅转发 `MonetPalette.isDarkNow()`（现已无调用点，留着是因为它的 KDoc 记录了「坑 1」） |
 | `core/SettingsBridge.kt` | TIM 进程侧读远端设置；配色变更时重启 TIM |
 | `settings/*` | 设置读写与跨进程同步（模块 UI ↔ TIM 进程） |
 | `ui/*` | 模块设置界面（Compose，Material Expressive） |
@@ -64,13 +63,14 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 
 - **深浅判定只能用 `MonetPalette.isDarkNow()`**，或者——当你要拿配色值的时候——
   `MonetPalette.palette().isDark`。它们都走 `effectiveDark()`（只看模块设置与系统），
-  **不要**问 TIM 的 `QQTheme`，也**不要**再用 `ThemeState.isNight()`（见「坑 1」）。
+  **不要**问 TIM 的 `QQTheme`。历史上还有个 `ThemeState.isNight()` 兼容壳，恒为
+  false（见「坑 1」），该文件已删除 —— 不要再引入任何"第二深浅源"。
   注意这两个值在"只设了模块内配色、没跟随系统深色"时**不一致**：
   `isDarkNow()` 可能 false 而 `palette()` 是深色档 —— 需要与取色同源时用后者。
 - **亮度/彩度判据走 `BgResolver`**：`luma()` / `chromaSpan()` / `isGray()` /
   `isNearWhite()` / `isLightLeftover()` / `isDimGrayText()` / `foregroundForDimText()`。
-  阈值用它导出的常量（`NEAR_WHITE`…`DARK`、`GRAY_SPAN`、`DIM_TEXT`、
-  `DIM_TEXT_STRONG`、`ROLE_TOLERANCE`、`ALPHA_MIN`、`TONE_*`、`HCT_CHROMA_MAX`），
+  阈值用它导出的常量（`NEAR_WHITE`…`DARK`、`GRAY_SPAN`、`DIM_TEXT_STRONG`、
+  `ROLE_TOLERANCE`、`ALPHA_MIN`、`TONE_*`、`HCT_CHROMA_MAX`），
   **不要再写裸数字**。
 - **两套颜色度量不可互换**：`BgResolver` 的 luma/RGB-span 与 TokenMapper 里的
   **HCT tone/chroma** 是两个尺度，同一个颜色可能一个判"亮"、一个判"彩"。
@@ -80,6 +80,11 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 - **判断"这个颜色是否已经是我们输出的角色色"**用 `BgResolver.isSchemeColor(color)`
   （只判"是不是一块面"用 `isSurfaceColorOf`）。它们**没有** `dark` 形参 —— 历史上
   那个形参从不参与判据，是纯粹的误用陷阱。
+- **`TokenMapper` 的角色取值器与映射入口一律不收 `dark`**：`bgPage()` / `bgList()` /
+  `bgCard()` / `outlineVariant()` / `inputBg()` / `guestBubble()` / `mapColor(name, color)` /
+  `tintColorFor(name)` / `inlineBgColor(color)` / `bgColorForDrawable(color)` /
+  `mapPageToken(key, color)`。深浅只有一个来源（模块设置），传进来只会让人以为
+  "传 false 就是浅色档" —— 2026-09 已把最后一波特这类形参清干净（见「坑 6」）。
 
 ### 颜色位运算与改色
 
@@ -135,7 +140,8 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
    `QQTheme.isNowThemeIsNight()` hook 成永远 false（为了让 TIM 走浅色资源），
    而 `ThemeState` 正是反射调它并**永久缓存** —— 于是所有 `if (isNight)` 分支都是
    死代码，几个通用兜底从来没运行过，表现为"同一个症状反复修不好、只能逐个打控件
-   补丁"。现已改为转发 `isDarkNow()`（并已无调用点）。
+   补丁"。修法是改为转发 `isDarkNow()`；该兼容壳文件（`core/ThemeState.kt`）后来
+   连文件一起删掉了（零调用点），**不要**再恢复它。
 2. **透明色 `#0` 会被当成"纯黑文字"提亮**：TIM 的 `?attr/xxx` 取值未定义时拿到 `#0`
    （RGB 也是 0），曾被 `dark && opaque == 0xFF000000 → onSurface` 兜底命中，
    于是"什么都不画"的地方显形成一条亮线。现已在 `TypedArray.getColor` 入口加
@@ -151,11 +157,19 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
    **不透明纯黑**把内容盖死。正确写法是 `ColorMath.withAlpha(0xFF000000.toInt(), alpha)`。
    同一个函数里还用过 `Int.MIN_VALUE` 当"无映射"哨兵，而它恰好是合法的
    `0x80000000`（半透明黑）—— **不要在颜色域里用哨兵值**。
-6. **`MonetPalette.palette(dark)` 的 `dark` 参数早就不用了**（深浅由设置决定），
-   但 TokenMapper 的 memo 键里还留着它 —— 传错时"取色对、分支错"，
-   表现为时好时坏、不像同一个 bug。现已只保留无参 `palette()`；
-   `mapColor`/`tintColorFor` 的 `dark` **仍只参与缓存键**，传不同的深浅来源
-   只会让缓存多存一份、结果不变（尚未清理，改动前先确认）。
+6. **`dark` 形参在这套代码里几乎全是"假旋钮"**（深浅由模块设置决定）。
+   历史形态有三层，**现已全部清干净**：
+   - `MonetPalette.palette(dark)` 重载 —— 参数被忽略，调用方传 TIM 的 themeId /
+     硬编码 true-false 都"看起来生效"（真出过"取色对、分支错"的时好时坏型 bug）。
+     该重载已删除，只剩无参 `palette()`。
+   - `mapColor` / `tintColorFor` / `inlineBgColor` 的 `dark` —— 只参与缓存键，
+     传不同的深浅来源只会让缓存多存一份、结果不变（`tintMemoLight/Dark` 两张表
+     内容必然相同，已合并成一张）。
+   - 角色取值器 `bgPage(dark)` / `bgCard(dark)` / `guestBubble(dark)` … —— 参数
+     从头到尾没被读过。
+   唯一"真的用 dark"的是 `BgResolver.isLightLeftover(color, dark)`（浅色遗留只在
+   深色下才有意义）—— 这种才配收形参。**新增 API 不要再收 `dark`**：需要与取色
+   同源就用 `palette().isDark`，需要整体深浅就用 `isDarkNow()`。
 7. **TIM 会在我们染色之后重新设置背景**（极光卡片、底部提示条都遇到过）——
    一次性染色会被覆盖，需要"attach 后再补一次"或"绘制时持续纠正"。
 8. **"行为与日志脱节"最贵**：`fixTinySolidBg` 曾经构造了 `GradientDrawable` 却
@@ -168,6 +182,10 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 10. **"先删后建"的文件替换会丢数据**：`ArkPackagePatcher` 曾经 `file.delete()`
     之后再 `rename`，第二次 rename 失败就永久毁掉原 `.ark`（只返回 false、无异常）。
     现在改成"先写 .bak → 失败可回滚"。
+    另一条**升级陷阱**：注入的幂等判据是"JS 里有没有 `MARKER` 字符串"
+    （`TimMonetPatchV3`）—— **注入内容一改就必须升版本号**（V3→V4），否则设备上
+    已打过旧补丁的 `.ark` 直接 `return true`，永远停在新内容之前。升版本号时旧块由
+    `patchInPlace(blockRegex)` 剥掉（这个形参曾长期被传进来却没用，等于没剥）。
 11. **有些"控件"根本不是 View**：输入框上方的引用条（含"取消引用"圆按钮）由
     `com.tencent.mobileqq.aio.i.d extends DynamicDrawableSpan` 实现 ——
     `InputReplyVBDelegate.s()` 把一个**临时 TextView** 画成 Bitmap，
@@ -400,6 +418,11 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
 - **找"看不见的元素"**：先猜它的**颜色等于哪个角色**（`#FFDBF3` 就是 `onSurface`），
   再按几何（全宽 / 高度 / 屏幕位置）或反查日志（`attr color #0 -> #ffdbf3`）定位。
 - **uiautomator dump 对 TIM 无效**（返回 `null root node`），别在这上面浪费时间。
+- **死代码扫描**（本轮收尾时做的，脚本没进仓库，思路可复用）：① 私有声明可达性 ——
+  以"私有声明体之外的代码"为根，沿调用图传播，未被标记的就是死代码；② 形参——
+  函数体（**剔掉注释**后）里不再出现该名字即未使用；③ 公开函数有无调用点
+  （数 `name(` 减去定义处）；④ `strings.xml` / drawable 是否被引用（含 Manifest）。
+  注意两个坑：*注释里提到参数名*会让 ② 漏报，*KDoc 里 `[name]` 链接*会让 ③ 漏报。
 
 ## 相关产物
 

@@ -54,9 +54,6 @@ object MonetPalette {
     private var fallbackDarkScheme: DynamicScheme? = null
 
     @Volatile
-    private var seedColor: Int = DEFAULT_SEED
-
-    @Volatile
     private var paletteGeneration = 0L
 
     @Volatile
@@ -157,22 +154,20 @@ object MonetPalette {
         }
     }
 
-    /** 当前壁纸派生的种子色。 */
-    fun seed(): Int {
-        ensureInitialized(null)
-        return seedColor
-    }
-
     /** 调色板代次：壁纸变化时自增，供各缓存失效判断。 */
     fun generation(): Long = paletteGeneration
 
-    /** TIM 的 application context（取壁纸等系统服务用）。 */
-    fun context(): Context? {
-        ensureInitialized(null)
-        return appContext
-    }
-
-    /** 当前调色板。深浅完全由模块设置（或系统）决定，见 [isDarkNow]。 */
+    /**
+     * 当前调色板。深浅完全由模块设置（或系统）决定，见 [isDarkNow]。
+     *
+     * ⚠️ 这里**只有无参形式**：历史上还有一个 `palette(dark)` 重载，但那个参数
+     * 早已被忽略（深浅改为完全跟随设置），调用方传的 TIM themeId / 硬编码
+     * true-false / `isDarkNow()` 一律不影响结果 —— 它只会让 TokenMapper 的缓存键
+     * 多一个与结果无关的位，并让人误以为"传 false 就是浅色档"从而写出依赖错误
+     * 前提的分支（`bgColorForDrawable` 就曾真用调用方的 dark 判断"亮底压暗"，
+     * 而颜色来自这里的 effectiveDark —— 判据与取色来自两个深浅源）。
+     * 无参重载已删除，不要再加带参版本（见 AGENTS.md 坑 6）。
+     */
     fun palette(): DynamicScheme {
         ensureInitialized(null)
         val effectiveDark = effectiveDark()
@@ -180,22 +175,6 @@ object MonetPalette {
         if (scheme != null) return scheme
         return fallbackScheme(effectiveDark)
     }
-
-    /**
-     * ⚠️ **参数早已被忽略**（历史上曾用它区分深浅，后来改为完全跟随设置）。
-     * 保留它只是因为还有一批调用点在传值 —— 那些值（TIM 的 themeId、硬编码的
-     * true/false、isDarkNow() 等）一律**不影响结果**，纯属误导。
-     *
-     * 它真正的副作用只剩两个：
-     *   ① 让 TokenMapper 的缓存键里多一个与结果无关的位（缓存条目翻倍）；
-     *   ② 读代码的人以为"传 false 就是浅色方案"，从而写出依赖错误前提的分支
-     *      （`bgColorForDrawable` 就曾真用调用方的 dark 判断"亮底压暗"，
-     *       而颜色来自这里的 effectiveDark —— 判据与取色来自两个深浅源）。
-     *
-     * **新代码一律用无参的 [palette]**。
-     */
-    @Deprecated("参数被忽略，请改用无参的 palette()")
-    fun palette(@Suppress("UNUSED_PARAMETER") dark: Boolean): DynamicScheme = palette()
 
     /** 后台真实调色板就绪前的轻量兜底（SPEC_2021 + TonalSpot，构建快很多）。 */
     private fun fallbackScheme(dark: Boolean): DynamicScheme {
@@ -287,7 +266,6 @@ object MonetPalette {
                 if (customKeyColor != 0) customKeyColor else systemSeeds?.first ?: fallbackSeed()
             val darkSeed =
                 if (customKeyColor != 0) customKeyColor else systemSeeds?.second ?: fallbackSeed()
-            seedColor = lightSeed
             lightScheme =
                 buildScheme(lightSeed, false, userSettings.paletteStyle, userSettings.colorSpec)
             darkScheme =

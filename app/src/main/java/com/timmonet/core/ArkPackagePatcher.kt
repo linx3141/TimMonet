@@ -37,6 +37,9 @@ object ArkPackagePatcher {
 
     private const val TAG = MainModule.TAG
     private const val MAGIC_PREFIX = "xarchive 1.0"
+    // ⚠️ 幂等判据 = "包里有没有这个字符串"，所以**注入内容一改就必须升版本号**
+    // （V3 → V4）：否则设备上已打过旧补丁的 .ark 会直接 return true，永远不会
+    // 更新成新内容。升版本号时旧块由 patchInPlace 的 blockRegex 剥掉。
     private const val MARKER = "TimMonetPatchV3"
     private const val TARGET_ENTRY = "baseView.js"
     private const val MANNOUNCE_MARKER = "TimMonetMannouncePatch"
@@ -139,7 +142,13 @@ object ArkPackagePatcher {
             return true
         }
 
-        val patchedJs = injector(baseJs) ?: return false
+        // ⚠️ 注入前必须先剥掉**旧版本**的补丁块：幂等只认 `marker`（含版本号，
+        // 如 TimMonetPatchV3），所以注入内容一变就得把 MARKER 升到 V4 —— 而那时
+        // 包里躺着的是 V3 的块，不剥掉就会出现"同一个文件里两份补丁"（旧块在前，
+        // 覆盖新块的变量/逻辑）。blockRegex 就是为这件事准备的（此前它被传进来
+        // 却从未使用，等于这条路径是空的）。
+        val stripped = blockRegex.replace(baseJs, "")
+        val patchedJs = injector(stripped) ?: return false
         val newStored = deflateAndEncrypt(patchedJs.toByteArray(Charsets.UTF_8))
 
         // 保持原始记录顺序重建数据区与文件表（offset 相对数据区起点）

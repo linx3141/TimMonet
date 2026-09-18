@@ -14,8 +14,7 @@ object TokenMapper {
 
     private val memo = ConcurrentHashMap<Long, Int>()
     private val inlineMemo = ConcurrentHashMap<Long, Int>()
-    private val tintMemoLight = ConcurrentHashMap<String, Int>()
-    private val tintMemoDark = ConcurrentHashMap<String, Int>()
+    private val tintMemo = ConcurrentHashMap<String, Int>()
     private val roleMemo = ConcurrentHashMap<String, Role>()
 
     @Volatile
@@ -67,7 +66,7 @@ object TokenMapper {
      *
      * 所以页面路径按**页面 CSS 的语义**走：这里的 `bg_top_light` 是卡片色。
      */
-    fun mapPageToken(key: String, color: Int, dark: Boolean): Int {
+    fun mapPageToken(key: String, color: Int): Int {
         if (key.contains("bg_top_light")) return resolve(Role.BG_CARD, color, MonetPalette.palette())
         // ⚠️ `fill_light_tertiary` 是"输入框/字段"的**填充**语义。
         // TIM 深色 token 给的是**低 alpha 的深色**（实测 `#1A34081D` = 10% 的深紫），
@@ -82,16 +81,13 @@ object TokenMapper {
                 MonetPalette.palette()
             )
         }
-        return mapColor(key, color, dark)
+        return mapColor(key, color)
     }
 
-    fun mapColor(name: String?, color: Int, dark: Boolean): Int {
+    fun mapColor(name: String?, color: Int): Int {
         refreshMemoGeneration()
-        val key = (
-            ((name?.hashCode() ?: 0).toLong() shl 33) xor
-                ((color.toLong() and 0xFFFFFFFFL) shl 1) xor
-                (if (dark) 0x1L else 0x0L)
-            )
+        val key = ((name?.hashCode() ?: 0).toLong() shl 33) xor
+            ((color.toLong() and 0xFFFFFFFFL) shl 1)
         memo[key]?.let { return it }
 
         val scheme = MonetPalette.palette()
@@ -108,15 +104,14 @@ object TokenMapper {
     }
 
     /** 给 drawable 求目标染色；无法识别的名字返回 null（保持原样）。 */
-    fun tintColorFor(name: String, dark: Boolean): Int? {
+    fun tintColorFor(name: String): Int? {
         val role = roleOf(name) ?: return null
         if (role == Role.KEEP) return null
         refreshMemoGeneration()
-        val cache = if (dark) tintMemoDark else tintMemoLight
-        cache[name]?.let { return if (it == NO_MAPPING) null else it }
+        tintMemo[name]?.let { return if (it == NO_MAPPING) null else it }
         val color = resolve(role, 0xFF000000.toInt(), MonetPalette.palette())
-        cache[name] = color
-        if (cache.size > 8192) cache.clear()
+        tintMemo[name] = color
+        if (tintMemo.size > 8192) tintMemo.clear()
         return color
     }
 
@@ -124,11 +119,11 @@ object TokenMapper {
      * 内联颜色背景（android:background="#F5F5F5" 之类）没有资源名，
      * 按明度映射：白→卡片色、浅灰→列表色、蓝→主色，其余保持不动。
      */
-    fun inlineBgColor(color: Int, dark: Boolean): Int? {
+    fun inlineBgColor(color: Int): Int? {
         refreshMemoGeneration()
-        val key = ((color.toLong() and 0xFFFFFFFFL) shl 1) or (if (dark) 0x1L else 0x0L)
+        val key = color.toLong() and 0xFFFFFFFFL
         inlineMemo[key]?.let { return if (it == NO_MAPPING) null else it }
-        val result = computeInlineBgColor(color, dark)
+        val result = computeInlineBgColor(color)
         inlineMemo[key] = result ?: NO_MAPPING
         if (inlineMemo.size > 16384) inlineMemo.clear()
         return result
@@ -156,7 +151,7 @@ object TokenMapper {
         return ColorMath.keepAlpha(scheme.primary, color)
     }
 
-    private fun computeInlineBgColor(color: Int, dark: Boolean): Int? {
+    private fun computeInlineBgColor(color: Int): Int? {
         // 全透明：不参与任何映射（约定见 AGENTS.md），调用方按"无映射"处理
         if (ColorMath.isTransparent(color)) return null
         val alpha = ColorMath.alpha(color)
@@ -192,7 +187,7 @@ object TokenMapper {
      *  (钱包页下半屏就是它) 按老规则 tone<60 被判成文字色、直接放过，
      *  结果一个页面被切成四段颜色。彩色一律不碰。
      */
-    fun bgColorForDrawable(color: Int, dark: Boolean): Int? {
+    fun bgColorForDrawable(color: Int): Int? {
         // 全透明：不参与任何映射（约定见 AGENTS.md）
         if (ColorMath.isTransparent(color)) return null
         val alpha = ColorMath.alpha(color)
@@ -202,12 +197,12 @@ object TokenMapper {
         // 白色数字/文字压在上面也刚好可读(内联颜色路径仍映射 primary，
         // 相册选中序号那种"品牌底+白字"的用法不受影响)。
         // ⚠️ 判据与取色必须**同源**：深浅一律取 scheme.isDark（= 模块设置的
-        // effectiveDark），不再相信调用方传进来的 dark —— 历史上这里用入参判断
-        // "亮底压暗"、颜色却来自 effectiveDark，两者可以不一致，导致同一个颜色
-        // 有时被压暗有时不被压暗（"时好时坏"型 bug 的典型）。
+        // effectiveDark）—— 这里曾经收一个 `dark` 入参，用它判断"亮底压暗"、
+        // 颜色却来自 effectiveDark，两者可以不一致，导致同一个颜色有时被压暗
+        // 有时不被压暗（"时好时坏"型 bug 的典型）。该形参已删除。
         val scheme = MonetPalette.palette()
         brandBlueRole(color, scheme)?.let {
-            return ColorMath.keepAlpha(guestBubble(scheme.isDark), color)
+            return ColorMath.keepAlpha(guestBubble(), color)
         }
         val opaque = ColorMath.opaque(color)
         val hct = try {
@@ -222,7 +217,7 @@ object TokenMapper {
         // 注意：这条**故意不排除彩色**（浅蓝的微云入口条就是靠它压暗的），
         // 所以用 BgResolver.luma 而不是 isLightLeftover（后者含彩色排除）。
         if (scheme.isDark && BgResolver.luma(opaque) > BgResolver.BRIGHT) {
-            return bgPage(true)
+            return bgPage()
         }
         if (hct.chroma >= BgResolver.HCT_CHROMA_MAX) return null
         val mapped = if (hct.tone < BgResolver.TONE_CONTAINER_SPLIT) {
@@ -233,16 +228,20 @@ object TokenMapper {
         return ColorMath.keepAlpha(mapped, color)
     }
 
+    // 角色取值器：深浅一律由模块设置决定（见 AGENTS.md「判据：只有一个来源」），
+    // 因此这些函数**不收 dark 形参** —— 历史上收过，但它从不参与判据，只会让
+    // 调用方以为"传 false 就是浅色档"（真踩过，见坑 6）。
+
     /** 聊天列表条目背景的两种角色色。 */
-    fun bgList(dark: Boolean): Int =
+    fun bgList(): Int =
         resolve(Role.BG_LIST, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 页面底色（BG_PAGE）：给"未选中底"这类需要跟页面融为一体的地方用。 */
-    fun bgPage(dark: Boolean): Int =
+    fun bgPage(): Int =
         resolve(Role.BG_PAGE, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 深色下可见的"线"色（分隔线/边框）：给分隔线类资源用。 */
-    fun outlineVariant(dark: Boolean): Int =
+    fun outlineVariant(): Int =
         resolve(Role.OUTLINE_VARIANT, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 输入框/搜索框底色（`Role.INPUT_BG`）：深色下 surfaceContainerHigh。
@@ -250,14 +249,14 @@ object TokenMapper {
      *  与 [bgPage] 的区别很重要：TIM 浅色下"页面底"和"输入框底"都是浅灰，
      *  "亮底压暗"这类兜底如果一律给页面底色，输入框就会和弹窗/卡片割裂
      *  （转发弹窗实测：普通文字转发时输入框变成页面色）。 */
-    fun inputBg(dark: Boolean): Int =
+    fun inputBg(): Int =
         resolve(Role.INPUT_BG, 0xFF000000.toInt(), MonetPalette.palette())
 
-    fun bgCard(dark: Boolean): Int =
+    fun bgCard(): Int =
         resolve(Role.BG_CARD, 0xFF000000.toInt(), MonetPalette.palette())
 
     /** 对方消息气泡的背景色（免打扰灰泡沿用）。 */
-    fun guestBubble(dark: Boolean): Int =
+    fun guestBubble(): Int =
         resolve(Role.GUEST_BUBBLE, 0xFF000000.toInt(), MonetPalette.palette())
 
     private fun inferByColor(color: Int, scheme: DynamicScheme): Int {
@@ -697,8 +696,7 @@ object TokenMapper {
             if (memoGeneration == generation) return
             memo.clear()
             inlineMemo.clear()
-            tintMemoLight.clear()
-            tintMemoDark.clear()
+            tintMemo.clear()
             // ⚠️ roleMemo 也必须一起失效：computeRole 依赖 MonetPalette.isAmoled()
             // （AMOLED 开时 bubble_host → GUEST_BUBBLE 等），而 isAmoled 会随设置
             // 变化。以前它只靠 "size > 4096" 兜底，于是切换 AMOLED 开关后
@@ -831,10 +829,9 @@ object BgResolver {
     /** 近似灰度：RGB 跨度 ≤ 此值就当作"灰"（不是彩色）。 */
     const val GRAY_SPAN = 24
 
-    /** 暗灰前景上限：luma 低于此值的灰字在深色底上读不出来，需要提亮。 */
-    const val DIM_TEXT = 110
-
-    /** 提亮灰字的档位：低于 [DIM_TEXT_STRONG] 给 onSurface，否则给 onSurfaceVariant。 */
+    /**
+     * 提亮灰字的档位：低于 [DIM_TEXT_STRONG] 给 onSurface，否则给 onSurfaceVariant。
+     */
     const val DIM_TEXT_STRONG = 70
 
     /**

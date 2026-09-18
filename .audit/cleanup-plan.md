@@ -5,6 +5,36 @@
 
 ---
 
+## 〇、2026-09-19 收尾：全量死代码扫描（已完成，改动见对应提交）
+
+扫描口径：① 私有声明**可达性**（以私有体之外的代码为根沿调用图传播）；
+② 形参在函数体（剔注释后）是否出现；③ 公开函数有无调用点；④ 资源/字符串是否被引用；
+⑤ 编译器警告里的"恒真分支 / 冗余转换 / 多余断言"。结果与处置：
+
+| 发现 | 处置 |
+|---|---|
+| `PAY_PWD_DOT_COLOR` 常量只有声明（`@Suppress("unused")`，注释说"只作记录"） | 删常量，色值记进 `hookPayPwdGridSetColor` 的注释 |
+| `MonetPalette.palette(dark)` 重载零调用（`@Deprecated` 兼容壳） | 删；教训并入 KDoc + 坑 6 |
+| `MonetPalette.seed()` / `context()` / `seedColor` 零调用 | 删（`appContext` 内部仍在用） |
+| `ThemeState.kt` 整个文件零调用 | 删文件（教训在 AGENTS「坑 1」） |
+| `TimMonetSettings.serialize/parse/PROVIDER_AUTHORITY` 零调用（无 provider 声明） | 删；类 KDoc 里那句 `[SettingsProvider]` 是悬空引用，已改写成"没有 ContentProvider" |
+| `BgResolver.DIM_TEXT` 零引用（`DIM_TEXT_STRONG` 才是被用的那档） | 删，AGENTS 常量清单同步 |
+| 未使用 import（`Hct`） | 删 |
+| 未使用字符串 4 条（`settings_theme_mode_amoled`/`settings_auto_color`/`_summary`/`settings_apply_hint`） | 删（`apply_hint` 的内容还是过期的："无需重启"已不成立） |
+| **未使用形参 22 个**（`darkTextFallback`/`dialogMonetizePass`/`monetizeForwardPopup`/`hookQuickMenuTheme`/`hookFileDownloadIcons`/`loginPageMonetizePass`/`findRowCardColor`/`mappedBitmapBgColor`/`mapTokenString`/`forwardConfirmDialogMonetize`/`hookResumeRefresh`/`installBackgroundInterceptor` 等） | 全部删除；顺带删掉因此变成孤儿的 9 个局部 `val dark = isDarkNow()` |
+| **`dark` 形参整族**（`bgPage/bgList/bgCard/outlineVariant/inputBg/guestBubble` + `mapColor/tintColorFor/inlineBgColor/bgColorForDrawable/mapPageToken`）——只当缓存键或从未被读 | 全部去掉形参：**64 个调用点**同步改；`tintMemoLight/Dark` 合并为 `tintMemo`（M10/C12/C14 收口） |
+| `patchInPlace(blockRegex)` 形参从未使用 | **不是纯死代码**：它本该在 MARKER 升版本时剥掉旧补丁块。已接上（见坑 10） |
+| 注释位置错误：`Paint.setColor` 的 KDoc 挂在 `hookPayPwdPaints` 上、AIOEditText 的横幅注释挂在支付密码段 | 各自移回对应函数 |
+| 编译器标记的冗余：2 处 `as ViewGroup`、2 处 `!!`、1 处 `?.`、1 处多余 cast | 删（另有 1 处 `decorView ?: return` 是平台类型恒真判断，作为防御保留） |
+
+**同时确认"看起来可疑但不是死代码"的**：`applyReplyJumpIcon(reason)` / `recolorReplyText(reason)` /
+`installBackgroundInterceptor(label)` / `tintFileCircleIcon(name)` / `logWhiteSource(source)`
+—— 这 5 个形参都用在日志字符串里（脚本剔注释后仍误报，已逐条人工核实）；
+`ColorMode.DARK_AMOLED`（旧值迁移用，保留）；`isLightLeftover(color, dark)`（唯一真用 dark 的判据）。
+
+---
+
+
 ## 一、已修（本次审查中当场发现并修复）
 
 ### ✅ fixTinySolidBg 是空操作（规则从未生效，却打出"已改成页面底色"的日志）
@@ -124,7 +154,7 @@
 - **问题**：一次弹窗显示跑 3~4 轮、每轮 4 遍全树，无"已处理"标记；`forceMonetSubtree` 无上限递归(1328)。
 - **改法**：只留一个入口 + 按 `MonetPalette.generation()` 标记去重；递归加上限。
 
-### M10. `MonetPalette.palette(dark)` 的参数早就不生效
+### ~~M10. `MonetPalette.palette(dark)` 的参数早就不生效~~ ✅ 2026-09-19 已删（重载已不存在）
 - **位置**：调用点 903、930、1398、2286；实现 `MonetPalette.kt` 147-153（实参被忽略，用 `effectiveDark()`）
 - **问题**：读起来像"强制浅色方案"，实际跟随设置 —— 历史"时好时坏"型 bug 的温床。
 - **改法**：删掉 `dark` 形参（改 `palette()`）。
@@ -239,19 +269,19 @@
   - `readCurrent` 失败静默返回旧 `current`
   - `write` 在 `prefs == null` 时静默 no-op
 
-### C12. `tintMemoLight/Dark` 两份缓存内容**必然相同**
+### ~~C12. `tintMemoLight/Dark` 两份缓存内容必然相同~~ ✅ 2026-09-19 已合并为单个 `tintMemo`
 - **位置**：`TokenMapper.kt` 78-88
 - **问题**：`resolve` 不依赖 `dark`，两份表逐项相同；83 行 `it == NO_MAPPING` 是**死分支**（85 行只存计算结果）。
 
 ## 低
 
-### C13. 死代码
+### C13. 死代码（✅ 2026-09-19 全部落地：ThemeState / seed / context / serialize / parse 均已删）
 - `ThemeState.kt` 16-20 零调用（仅剩一个未使用 import + 注释）
 - `MonetPalette.kt` 56-57 + 133-136 `seedColor` 只被无人调用的 `seed()` 读；142-145 `context()` 无调用者
 - `TokenMapper.kt` 637-640 `BgResolver.dimmed/card` 无调用者
 - `TimMonetSettings.kt` 19 `PROVIDER_AUTHORITY`、103-112 `serialize`、115-141 `parse` 全无调用者；`AndroidManifest` 无 provider，13 行注释引用的 `[SettingsProvider]` 类不存在
 
-### C14. `mapColor` 的 `dark` 只参与缓存键；`name` 用 hashCode 折叠、null→0 与 hashCode==0 撞键
+### ~~C14. `mapColor` 的 `dark` 只参与缓存键~~；`name` 用 hashCode 折叠、null→0 与 hashCode==0 撞键（**后半未修**）
 - **位置**：`TokenMapper.kt` 55-75
 
 ### C15. SPEC_2025 白名单重复

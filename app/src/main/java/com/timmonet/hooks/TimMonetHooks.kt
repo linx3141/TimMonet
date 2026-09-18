@@ -33,7 +33,6 @@ import android.util.TypedValue
 import android.os.Bundle
 import android.text.Spannable
 import android.text.style.ForegroundColorSpan
-import com.materialkolor.hct.Hct
 import com.materialkolor.scheme.DynamicScheme
 import com.timmonet.MainModule
 import com.timmonet.core.ArkPackagePatcher
@@ -241,7 +240,7 @@ object TimMonetHooks {
                     module.hook(method).intercept { chain ->
                         val result = chain.proceed()
                         if (result is Int) {
-                            TokenMapper.bgList(MonetPalette.isDarkNow())
+                            TokenMapper.bgList()
                         } else {
                             result
                         }
@@ -253,7 +252,7 @@ object TimMonetHooks {
                     module.hook(method).intercept { chain ->
                         val result = chain.proceed()
                         if (result is Int) {
-                            TokenMapper.bgCard(MonetPalette.isDarkNow())
+                            TokenMapper.bgCard()
                         } else {
                             result
                         }
@@ -338,7 +337,7 @@ object TimMonetHooks {
         hookAioNavBadge(module, classLoader)
         hookArkToken(module, classLoader)
         hookArkPackagePatch(module, classLoader)
-        hookFileDownloadIcons(module)
+        hookFileDownloadIcons()
         hookPlusPanelIcons(module, classLoader)
         hookSingleLineDrawables(module, classLoader)
         hookPlusPanelPlate()
@@ -358,11 +357,11 @@ object TimMonetHooks {
         hookForwardRecentTheme(module, classLoader)
         hookSplashBackground(module, classLoader)
         hookForwardDialog(module, classLoader)
-        hookQuickMenuTheme(module, classLoader)
+        hookQuickMenuTheme(classLoader)
         hookAlbumTimelineText(module, classLoader)
         hookForceLight(module, classLoader)
         hookForceLightConfig(module)
-        hookResumeRefresh(module, classLoader)
+        hookResumeRefresh(module)
         registerSystemNightCallback()
         hookSettingEntry(module, classLoader)
     }
@@ -826,7 +825,7 @@ object TimMonetHooks {
                             val shouldFix = rCol != 0 && alpha in 1..127 &&
                                 (scheme.isDark || BgResolver.isNearWhite(opaqueColor(rCol)))
                             if (shouldFix) {
-                                val cardCol = TokenMapper.bgCard(scheme.isDark)
+                                val cardCol = TokenMapper.bgCard()
                                 if (rb is android.graphics.drawable.ColorDrawable) {
                                     rb.mutate()
                                     rb.color = cardCol
@@ -905,7 +904,7 @@ object TimMonetHooks {
                     runCatching { module.deoptimize(method) }
                     module.hook(method).intercept { chain ->
                         try {
-                            forwardConfirmDialogMonetize(chain.thisObject as? Dialog, cl)
+                            forwardConfirmDialogMonetize(chain.thisObject as? Dialog)
                         } catch (t: Throwable) {
                             Log.w(TAG, "ark show monetize failed", t)
                         }
@@ -923,7 +922,7 @@ object TimMonetHooks {
      *  窗底与根卡平染 surfaceBright → 子树莫奈化 → 表情/键盘键染 onSurface →
      *  hint/非键小图标补色。补跑 = 300ms 防抖布局监听 + 120/400/1200ms 延时，
      *  覆盖内容异步加载与键盘/表情面板切换产生的任何新视图。 */
-    private fun forwardConfirmDialogMonetize(dlg: Dialog?, cl: ClassLoader) {
+    private fun forwardConfirmDialogMonetize(dlg: Dialog?) {
         if (dlg == null) return
         Log.i(TAG, "confirm dialog monetize enter: ${dlg.javaClass.name}")
         try {
@@ -944,7 +943,7 @@ object TimMonetHooks {
             val decor = win?.decorView ?: return
             // 事件触发即整窗染色一次(延时/轮询补跑经实验证明非必需)
             runCatching {
-                dialogMonetizePass(decor, cl, dark)
+                dialogMonetizePass(decor, dark)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "confirm dialog monetize failed", t)
@@ -956,7 +955,7 @@ object TimMonetHooks {
      *  ② 根卡(colorFilter)平染 surfaceBright，与窗底同档
      *  ③ 表情/键盘切换键 → onSurface（覆盖旧 filter，与全局 icon_ 规则一致）
      *  ④ hint 过暗 → onSurfaceVariant；非键暗小图标 → onSurfaceVariant */
-    private fun dialogMonetizePass(decor: View, cl: ClassLoader, dark: Boolean) {
+    private fun dialogMonetizePass(decor: View, dark: Boolean) {
         val scheme = MonetPalette.palette()
         runCatching {
             forceMonetSubtree(decor)
@@ -1107,7 +1106,7 @@ object TimMonetHooks {
                         module.hook(method).intercept { chain ->
                             val result = chain.proceed()
                             try {
-                                forwardConfirmDialogMonetize(chain.thisObject as? Dialog, cl)
+                                forwardConfirmDialogMonetize(chain.thisObject as? Dialog)
                             } catch (t: Throwable) {
                                 Log.w(TAG, "ark w0 monetize failed", t)
                             }
@@ -1151,7 +1150,7 @@ object TimMonetHooks {
                                 // QQCustomDialogWtihEmoticonInput(带表情输入) /
                                 // QQCustomDialog(普通)；统一染 surfaceBright。
                                 if (dlg.javaClass.name.contains("QQCustomDialog")) {
-                                    forwardConfirmDialogMonetize(dlg, cl)
+                                    forwardConfirmDialogMonetize(dlg)
                                 }
                             }
                         } catch (t: Throwable) {
@@ -1246,7 +1245,7 @@ object TimMonetHooks {
                         val dlg = chain.thisObject as? Dialog ?: return@intercept result
                         // a0 是弹窗构建/切换必经入口：直接把整窗莫奈化挂这里
                         runCatching {
-                            forwardConfirmDialogMonetize(dlg, cl)
+                            forwardConfirmDialogMonetize(dlg)
                         }
                         val decor = dlg.window?.decorView ?: return@intercept result
                         tintEmoButtonIn(decor)
@@ -1276,12 +1275,11 @@ private var quickMenuLogCount = 0
 
 /** 转发“选聊天”弹窗（ForwardRecentActivity）整体莫奈化：面板底色 + 整棵子树，
  *  decor.post 到主线程执行，确保弹窗首帧已就绪。 */
-private fun monetizeForwardPopup(activity: Activity, cl: ClassLoader) {
+private fun monetizeForwardPopup(activity: Activity) {
     val window = activity.window ?: return
     val decor = window.decorView ?: return
     decor.post {
         try {
-            val dark = MonetPalette.isDarkNow()
             val content = activity.findViewById(android.R.id.content) as? ViewGroup
             val root: View = if (content != null && content.childCount > 0) {
                 content.getChildAt(0)
@@ -1289,9 +1287,9 @@ private fun monetizeForwardPopup(activity: Activity, cl: ClassLoader) {
                 decor
             }
             val rootBg = root.background
-            if (rootBg != null && !trySetPaintFilter(rootBg, TokenMapper.bgList(dark))) {
+            if (rootBg != null && !trySetPaintFilter(rootBg, TokenMapper.bgList())) {
                 try {
-                    ColorMath.recolorInPlace(rootBg, TokenMapper.bgList(dark))
+                    ColorMath.recolorInPlace(rootBg, TokenMapper.bgList())
                 } catch (t: Throwable) {
                     // ignore
                 }
@@ -1398,7 +1396,7 @@ private fun mapPopupTextColor(color: Int, scheme: DynamicScheme): Int {
     if (opaque in TokenMapper.BRAND_BLUES) {
         return ColorMath.keepAlpha(scheme.primary, color)
     }
-    val mapped = TokenMapper.mapColor(null, opaque, scheme.isDark)
+    val mapped = TokenMapper.mapColor(null, opaque)
     return ColorMath.keepAlpha(mapped, color)
 }
 
@@ -1454,7 +1452,7 @@ private fun hookForwardDialog(module: XposedModule, cl: ClassLoader) {
                 module.hook(method).intercept { chain ->
                     chain.proceed()
                     try {
-                        forwardConfirmDialogMonetize(chain.thisObject as? Dialog, cl)
+                        forwardConfirmDialogMonetize(chain.thisObject as? Dialog)
                     } catch (t: Throwable) {
                         Log.w(TAG, "ForwardDialog.setContentView monetize failed", t)
                     }
@@ -1467,7 +1465,7 @@ private fun hookForwardDialog(module: XposedModule, cl: ClassLoader) {
                 module.hook(method).intercept { chain ->
                     chain.proceed()
                     try {
-                        forwardConfirmDialogMonetize(chain.thisObject as? Dialog, cl)
+                        forwardConfirmDialogMonetize(chain.thisObject as? Dialog)
                     } catch (t: Throwable) {
                         Log.w(TAG, "ForwardDialog.show monetize failed", t)
                     }
@@ -1929,9 +1927,9 @@ private fun hookDispatchDraw(module: XposedModule) {
                                 // 位图会采样）+ recolorInPlace（保形改色，皮肤 drawable 认它）。
                                 val d = ch.background ?: continue
                                 val c = solidColorOf(d) ?: continue
-                                if (c == TokenMapper.bgPage(true)) continue
+                                if (c == TokenMapper.bgPage()) continue
                                 if (BgResolver.luma(opaqueColor(c)) < BgResolver.LIGHT) continue
-                                ColorMath.recolorInPlace(d, TokenMapper.bgPage(true))
+                                ColorMath.recolorInPlace(d, TokenMapper.bgPage())
                                 if (thinLineLog++ < 12) {
                                     Log.i(
                                         TAG,
@@ -2117,7 +2115,7 @@ private fun hookPlusPanelIcons(module: XposedModule, cl: ClassLoader) {
 
 /** QQ 快捷菜单（长按消息）主题化：把三个 QQCustomMenu* 容器类解析出来，命中任一
  *  的 View 挂 onAttachedToWindow 后调度整棵子树染色。 */
-private fun hookQuickMenuTheme(module: XposedModule, cl: ClassLoader) {
+private fun hookQuickMenuTheme(cl: ClassLoader) {
     val classes = QUICK_MENU_UI_CLASSES.mapNotNull { name ->
         runCatching { Class.forName(name, false, cl) }.getOrNull()
     }
@@ -2239,7 +2237,7 @@ private fun tintBadgeDigitText(tv: TextView, scheme: DynamicScheme): Boolean {
     var pv: android.view.ViewParent? = tv.parent
     var depth = 0
     while (pv is ViewGroup && depth < 3) {
-        val g = pv as ViewGroup
+        val g = pv
         if (dIsPrimary(g.background)) {
             runCatching {
                 tv.setTextColor(scheme.onPrimary)
@@ -2279,7 +2277,7 @@ private var appliedThemeGen = -1L
  *     列表 notifyDataSetChanged 让其按新配色重建(inflate 资源重走 hook)，
  *     QUIBadge 角标重算。 */
 
-private fun hookResumeRefresh(module: XposedModule, cl: ClassLoader) {
+private fun hookResumeRefresh(module: XposedModule) {
     findMethod(Activity::class.java, setOf("onResume"))
         ?.let { method ->
             logOnce("hook installed: Activity.onResume (login+palette refresh)")
@@ -2315,7 +2313,7 @@ private fun hookResumeRefresh(module: XposedModule, cl: ClassLoader) {
                     ) {
                         val dec = act.window?.decorView ?: return@intercept result
                         runCatching {
-                            loginPageMonetizePass(dec, cl)
+                            loginPageMonetizePass(dec)
                         }
                     }
                     // 配色代次变化 → 全界面换新配色（首次启动只记录代次不刷）
@@ -2368,7 +2366,7 @@ private fun hookResumeRefresh(module: XposedModule, cl: ClassLoader) {
 
 /** 登录/添加账号页单次深色化：页面根/decor 背景(浅色 ColorDrawable/Gradient)
  *  平染 surfaceContainer → 整树莫奈化(文本/控件)。 */
-private fun loginPageMonetizePass(decor: View, cl: ClassLoader) {
+private fun loginPageMonetizePass(decor: View) {
     try {
         val scheme = MonetPalette.palette()
         if (!scheme.isDark) return
@@ -2809,7 +2807,7 @@ private fun hookForwardRecentTheme(module: XposedModule, cl: ClassLoader) {
                     try {
                         val activity = chain.thisObject as? Activity
                         if (activity != null) {
-                            monetizeForwardPopup(activity, cl)
+                            monetizeForwardPopup(activity)
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "monetize forward popup failed", t)
@@ -3927,14 +3925,13 @@ private fun tintTextViewBadge(tv: TextView?, text: CharSequence?) {
         return
     }
     try {
-        val dark = MonetPalette.isDarkNow()
         val scheme = MonetPalette.palette()
         when (kind) {
             SummaryBadgeKind.RECALL -> {
                 // 撤回提示长条：背景跟随所在聊天条目，文字用 onSurfaceVariant
                 tintPillBackground(
                     tv,
-                    findRowCardColor(tv, dark, text ?: ""),
+                    findRowCardColor(tv, text ?: ""),
                     createIfMissing = false
                 )
                 tv.setTextColor(scheme.onSurfaceVariant)
@@ -4282,7 +4279,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 null
             }
             if (cellCls != null) {
-                val cardBg = { TokenMapper.guestBubble(true) }
+                val cardBg = { TokenMapper.guestBubble() }
                 onSetBackgroundArg { view, incoming ->
                     if (!cellCls.isInstance(view)) return@onSetBackgroundArg null
                     // 返回 incoming 本身 = 只改色、不换对象（保形：圆角/按压态都在）
@@ -4380,13 +4377,12 @@ private fun hookSummaryBadge(module: XposedModule) {
                             }
                         }
                         if (text == "加好友" && textView != null && isProfileActivityView(view)) {
-                            val dark = MonetPalette.isDarkNow()
                             val scheme = MonetPalette.palette()
                             textView.background?.let { bg ->
                                 recolorProfileAddFriendBg(
                                     bg,
-                                    TokenMapper.bgCard(dark),
-                                    TokenMapper.bgList(dark)
+                                    TokenMapper.bgCard(),
+                                    TokenMapper.bgList()
                                 )
                             }
                             textView.setTextColor(scheme.onSurface)
@@ -4669,7 +4665,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (bitmap != null) {
                             bubble.setBackground(
                                 recolorBackBottomBitmap(
-                                    bitmap!!,
+                                    bitmap,
                                     bubble.resources,
                                     scheme.primary,
                                     scheme.onPrimary
@@ -5303,7 +5299,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     var hostP: android.view.ViewParent? = view.parent
                     var depth = 0
                     while (hostP is ViewGroup && depth < 2) {
-                        val g = hostP as ViewGroup
+                        val g = hostP
                         for (k in 0 until g.childCount) {
                             val c = g.getChildAt(k)
                             if (c === view || c !is TextView || c.isClickable) continue
@@ -5350,7 +5346,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (!MonetPalette.isDarkNow()) return@runCatching
                         val d = iv.drawable ?: return@runCatching
                         d.mutate()
-                        d.setColorFilter(TokenMapper.bgCard(true), PorterDuff.Mode.SRC_IN)
+                        d.setColorFilter(TokenMapper.bgCard(), PorterDuff.Mode.SRC_IN)
                     }
                     result
                 }
@@ -5463,7 +5459,6 @@ private fun hookSummaryBadge(module: XposedModule) {
             quiBadgeForceMemo[view] = gen
         }
         try {
-            val dark = MonetPalette.isDarkNow()
             val scheme = MonetPalette.palette()
             val fields = quiBadgeFieldsCache.getOrPut(view.javaClass) {
                 QuiBadgeFields(
@@ -5499,17 +5494,17 @@ private fun hookSummaryBadge(module: XposedModule) {
                 maxOf(origR, origG, origB) - minOf(origR, origG, origB) <= 24 &&
                 colorLuma(origBg) in 90..235
             val isMuted = viewType == 1 || viewType == 3 || viewType == 8 || origGray
-            val rowColor = findRowCardColor(view as? View, dark, text)
+            val rowColor = findRowCardColor(view as? View, text)
             val bgColor: Int
             val fgColor: Int
             if (isRecall) {
                 bgColor = rowColor
                 fgColor = scheme.onSurfaceVariant
             } else if (isMuted) {
-                bgColor = if (colorClose(rowColor, TokenMapper.bgCard(dark))) {
+                bgColor = if (colorClose(rowColor, TokenMapper.bgCard())) {
                     scheme.secondaryContainer
                 } else {
-                    TokenMapper.guestBubble(dark)
+                    TokenMapper.guestBubble()
                 }
                 fgColor = scheme.onSurface
             } else {
@@ -5735,13 +5730,13 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     /** 找到附标所在聊天条目的卡片背景色（置顶卡片 / 普通列表）。 */
-    private fun findRowCardColor(view: View?, dark: Boolean, text: CharSequence): Int {
-        if (view == null) return TokenMapper.bgList(dark)
+    private fun findRowCardColor(view: View?, text: CharSequence): Int {
+        if (view == null) return TokenMapper.bgList()
         // 文本变了说明这一行被复用给了别的会话，缓存必须失效
         val textHash = text.hashCode()
         badgeRowCache[view]?.let { if (it.first == textHash) return it.second }
-        val listColor = TokenMapper.bgList(dark)
-        val cardColor = TokenMapper.bgCard(dark)
+        val listColor = TokenMapper.bgList()
+        val cardColor = TokenMapper.bgCard()
         var color = listColor
         var sawAnySurface = false
         var v: View? = view
@@ -6028,7 +6023,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                             val c = chain.getArg(0) as Int
                             val scheme = MonetPalette.palette()
                             if (scheme.isDark && colorLuma(c or 0xFF000000.toInt()) > 140) {
-                                val mapped = TokenMapper.bgCard(true)
+                                val mapped = TokenMapper.bgCard()
                                 if (statusBarLogCount++ < 8) {
                                     Log.i(
                                         TAG,
@@ -6221,7 +6216,7 @@ private fun hookSummaryBadge(module: XposedModule) {
      * 每个分支用的颜色资源不同，其中 `FullWidthWithTransparent` 用的是
      * `R.color.ajr` = `@color/fm` = `#00000000` **全透明**（TIM 有意让下层透出）。
      * 实测该工厂对设置页**每一行**返回同一个颜色（29 次调用全为 `#2B2B34`
-     * = `TokenMapper.bgCard(true)`）→ 同组各行本该同色。
+     * = `TokenMapper.bgCard()`）→ 同组各行本该同色。
      * 但 `AccountManageView` / `SingleLineRedTouchView` 两类行会取到别的颜色。
      * 这里统一到工厂的规范值，**全透明的行原样放过**。
      */
@@ -6233,7 +6228,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val container = d as? DrawableContainer ?: return@runCatching
                 val cur = solidColorOf(container) ?: return@runCatching
                 if (ColorMath.isTransparent(cur)) return@runCatching
-                val want = TokenMapper.bgCard(true)
+                val want = TokenMapper.bgCard()
                 if (ColorMath.opaque(cur) == ColorMath.opaque(want)) return@runCatching
                 if (!BgResolver.isSurfaceColorOf(cur) &&
                     BgResolver.luma(ColorMath.opaque(cur)) > BgResolver.BRIGHT
@@ -6457,7 +6452,7 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun isInsideBubble(v: View?): Boolean {
         val scheme = MonetPalette.palette()
         val selfBg = ColorMath.opaque(scheme.primary)
-        val guestBg = ColorMath.opaque(TokenMapper.guestBubble(true))
+        val guestBg = ColorMath.opaque(TokenMapper.guestBubble())
         var c: View? = v?.parent as? View
         var d = 0
         while (c != null && d < 6) {
@@ -6586,7 +6581,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 if (!isPopupBeakView(v)) return@runCatching
                 val iv = v as ImageView
                 val d = iv.drawable ?: return@runCatching
-                val want = TokenMapper.bgPage(true)
+                val want = TokenMapper.bgPage()
                 ColorMath.recolorInPlace(d, want)
                 runCatching { iv.imageTintList = android.content.res.ColorStateList.valueOf(want) }
                 if (popupBeakLog++ < 6) {
@@ -6633,8 +6628,8 @@ private fun hookSummaryBadge(module: XposedModule) {
                         var result = chain.proceed() as? Drawable
                         runCatching {
                             if (result != null && MonetPalette.isDarkNow()) {
-                                val bg = TokenMapper.bgPage(true)
-                                result!!.mutate()
+                                val bg = TokenMapper.bgPage()
+                                result.mutate()
                                 result.setTint(bg)
                                 Log.i(TAG, "notice bar bg -> #" + Integer.toHexString(bg))
                             }
@@ -6791,7 +6786,7 @@ private fun hookSummaryBadge(module: XposedModule) {
         // ⚠️ 与其他所有"亮底压暗"路径保持一致：**就地改色**，绝不手工 new 一个
         // GradientDrawable 顶上 —— 那会丢掉原 drawable 的圆角/九宫格留白/描边/
         // 多状态（"卡片圆角被削平"就是这么来的）。详见 ColorMath.recolorInPlace。
-        ColorMath.recolorInPlace(d, TokenMapper.bgPage(true))
+        ColorMath.recolorInPlace(d, TokenMapper.bgPage())
         logOnce(
             "thin bright line -> page color on " + v.javaClass.simpleName +
                 " " + v.width + "x" + v.height + " #" + Integer.toHexString(c)
@@ -6815,7 +6810,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (!MonetPalette.isDarkNow()) return@runCatching
                         val d = v.drawable ?: return@runCatching
                         d.mutate()
-                        d.setColorFilter(TokenMapper.bgCard(true), PorterDuff.Mode.SRC_IN)
+                        d.setColorFilter(TokenMapper.bgCard(), PorterDuff.Mode.SRC_IN)
                     }
                 }, 150L)
             }
@@ -6925,7 +6920,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             // 只处理"半透明填充"（TIM 的 fill_standard_* 那种叠加层）；
             // 不透明或全透明的都不碰。
             if (alpha == 0 || alpha >= 0x80) return@runCatching
-            val want = TokenMapper.inputBg(true)
+            val want = TokenMapper.inputBg()
             // ⚠️ 不能只用 recolorInPlace：它走 filter/tint，而 **GradientDrawable 的
             // tint 会保留填充自身的 alpha** —— 实测改完仍是"#3D0D23 @ 8%"叠出来的
             // #4F162F，屏幕上等于没改。这里对形状 drawable **直接改填充色**（不透明），
@@ -7029,8 +7024,8 @@ private fun hookSummaryBadge(module: XposedModule) {
         if (!BgResolver.isLightLeftover(c, true)) return
         // ⚠️ 输入框容器另走一档：TIM 浅色下"页面底"和"输入框底"都是浅灰，
         // 一律压成页面底色会让输入框与弹窗/卡片割裂（转发弹窗实测）。语义上它该用 INPUT_BG。
-        val targetBg = if (isInputFieldHost(v)) TokenMapper.inputBg(true)
-        else TokenMapper.bgPage(true)
+        val targetBg = if (isInputFieldHost(v)) TokenMapper.inputBg()
+        else TokenMapper.bgPage()
         // ⚠️ 保留原 drawable 的**形状**，只改颜色 —— 绝不能手工造一个
         // GradientDrawable 去替换：那会丢掉圆角、九宫格留白、描边与多状态
         // （历史上"卡片圆角被削平"就是这个原因）。双写 filter+tint 的原因见
@@ -7107,7 +7102,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             // ① 已经确认它的背景是**皮肤引擎的九宫格**，换成普通矩形会丢掉
             // 九宫格的拉伸留白与 insets（提示条文字贴边/变形），而且与
             // fixTinySolidBg / fixThinBrightLine 的做法自相矛盾。
-            v.background?.let { ColorMath.recolorInPlace(it, TokenMapper.bgPage(true)) }
+            v.background?.let { ColorMath.recolorInPlace(it, TokenMapper.bgPage()) }
         }
         // ② 里面的图标 -> 亮色。图标可能是 ImageView，也可能是 TextView 的
         //    drawableLeft（"文件+波纹"那个图标就在文字左边），两种都覆盖。
@@ -7130,7 +7125,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                                 d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
                             }
                         }
-                        is TextView -> child.compoundDrawables?.forEach { d ->
+                        is TextView -> child.compoundDrawables.forEach { d ->
                             if (d != null && d.colorFilter == null && isMonochromeIcon(d)) {
                                 d.mutate()
                                 d.setColorFilter(scheme.onSurface, PorterDuff.Mode.SRC_IN)
@@ -7337,7 +7332,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         mapped = if (isSchemeColor(color)) {
                             color
                         } else {
-                            TokenMapper.inlineBgColor(color, dark) ?: color
+                            TokenMapper.inlineBgColor(color) ?: color
                         }
                     }
                     if (dark && mapped != color && (color and 0x00FFFFFF) == 0x00FFFFFF &&
@@ -7433,7 +7428,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             if (original == 0) return false
             // 已经是莫奈配色方案里的颜色（说明已被资源名正确染过），不再二次映射
             if (isSchemeColor(original)) return true
-            val mapped = TokenMapper.bgColorForDrawable(original, dark) ?: return false
+            val mapped = TokenMapper.bgColorForDrawable(original) ?: return false
             if (mapped != original) {
                 drawable.mutate()
                 drawable.color = mapped
@@ -7446,7 +7441,7 @@ private fun hookSummaryBadge(module: XposedModule) {
             val solid = runCatching { drawable.color?.defaultColor }.getOrNull()
             if (solid != null) {
                 if (isSchemeColor(solid)) return true
-                val mapped = TokenMapper.bgColorForDrawable(solid, dark) ?: return false
+                val mapped = TokenMapper.bgColorForDrawable(solid) ?: return false
                 if (mapped != solid) {
                     drawable.mutate()
                     drawable.setColor(mapped)
@@ -7469,7 +7464,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 val m = if (isSchemeColor(c)) {
                     c
                 } else {
-                    TokenMapper.bgColorForDrawable(c, dark) ?: c
+                    TokenMapper.bgColorForDrawable(c) ?: c
                 }
                 out[i] = m
                 if (m != c) changed = true
@@ -7527,7 +7522,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                 }
                 return true
             }
-            val mapped = TokenMapper.bgColorForDrawable(dominant, dark) ?: return false
+            val mapped = TokenMapper.bgColorForDrawable(dominant) ?: return false
             if (mapped != dominant) {
                 drawable.mutate()
                 drawable.colorFilter = PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN)
@@ -7545,7 +7540,7 @@ private fun hookSummaryBadge(module: XposedModule) {
         if (drawable is android.graphics.drawable.NinePatchDrawable) {
             if (drawable.colorFilter != null) return true
             val dominant = renderSample(drawable) ?: return false
-            val mapped = TokenMapper.inlineBgColor(dominant, dark) ?: return false
+            val mapped = TokenMapper.inlineBgColor(dominant) ?: return false
             if (mapped != dominant) {
                 drawable.mutate()
                 drawable.colorFilter = PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN)
@@ -7611,12 +7606,12 @@ private fun hookSummaryBadge(module: XposedModule) {
 
     /** 位图背景主色 → 目标色：红色系（未读数字气泡等红九宫格）→ primary，
      *  其余走既有内联规则（白→卡片色阶、蓝→primary、灰保留）。 */
-    private fun mappedBitmapBgColor(dominant: Int, dark: Boolean): Int? {
+    private fun mappedBitmapBgColor(dominant: Int): Int? {
         val opaque = opaqueColor(dominant)
         if (isErrorRed(opaque)) {
             return MonetPalette.palette().primary
         }
-        return TokenMapper.inlineBgColor(opaque, dark)
+        return TokenMapper.inlineBgColor(opaque)
     }
 
     private fun tintSkinDrawableByBitmap(drawable: Drawable?): Boolean {
@@ -7644,10 +7639,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     val dominant = sampleBitmapColor(bmpField.get(state) as? Bitmap) ?: return false
                     val opaqueD2 = opaqueColor(dominant)
                     if (hadFilterB && !isErrorRed(opaqueD2)) return true
-                    val mapped = mappedBitmapBgColor(
-                        dominant,
-                        MonetPalette.isDarkNow()
-                    ) ?: return false
+                    val mapped = mappedBitmapBgColor(dominant) ?: return false
                     paint.setColorFilter(PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN))
                     drawable.invalidateSelf()
                     logOnce("skin bitmap bg #${Integer.toHexString(dominant)} -> #${Integer.toHexString(mapped)}")
@@ -7676,10 +7668,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     // 带既有滤色但滤色非红：只有当素材本身是红色时才覆写，
                     // 避免二次染坏白/灰皮肤图标。
                     if (hadFilter && !isErrorRed(opaqueD)) return true
-                    val mapped = mappedBitmapBgColor(
-                        dominant,
-                        MonetPalette.isDarkNow()
-                    ) ?: return false
+                    val mapped = mappedBitmapBgColor(dominant) ?: return false
                     if (paint != null) {
                         paint.setColorFilter(PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN))
                     } else {
@@ -7694,10 +7683,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                         ?.invoke(drawable) as? Paint ?: return false
                     if (paint.colorFilter != null) return true
                     val dominant = renderSample(drawable) ?: return false
-                    val mapped = mappedBitmapBgColor(
-                        dominant,
-                        MonetPalette.isDarkNow()
-                    ) ?: return false
+                    val mapped = mappedBitmapBgColor(dominant) ?: return false
                     paint.setColorFilter(PorterDuffColorFilter(mapped, PorterDuff.Mode.SRC_IN))
                     drawable.invalidateSelf()
                     logOnce("ninepatch bg #${Integer.toHexString(dominant)} -> #${Integer.toHexString(mapped)}")
@@ -7776,25 +7762,6 @@ private fun hookSummaryBadge(module: XposedModule) {
     // AIO 气泡文字（修复深色模式下“浅色气泡 + 浅色文字”的对比度问题）
     // ------------------------------------------------------------------
 
-    // ------------------------------------------------------------------
-    // 聊天输入框（“说点什么…”）：背景色跟随对方消息气泡（guestBubble），
-    // 绕开 TIM 皮肤系统把它染成主色（深色下 #6CD6FF 过亮）的问题。
-    // 只作用于 AIOEditText 自身（输入框），旁边 + / 语音 / 表情所在
-    // 的整条输入栏背景不在本 hook 范围，保持原样。
-    // ------------------------------------------------------------------
-
-    
-/**
- * 终极兜底：直接拦 `Paint.setColor`。
- *
- * 前面把 `drawRoundRect` / `drawRect` / `drawPath` 都挂了一遍仍未命中 ——
- * 说明密码格的实际画法不在这些入口里（实现与反编译那段有出入）。
- * 但**无论怎么画，填色前必然要设置 Paint 的颜色**，所以在 `setColor` 上按
- * 特征色 `#FFEDEDED` 识别是最可靠的一层。
- *
- * ⚠️ 这是**热方法**（每帧大量调用），所以：不匹配颜色时只做一次 int 比较、
- * 立即 `proceed()`，不做任何其它判断。仅在命中那个硬编码色时才改写参数。
- */
 /**
  * 支付密码格子的**身份路径**：hook 两个 `init(Context, AttributeSet)`，
  * 在它自己设完颜色之后，把它自己的两个 Paint 字段改成我们的配色。
@@ -7828,13 +7795,13 @@ private fun hookPayPwdPaints(module: XposedModule, cl: ClassLoader) {
                             val fg = cachedField(cls, "mPaintForeground")?.also { it.isAccessible = true }
                                 ?.get(chain.thisObject) as? Paint
                             val scheme = MonetPalette.palette()
-                            bg?.setColor(TokenMapper.guestBubble(true))
+                            bg?.setColor(TokenMapper.guestBubble())
                             fg?.setColor(scheme.primary)
                             if (payPwdLog++ < 8) {
                                 Log.i(
                                     TAG,
                                     "pay pwd paints -> grid #" +
-                                        Integer.toHexString(TokenMapper.guestBubble(true)) +
+                                        Integer.toHexString(TokenMapper.guestBubble()) +
                                         " dot #" + Integer.toHexString(scheme.primary)
                                 )
                             }
@@ -7846,6 +7813,17 @@ private fun hookPayPwdPaints(module: XposedModule, cl: ClassLoader) {
     }
 }
 
+/**
+ * 终极兜底：直接拦 `Paint.setColor`。
+ *
+ * 前面把 `drawRoundRect` / `drawRect` / `drawPath` 都挂了一遍仍未命中 ——
+ * 说明密码格的实际画法不在这些入口里（实现与反编译那段有出入）。
+ * 但**无论怎么画，填色前必然要设置 Paint 的颜色**，所以在 `setColor` 上按
+ * 特征色 `#FFEDEDED` 识别是最可靠的一层。
+ *
+ * ⚠️ 这是**热方法**（每帧大量调用），所以：不匹配颜色时只做一次 int 比较、
+ * 立即 `proceed()`，不做任何其它判断。仅在命中那个硬编码色时才改写参数。
+ */
 private fun hookPayPwdGridSetColor(module: XposedModule) {
     findMethod(Paint::class.java, setOf("setColor"), INT_TYPE)?.let { mm ->
         logOnce("hook installed: Paint.setColor (pay pwd grid)")
@@ -7856,7 +7834,7 @@ private fun hookPayPwdGridSetColor(module: XposedModule) {
                 c == PAY_PWD_GRID_COLOR -> {
                     // 6 个密码格的底（#FFEDEDED 纯白）。按**精确色值**命中（这个值很特殊），
                     // 作为 init 那条身份路径之外的兜底保留。
-                    val mapped = TokenMapper.guestBubble(true)
+                    val mapped = TokenMapper.guestBubble()
                     if (payPwdLog++ < 4) {
                         Log.i(TAG, "pay pwd grid painted -> #" + Integer.toHexString(mapped))
                     }
@@ -7867,6 +7845,8 @@ private fun hookPayPwdGridSetColor(module: XposedModule) {
                 // —— 只要弹窗在屏上，窗口就一直开着，同进程任何 setColor(#333333)
                 // （金额/标题/自绘图形）都会被换成 primary。现在改在对象身份上做：
                 // 见 hookPayPwdPaints()（hook 两个 init，直接写它自己的两个 Paint 字段）。
+                // 圆点的原值（仅供查证）：
+                //   DownloadCardView.COLOR_BUTTON_BACKGROUND_DARK = -13421773 = #FF333333
                 else -> chain.proceed()
             }
         }
@@ -7875,15 +7855,6 @@ private fun hookPayPwdGridSetColor(module: XposedModule) {
 
 /** 密码格底色的硬编码值：`PasswordEditText.init()` 里的 `-1184275`。 */
 private const val PAY_PWD_GRID_COLOR = 0xFFEDEDED.toInt()
-
-/**
- * 密码圆点的硬编码值：`DownloadCardView.COLOR_BUTTON_BACKGROUND_DARK = -13421773`
- * = `#FF333333`（真机圆点就是这个色，压在 #2B2B34 的格子上几乎看不见）。
- * ⚠️ 现在**只作记录**：不再按这个色值匹配（那是通用深灰，会误伤别处），
- * 圆点改走身份路径 `hookPayPwdPaints()`。
- */
-@Suppress("unused")
-private const val PAY_PWD_DOT_COLOR = 0xFF333333.toInt()
 
 
 /**
@@ -8004,7 +7975,7 @@ private fun fixAvIconTint(csl: ColorStateList): ColorStateList? {
         val c = colors[i]
         // 面色判据：不带 alpha 的浅色被映射后落进 surfaceContainer 家族。
         // 用 BgResolver 的"是不是一块面"判据，保持判据单一来源。
-        if (BgResolver.isSurfaceColorOf(c) || c == TokenMapper.bgPage(true)) {
+        if (BgResolver.isSurfaceColorOf(c) || c == TokenMapper.bgPage()) {
             changed = true
             ColorMath.keepAlpha(onSurface, c)
         } else {
@@ -8038,6 +8009,12 @@ private fun fixAvIconTint(csl: ColorStateList): ColorStateList? {
  */
 private val AV_ICON_TINT_COLORS = setOf("rl", "rm", "rn", "qm", "qn", "amp", "b0x")
 
+// ------------------------------------------------------------------
+// 聊天输入框（“说点什么…”）：背景色跟随对方消息气泡（guestBubble），
+// 绕开 TIM 皮肤系统把它染成主色（深色下 #6CD6FF 过亮）的问题。
+// 只作用于 AIOEditText 自身（输入框），旁边 + / 语音 / 表情所在
+// 的整条输入栏背景不在本 hook 范围，保持原样。
+// ------------------------------------------------------------------
 private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         val cls = try {
             Class.forName("com.tencent.mobileqq.aio.input.edit.AIOEditText", false, cl)
@@ -8053,7 +8030,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         //     就等于"输入框和弹窗同色"、整个框看不见（用户报"输入框变成背景色"）
         //     → 这里改用深一档的 `INPUT_BG`(surfaceContainerHigh #3D0D23) 做**内嵌**输入框。
         val inputColor: () -> Int = {
-            TokenMapper.guestBubble(MonetPalette.isDarkNow())
+            TokenMapper.guestBubble()
         }
         onSetBackgroundArg { view, _ ->
             if (!cls.isInstance(view)) return@onSetBackgroundArg null
@@ -8421,14 +8398,13 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
     private fun forceSingleLineBadge(view: Any?, text: String?, setTextColorMethod: Method?) {
         if (view == null) return
         try {
-            val dark = MonetPalette.isDarkNow()
             val scheme = MonetPalette.palette()
             val v = view as? View
             when (summaryBadgeKind(text)) {
                 SummaryBadgeKind.RECALL -> {
                     tintPillBackground(
                         v,
-                        findRowCardColor(v, dark, text ?: ""),
+                        findRowCardColor(v, text ?: ""),
                         createIfMissing = false
                     )
                     setTextColorMethod?.invoke(view, scheme.onSurfaceVariant)
@@ -8753,7 +8729,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         val keys = json.keys()
                         while (keys.hasNext()) {
                             val key = keys.next() as String
-                            var mapped = mapTokenString(key, json.optString(key), dark)
+                            var mapped = mapTokenString(key, json.optString(key))
                             // 部分 Ark 卡片直接用纯白背景 token；深色下归一为卡片色。
                             // 仅对背景/填充/卡片类 key 兜底，避免误改白色文字与描边。
                             val keyL = key.lowercase()
@@ -8767,7 +8743,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                         Color.parseColor(part.trim())
                                     }.getOrNull()
                                     if (color != null && BgResolver.isNearWhite(color)) {
-                                        colorToHex(TokenMapper.bgCard(true))
+                                        colorToHex(TokenMapper.bgCard())
                                     } else {
                                         part
                                     }
@@ -9266,7 +9242,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
         )
 
-    private fun hookFileDownloadIcons(module: XposedModule) {
+    private fun hookFileDownloadIcons() {
         runCatching {
             onViewAttached { view ->
                 val name = view.javaClass.name
@@ -9452,7 +9428,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             val onPrimaryPill = view?.background?.let { bg ->
                                 gradientColorOf(bg) == scheme.primary ||
                                     (bg is ColorDrawable && (runCatching {
-                                        (bg as? ColorDrawable)?.let { colorOfColorDrawable(it) }
+                                        colorOfColorDrawable(bg)
                                     }.getOrNull()?.let { it or 0xFF000000.toInt() }) ==
                                         (scheme.primary or 0xFF000000.toInt()))
                             } ?: false
@@ -9499,11 +9475,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             val tv = chain.getArg(0) as? TextView ?: return@intercept result
                             val resId = chain.getArg(1) as Int
                             val name = entryName(tv.resources, resId)
-                            val mapped = TokenMapper.mapColor(
-                                name,
-                                tv.currentTextColor,
-                                MonetPalette.isDarkNow()
-                            )
+                            val mapped = TokenMapper.mapColor(name, tv.currentTextColor)
                             tv.setTextColor(mapped)
                         } catch (t: Throwable) {
                             Log.w(TAG, "search item text failed", t)
@@ -9538,7 +9510,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                     module.hook(method).intercept { chain ->
                         val result = chain.proceed()
                         if (result is Int) {
-                            TokenMapper.mapColor(tokenName, result, MonetPalette.isDarkNow())
+                            TokenMapper.mapColor(tokenName, result)
                         } else {
                             result
                         }
@@ -9831,12 +9803,11 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         // 刺眼；未选中的 1dp 描边也是同一个色。这里按 drawable 名重建两态：
         // 选中=低对比容器色，未选中=页面底+同色暗描边。
         if (name.contains("qui_header_tab_")) {
-            val tabDark = MonetPalette.isDarkNow()
             val sel = name.contains("selected")
-            val line = TokenMapper.outlineVariant(tabDark)
+            val line = TokenMapper.outlineVariant()
             val gd = GradientDrawable()
             gd.shape = GradientDrawable.RECTANGLE
-            gd.setColor(if (sel) line else TokenMapper.bgPage(tabDark))
+            gd.setColor(if (sel) line else TokenMapper.bgPage())
             // 原版只有"未选中"那态带描边（selected 只有 <solid>）。
             // 宽度用 1px：TIM 自己做了密度适配，用系统 density 去算 1dp 会偏粗。
             if (!sel) gd.setStroke(1, line)
@@ -9883,7 +9854,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         // qui_/skin_ 等前缀，落到早退里会被原样放行（这正是它们一直没被染的原因）。
         if (name == "dwa") {
             // 密码格容器底：白 → 页面面色，与输入框观感一致
-            ColorMath.recolorInPlace(drawable, TokenMapper.bgPage(true))
+            ColorMath.recolorInPlace(drawable, TokenMapper.bgPage())
             if (payPwdLog++ < 4) {
                 Log.i(TAG, "pay pwd grid bg $name -> page")
             }
@@ -9943,7 +9914,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             !name.contains("qq_profilecard_info_bg") &&
             !name.contains("qq_profilecard_foot_bg")
         ) return drawable
-        val color = TokenMapper.tintColorFor(name, MonetPalette.isDarkNow())
+        val color = TokenMapper.tintColorFor(name)
         if (color == null) {
             if (name.contains("bg_") || name.contains("card") || name.contains("tab_") ||
                 name.contains("check") || name.contains("background")
@@ -10324,7 +10295,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
     private fun tintInlineDrawable(drawable: Drawable, typedValue: TypedValue?): Drawable {
         if (isThirdPartyUiActive()) return drawable
         val inlineColor = typedValue?.data ?: return drawable
-        val mapped = TokenMapper.inlineBgColor(inlineColor, MonetPalette.isDarkNow())
+        val mapped = TokenMapper.inlineBgColor(inlineColor)
             ?: return drawable
         return try {
             if (drawable is android.graphics.drawable.ColorDrawable) {
@@ -10561,8 +10532,8 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                     // 大片白底 + 品牌蓝顶栏。按值兜底(只认精确品牌蓝与无彩色浅色)。
                     if (type == TypedValue.TYPE_STRING) {
                         val dark = MonetPalette.isDarkNow()
-                        val mapped = TokenMapper.inlineBgColor(result, dark)
-                            ?: darkTextFallback(result, dark)
+                        val mapped = TokenMapper.inlineBgColor(result)
+                            ?: darkTextFallback(result)
                             ?: result
                         if (mapped != result && attrColorLogCount++ < 30) {
                             Log.i(
@@ -10592,7 +10563,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             // 归一成 onSurface(文字色)，结果白底依旧是白的 ——
                             // 钱包页那片纯白就是这么来的。
                             opaque == 0xFFFFFFFF.toInt() -> {
-                                val mapped = TokenMapper.inlineBgColor(result, dark)
+                                val mapped = TokenMapper.inlineBgColor(result)
                                 if (mapped != null && mapped != result) {
                                     logOnce(
                                         "inline white -> #" + Integer.toHexString(mapped)
@@ -10610,7 +10581,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             }
                             // 其余:仅深色模式下的灰阶(白/浅灰底)做面色映射,
                             // 彩色一律保持原样(此前按颜色值盲目映射会改成更浅的面色)
-                            dark -> TokenMapper.inlineBgColor(result, true) ?: result
+                            dark -> TokenMapper.inlineBgColor(result) ?: result
                             else -> result
                         }
                     }
@@ -10672,7 +10643,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
     }
 
     /** 深色配色下的纯黑/近黑 -> onSurface（TIM 浅色主题遗留的文字色），否则 null。 */
-    private fun darkTextFallback(color: Int, dark: Boolean): Int? {
+    private fun darkTextFallback(color: Int): Int? {
         val scheme = MonetPalette.palette()
         if (!scheme.isDark) return null
         val op = color or 0xFF000000.toInt()
@@ -10690,7 +10661,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         // 否则会被下面的"纯黑 -> onSurface"兜底提亮成**不透明的亮色**
         // （手势密码九宫格的圆点外圈 ju/jr 就是全透明占位）。
         if ((color ushr 24) == 0) return color
-        val dark = MonetPalette.isDarkNow()
         // 资源名在 Android 里强制小写，直接 startsWith 免去每次 lowercase 分配。
         if (whiteSrcLogCount < 40) logWhiteSource("Resources.getColor name=$name", color)
         // 手势密码/图案锁页的九宫格：未选中的点用 qui_common_icon_primary 作填充，
@@ -10700,7 +10670,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         if (page != null && page.contains("GesturePWD") && name != null &&
             name.contains("icon_primary")
         ) {
-            return TokenMapper.outlineVariant(dark)
+            return TokenMapper.outlineVariant()
         }
         val knownName = name != null &&
             (name.startsWith("qui_") ||
@@ -10719,7 +10689,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             // 前缀，于是整页保持原版 —— 大片白底 + 品牌蓝顶栏。
             // 这里按**颜色值**兜底；规则很保守(只认精确品牌蓝常量与无彩色浅色)，
             // 见 TokenMapper.inlineBgColor。
-            TokenMapper.inlineBgColor(color, dark)?.let { return it }
+            TokenMapper.inlineBgColor(color)?.let { return it }
             // 深色配色下的纯黑/近黑：TIM 浅色主题留下的文字色，在莫奈深色面上
             // 几乎看不见(钱包设置页"金额隐私保护/安全锁/服务管理"就是)，
             // 按文字色归一为 onSurface。只认无彩色且很暗的，彩色一律不动。
@@ -10745,14 +10715,14 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             name.contains("separator") || isLineName(name) ||
                             name.contains("border"))
                     ) {
-                        return TokenMapper.outlineVariant(dark)
+                        return TokenMapper.outlineVariant()
                     }
                     return scheme.onSurface
                 }
             }
             return color
         }
-        val mapped = TokenMapper.mapColor(name, color, dark)
+        val mapped = TokenMapper.mapColor(name, color)
         if (name.startsWith("qui_") && name.contains("bg_") && mapped != color) {
             logOnce("color $name: #${Integer.toHexString(color)} -> #${Integer.toHexString(mapped)}")
         }
@@ -10867,7 +10837,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         // 变化时自动失效。
                         tokenColorMemoized(resId, themeId == TOKEN_NIGHT) {
                             val name = entryName(ctx?.resources, resId)
-                            TokenMapper.mapColor(name, original, themeId == TOKEN_NIGHT)
+                            TokenMapper.mapColor(name, original)
                         }
                     } catch (t: Throwable) {
                         Log.e(TAG, "map getQuiColor failed", t)
@@ -10925,7 +10895,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         val resId = chain.getArg(0) as Int
                         val resources = resourcesOf(chain.thisObject)
                         val name = entryName(resources, resId)
-                        TokenMapper.mapColor(name, result, MonetPalette.isDarkNow())
+                        TokenMapper.mapColor(name, result)
                     } catch (t: Throwable) {
                         Log.e(TAG, "map SkinEngine.getColor failed", t)
                         result
@@ -11020,11 +10990,10 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         quiTokenCache?.let { cached ->
                             if (quiTokenCacheGen == generation) return@intercept cached
                         }
-                        val dark = MonetPalette.isDarkNow()
                         val out = HashMap<String, String>(map.size)
                         for ((key, value) in map) {
                             if (key !is String || value !is String) continue
-                            out[key] = mapTokenString(key, value, dark)
+                            out[key] = mapTokenString(key, value)
                         }
                         // 采样常见标签/文字键（WebView 群公告列表等跨端页面消费此表）
                         if (quiTokenSampleLogCount++ < 8) {
@@ -11079,11 +11048,10 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                 tintMapCache[clsName]?.let { cached ->
                                     if (cached.first == generation) return@intercept cached.second
                                 }
-                                val dark = MonetPalette.isDarkNow()
                                 val out = HashMap<String, String>(map.size)
                                 for ((key, value) in map) {
                                     if (key !is String || value !is String) continue
-                                    out[key] = mapTokenString(key, value, dark)
+                                    out[key] = mapTokenString(key, value)
                                 }
                                 val sample = out["bg_nav_primary"]
                                 logOnce(
@@ -11135,7 +11103,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         }
     }
 
-    private fun mapTokenString(key: String, value: String, dark: Boolean): String {
+    private fun mapTokenString(key: String, value: String): String {
         val parts = value.split(",")
         val mapped = parts.map { part ->
             val trimmed = part.trim()
@@ -11146,7 +11114,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
             }
             // 跨端页面用 mapPageToken：同一个 token 名在页面里的语义可能与原生不同
             // （bg_top_light 在群公告 H5 里是卡片底，原生侧是顶栏底）
-            colorToHex(TokenMapper.mapPageToken(key, color, dark))
+            colorToHex(TokenMapper.mapPageToken(key, color))
         }
         return mapped.joinToString(",")
     }
@@ -11194,7 +11162,7 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
         }
 
         val mapped = IntArray(colors.size) { index ->
-            TokenMapper.mapColor(name, colors[index], dark)
+            TokenMapper.mapColor(name, colors[index])
         }
         val out = newSkinCsl(specs, mapped)
         cslCache[cacheKey] = CachedCsl(generation, out)

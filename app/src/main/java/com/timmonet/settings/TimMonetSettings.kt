@@ -10,13 +10,17 @@ import com.timmonet.ui.theme.ColorMode
 /**
  * 模块设置（颜色模式 / 种子色 / 色彩风格 / 色彩标准）。
  *
- * 模块自己的进程读写 SharedPreferences；TIM 进程通过 [SettingsProvider]
- * 读取同一份数据，实现“改完直接生效”。
+ * 模块自己的进程读写 SharedPreferences；TIM 进程通过 LSPosed 的
+ * `XposedModule.getRemotePreferences([REMOTE_PREFS_NAME])` 读到同一份数据
+ * （见 `core/SettingsBridge`），实现"改完直接生效"。
+ *
+ * ⚠️ 文件里**没有** ContentProvider：历史上曾用 `serialize()` / `parse()` 走
+ * provider 传文本，那条路径连同 `PROVIDER_AUTHORITY` 一起删掉了（清单里从没有
+ * 过 provider 声明）。不要再把文本序列化加回来。
  */
 object TimMonetSettings {
 
     const val PREFS_NAME = "tim_monet"
-    const val PROVIDER_AUTHORITY = "com.timmonet.settings"
 
     private const val KEY_COLOR_MODE = "colorMode"
     private const val KEY_KEY_COLOR = "keyColor"
@@ -99,44 +103,4 @@ object TimMonetSettings {
 
     fun revision(prefs: SharedPreferences): Long = prefs.getLong(KEY_REVISION, 0L)
 
-    /** 序列化为 key=value 行文本，供 ContentProvider 跨进程传输。 */
-    fun serialize(context: Context): String {
-        val settings = read(context)
-        return buildString {
-            append(KEY_COLOR_MODE).append('=').append(settings.colorMode.value).append('\n')
-            append(KEY_KEY_COLOR).append('=').append(settings.keyColor).append('\n')
-            append(KEY_PALETTE_STYLE).append('=').append(settings.paletteStyle.name).append('\n')
-            append(KEY_COLOR_SPEC).append('=').append(settings.colorSpec.name).append('\n')
-            append(KEY_AMOLED).append('=').append(settings.amoledBlack)
-        }
-    }
-
-    /** TIM 进程解析 provider 返回的文本。 */
-    fun parse(text: String?): AppSettings {
-        if (text.isNullOrBlank()) return defaults()
-        val map = HashMap<String, String>()
-        for (line in text.lines()) {
-            val index = line.indexOf('=')
-            if (index > 0) map[line.substring(0, index).trim()] = line.substring(index + 1).trim()
-        }
-        var mode = ColorMode.fromValue(map[KEY_COLOR_MODE]?.toIntOrNull() ?: 0)
-        var amoled = map[KEY_AMOLED]?.toBooleanStrictOrNull() ?: false
-        if (mode == ColorMode.DARK_AMOLED) {
-            mode = ColorMode.DARK
-            amoled = true
-        }
-        return AppSettings(
-            colorMode = mode,
-            keyColor = map[KEY_KEY_COLOR]?.toIntOrNull() ?: 0,
-            paletteStyle = runCatching {
-                PaletteStyle.valueOf(map[KEY_PALETTE_STYLE] ?: PaletteStyle.TonalSpot.name)
-            }.getOrDefault(PaletteStyle.TonalSpot),
-            colorSpec = runCatching {
-                ColorSpec.SpecVersion.valueOf(
-                    map[KEY_COLOR_SPEC] ?: ColorSpec.SpecVersion.SPEC_2025.name
-                )
-            }.getOrDefault(ColorSpec.SpecVersion.SPEC_2025),
-            amoledBlack = amoled,
-        )
-    }
 }
