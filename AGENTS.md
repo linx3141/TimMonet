@@ -124,6 +124,11 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
   `dispatchDraw`、`setBackground`、`onAttachedToWindow`、`getColor`。
 - **新增 attach 处理器**用 `onViewAttached { v -> ... }` 注册，**不要**再单独 hook
   `View.onAttachedToWindow`（注册顺序 = 执行顺序）。
+  ⚠️ **能判断类型/类名/id 的，一律用 `onViewAttachedIf(gate) { v -> ... }`**：
+  分发器对每个 attach 的 View 跑全部处理器，闸门是纯身份判断（不匹配连处理器都不进）。
+  实测 21 个处理器 × 每个 View 在 10 秒滑动里 = 68,586 次调用 / 主线程 1.72 秒
+  （见「坑 31」）。热路径上禁止 `text.toString()`、禁止对皮肤 drawable 反复
+  `setColorFilter`（每次一次位图重渲染）。
 - **新增"替换 setBackground 入参"**用 `onSetBackgroundArg { v, incoming -> ... }`，
   返回非 null 的 drawable 才会替换（第一个非 null 生效）；返回 `incoming` 本身=
   只改色不换对象。
