@@ -1842,11 +1842,11 @@ private fun looksLikeAccountText(s: String): Boolean {
 /** 长数字文本(QQ 号等)在 attach 时兜底:布局里静态写的文本不经过
  *  setText,只在挂载时补齐染色(不透明 onSurface)。 */
 private fun hookLongNumberText() {
-    onViewAttached { tv ->
-        if (tv !is TextView) return@onViewAttached
+    onViewAttachedIf({ it is TextView }) { v ->
+        val tv = v as TextView   // 闸门已保证类型，这里只是给编译器看
         // 第三方模块注入界面:整体跳过染色
-        if (isThirdPartyUiActive()) return@onViewAttached
-        val t = tv.text?.toString()?.trim() ?: return@onViewAttached
+        if (isThirdPartyUiActive()) return@onViewAttachedIf
+        val t = tv.text?.toString()?.trim() ?: return@onViewAttachedIf
         if (looksLikeAccountText(t) && !isInProfileCardUi(tv)) {
             runCatching {
                 val scheme = MonetPalette.palette()
@@ -2071,11 +2071,11 @@ private fun fixTitleBarIcon(v: View) {
 }
 
 private fun hookTitleBarLeftButton() {
-    onViewAttached { v ->
+    // 预筛挪到闸门里：只有 app 资源 id(0x7f...) 才需要查名字；entryName() 自带缓存，
+    // 避免每次 attach 都走 Resources 反射
+    onViewAttachedIf({ v -> v.id != View.NO_ID && (v.id ushr 24) == 0x7f }) { v ->
         val id = v.id
-        // 预筛：只有 app 资源 id(0x7f...) 才去查名字；entryName() 自带缓存，
-        // 避免每次 attach 都走 Resources 反射
-        if (id != View.NO_ID && (id ushr 24) == 0x7f && !isThirdPartyUiActive()) {
+        if (!isThirdPartyUiActive()) {
             val nm = entryName(v.resources, id)
             if (nm == "ivTitleBtnLeft" || nm == "ivTitleBtnRightImage") {
                 runCatching { fixTitleBarIcon(v) }
@@ -2085,10 +2085,8 @@ private fun hookTitleBarLeftButton() {
 }
 
 private fun hookPlusPanelPlate() {
-    onViewAttached { v ->
-        if (panelSeen && v is FrameLayout) {
-            runCatching { fixPlusItemPlate(v) }
-        }
+    onViewAttachedIf({ panelSeen && it is FrameLayout }) { v ->
+        runCatching { fixPlusItemPlate(v) }
     }
 }
 
@@ -2162,6 +2160,9 @@ private fun hookPlusPanelIcons(module: XposedModule, cl: ClassLoader) {
 
 /** QQ 快捷菜单（长按消息）主题化：把三个 QQCustomMenu* 容器类解析出来，命中任一
  *  的 View 挂 onAttachedToWindow 后调度整棵子树染色。 */
+/** 会话行滑动/长按菜单按钮的文字（用于无分配比较）。 */
+private val MENU_LABELS = setOf("删除", "置顶", "取消置顶", "标为未读", "标为已读")
+
 private fun hookQuickMenuTheme(cl: ClassLoader) {
     val classes = QUICK_MENU_UI_CLASSES.mapNotNull { name ->
         runCatching { Class.forName(name, false, cl) }.getOrNull()
@@ -2170,67 +2171,85 @@ private fun hookQuickMenuTheme(cl: ClassLoader) {
         Log.w(TAG, "QQCustomMenu* layouts not found")
         return
     }
-    onViewAttached { view ->
+    // 菜单本体：类实例闸门（只有这些类才进处理器）
+    onViewAttachedIf({ v -> classes.any { it.isInstance(v) } }) { view ->
+        // 菜单 attach 即染色一次(原 40 次/10s 轮跑经实验证明非必需)
+        runCatching { forceMonetQuickMenu(view) }
+    }
+    // 会话行滑动/长按菜单按钮：渲染器 chats.core.adapter.c.a.c
+    // 代码创建(setTextColor(-1) 白字 + 彩色 webp 底)。
+    // 左滑(SwipeMenuLayout 内) → primary 底+onPrimary 字；
+    // 长按正上方的横排文字浮层(无彩色底) → 文字染 onSurface，
+    // 复用重设白色时延时补染。
+    //
+    // ⚠️ 闸门里先卡 TextView + 文本长度：原来对**每个 attach 的 TextView** 都做
+    // `text.toString().trim()`（聊天行的 text 是带 emoji span 的 Spannable，
+    // toString 要整串拷贝）—— 实测这条处理器在 10 秒滑动窗口里吃掉 attach 路径
+    // 58% 的时间（580ms/1.0s），而菜单按钮文字只有 2~5 个字。
+    onViewAttachedIf({ v -> v is TextView && (v.text?.length ?: 0) in 1..8 }) { view ->
         runCatching {
-                    if (classes.any { it.isInstance(view) }) {
-                        // 菜单 attach 即染色一次(原 40 次/10s 轮跑经实验证明非必需)
-                        runCatching {
-                            forceMonetQuickMenu(view)
+            val tv = view as TextView
+            val cs = tv.text ?: return@runCatching
+            // ⚠️ 不要在热路径上 `text.toString()`：聊天行的 text 是带 span 的
+            // Spannable，toString 等于整串拷贝 + trim 再一次拷贝。菜单文字只有
+            // 2~5 个字，用 TextUtils.equals 直接逐字符比 CharSequence（零分配）。
+            // 仅当首尾真带空白时（罕见）才退回 trim 版本。
+            val labels = MENU_LABELS
+            var menuTxt: String? = null
+            for (l in labels) {
+                if (android.text.TextUtils.equals(cs, l)) {
+                    menuTxt = l
+                    break
+                }
+            }
+            if (menuTxt == null && cs.isNotEmpty() &&
+                (cs[0].isWhitespace() || cs[cs.length - 1].isWhitespace())
+            ) {
+                val trimmed = cs.toString().trim()
+                if (trimmed in labels) menuTxt = trimmed
+            }
+            if (menuTxt == null) return@runCatching
+            var inSwipe = false
+            var p0: android.view.ViewParent? = tv.parent
+            var d0 = 0
+            while (p0 != null && d0 < 6) {
+                if (p0.javaClass.name == "com.tencent.qqnt.widget.SwipeMenuLayout") {
+                    inSwipe = true
+                    break
+                }
+                p0 = p0.parent
+                d0++
+            }
+            val scheme = MonetPalette.palette()
+            if (inSwipe) {
+                // ⚠️ 只在**真的还没染过**时才动手：`setColorFilter`/`setTint` 打在皮肤
+                // drawable 上会触发位图重渲染，`setTextColor` 会触发重排 —— 实测这条
+                // 分支单次 2.5ms（111 次调用 = 301ms / 10 秒滑动窗口）。
+                // 滑动菜单是**每行都预建**的，行绑定时会反复 attach，重复染等于白烧。
+                val bgNow = tv.background
+                val textOk = opaqueColor(tv.currentTextColor) == opaqueColor(scheme.onPrimary)
+                val bgOk = bgNow?.colorFilter != null
+                if (!bgOk || !textOk) {
+                    runCatching {
+                        bgNow?.let { bg ->
+                            bg.mutate()
+                            bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
+                            bg.setTint(scheme.primary)
                         }
-                    }
-                    // 会话行滑动/长按菜单按钮：渲染器 chats.core.adapter.c.a.c
-                    // 代码创建(setTextColor(-1) 白字 + 彩色 webp 底)。
-                    // 左滑(SwipeMenuLayout 内) → primary 底+onPrimary 字；
-                    // 长按正上方的横排文字浮层(无彩色底) → 文字染 onSurface，
-                    // 复用重设白色时延时补染。
-                    if (view is TextView) {
-                        val menuTxt = runCatching {
-                            view.text?.toString()?.trim()
-                        }.getOrNull()
-                        if (menuTxt == "删除" || menuTxt == "置顶" ||
-                            menuTxt == "取消置顶" || menuTxt == "标为未读" ||
-                            menuTxt == "标为已读"
-                        ) {
-                            var inSwipe = false
-                            var p0: android.view.ViewParent? = view.parent
-                            var d0 = 0
-                            while (p0 != null && d0 < 6) {
-                                if (p0.javaClass.name ==
-                                    "com.tencent.qqnt.widget.SwipeMenuLayout"
-                                ) {
-                                    inSwipe = true
-                                    break
-                                }
-                                p0 = p0.parent
-                                d0++
-                            }
-                            val scheme = MonetPalette.palette()
-                            if (inSwipe) {
-                                runCatching {
-                                    view.background?.let { bg ->
-                                        bg.mutate()
-                                        bg.setColorFilter(
-                                            scheme.primary, PorterDuff.Mode.SRC_IN
-                                        )
-                                        bg.setTint(scheme.primary)
-                                    }
-                                    view.setTextColor(scheme.onPrimary)
-                                    logOnce("swipe menu btn monetized ($menuTxt)")
-                                }
-                            } else {
-                                runCatching {
-                                    val col = opaqueColor(view.currentTextColor)
-                                    if (col == 0xFFFFFFFF.toInt() ||
-                                        col == scheme.onSurface
-                                    ) {
-                                        view.setTextColor(scheme.onSurface)
-                                        logOnce("chat float txt monetized ($menuTxt)")
-                                    }
-                                }
-                            }
-                        }
+                        tv.setTextColor(scheme.onPrimary)
+                        logOnce("swipe menu btn monetized ($menuTxt)")
                     }
                 }
+            } else {
+                runCatching {
+                    val col = opaqueColor(tv.currentTextColor)
+                    if (col == 0xFFFFFFFF.toInt() || col == scheme.onSurface) {
+                        tv.setTextColor(scheme.onSurface)
+                        logOnce("chat float txt monetized ($menuTxt)")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4296,8 +4315,8 @@ private fun hookSummaryBadge(module: XposedModule) {
                 }
             }
             // View.onAttachedToWindow：内容卡本体挂载 → 计数 + 立即刷底 + 三次延迟兜底
-            onViewAttached { view ->
-                if (profileContentCls.isInstance(view)) {
+            onViewAttachedIf({ profileContentCls.isInstance(it) }) { view ->
+                run {
                     profileUiCount++
                     runCatching {
                         // 已有背景就就地改色（保形状）；没有背景不强加 ——
@@ -4331,8 +4350,7 @@ private fun hookSummaryBadge(module: XposedModule) {
                     incoming
                 }
                 // 兜底：inflate 期直接赋给字段的背景不走任何 setter
-                onViewAttached { v ->
-                    if (!cellCls.isInstance(v)) return@onViewAttached
+                onViewAttachedIf({ cellCls.isInstance(it) }) { v ->
                     runCatching {
                         v.background?.let { ColorMath.recolorInPlace(it, cardBg()) }
                     }
@@ -4609,11 +4627,11 @@ private fun hookSummaryBadge(module: XposedModule) {
                     }
                 }
             // 任何气泡视图挂载后再次整棵登记（回收重挂期间父链断裂也能按身份命中）
-            onViewAttached { view ->
-                val name = view.javaClass.name
-                if (name.contains("UnreadBubble") || name.contains("unreadbubble")) {
-                    view.post { runCatching { protectUnreadSubtree(view) } }
-                }
+            onViewAttachedIf({
+                val n = it.javaClass.name
+                n.contains("UnreadBubble") || n.contains("unreadbubble")
+            }) { view ->
+                view.post { runCatching { protectUnreadSubtree(view) } }
             }
         } catch (t: Throwable) {
             Log.w(TAG, "UnreadBubbleVB not found", t)
@@ -5854,8 +5872,8 @@ private fun hookSummaryBadge(module: XposedModule) {
     private fun hookTextContrast() {
         // 注意挂 View.onAttachedToWindow：TextView 自己没重写这个方法，
         // findMethod(TextView::class.java, ...) 会返回 null、hook 根本装不上。
-            onViewAttached { v ->
-                val tv = v as? TextView ?: return@onViewAttached
+            onViewAttachedIf({ it is TextView }) { v ->
+                val tv = v as TextView
                 if (!isThirdPartyUiActive()) {
                     runCatching { fixLowContrastText(tv) }
                     // 卡片/列表底色往往是 attach 之后才被染深的，那时这一次检查
@@ -6074,10 +6092,8 @@ private fun hookSummaryBadge(module: XposedModule) {
                 result
             }
         }
-        onViewAttached { v ->
-            runCatching {
-                if (v is android.widget.CompoundButton) fixHeaderTabTextColor(v)
-            }
+        onViewAttachedIf({ it is android.widget.CompoundButton }) { v ->
+            runCatching { fixHeaderTabTextColor(v as android.widget.CompoundButton) }
         }
     }
 
@@ -6212,11 +6228,10 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private fun hookNearBlackHint(module: XposedModule) {
-        onViewAttached { v ->
-            val tv = v as? TextView ?: return@onViewAttached
-            fixNearBlackHint(tv)
-            // hint 常在 attach 之后才设：下一帧再核一次（只读当前状态，不是猜时间）
-            v.post { fixNearBlackHint(tv) }
+        // hint 常在 attach 之后才设：setHintTextColor 已挂 hook（设置入口），
+        // 原来这里再 post 一次属于重复工作（每个 attach 的 TextView 一个 Runnable）。
+        onViewAttachedIf({ it is TextView }) { v ->
+            fixNearBlackHint(v as TextView)
         }
         findMethod(TextView::class.java, setOf("setHintTextColor"), INT_TYPE)
             ?.let { m ->
@@ -6304,11 +6319,8 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private fun hookSearchBarIcon(module: XposedModule) {
-        onViewAttached { v ->
-            val iv = v as? ImageView ?: return@onViewAttached
-            if (!insideSearchBar(v)) return@onViewAttached
-            fixSearchBarIcon(iv)
-            v.post { fixSearchBarIcon(iv) }
+        onViewAttachedIf({ it is ImageView && insideSearchBar(it) }) { v ->
+            fixSearchBarIcon(v as ImageView)
         }
         findMethod(ImageView::class.java, setOf("setImageDrawable"), Drawable::class.java)
             ?.let { m ->
@@ -6339,7 +6351,21 @@ private fun hookSummaryBadge(module: XposedModule) {
         var c: View? = v?.parent as? View
         var d = 0
         while (c != null && d < 6) {
-            val col = c.background?.let { solidColorOf(it) } ?: 0
+            val bg = c.background
+            // ⚠️ 判据分两步，先走**零成本**的那一步：气泡底如果在之前那轮已经被我们
+            // 染过，它身上会带 colorFilter（recolorInPlace 同时写 filter/tint）——
+            // 那就是"我们自己染出来的气泡面"，无需再采样。
+            // 原来对每个 attach 的气泡 TextView 都要向上最多 6 层逐个 `solidColorOf`，
+            // 而皮肤 drawable 的 solidColorOf 是**渲染采样**（一次一个位图）：
+            // 实测这条路径让 `hookBubbleCompoundIcon` 在 10 秒滑动里吃掉 attach 路径
+            // 34% 的时间（335ms），单次调用 ~480µs。
+            if (bg != null && bg.colorFilter != null) return true
+            // 采样结果按 drawable 实例缓存（弱引用键）：气泡底就那两三个 drawable，
+            // 被 TIM 在所有行里复用；皮肤 drawable 的 solidColorOf 是渲染采样（一次
+            // 一个位图），不缓存就是每行每次 attach 重采一遍。
+            // 安全性：上面那行已经拦掉了"被我们染过的"（有 colorFilter）——
+            // 所以缓存里存的永远是**TIM 原始底**的采样，不会因为我们自己的改色而失效。
+            val col = bg?.let { insideBubbleSample(it) } ?: 0
             if (col != 0) {
                 val op = ColorMath.opaque(col)
                 if (op == selfBg || op == guestBg) return true
@@ -6370,8 +6396,17 @@ private fun hookSummaryBadge(module: XposedModule) {
             val isSelf = op == ColorMath.opaque(scheme.onPrimary)
             val isGuest = op == ColorMath.opaque(scheme.onSurface)
             if (!isSelf && !isGuest) return@runCatching
+            // ⚠️ 先确认"真的有 compound drawable"再往 isInsideBubble 里走：
+            // isInsideBubble 会向上最多 6 层逐个 `solidColorOf`，而皮肤 drawable
+            // 的 solidColorOf 是**渲染采样**（每次一个位图）。顺序反了就是每个
+            // attach 的 TextView 白跑一串渲染 —— 实测这条处理器占主线程 13.4%
+            // （simpleperf --children），而聊天列表里绝大多数 TextView 根本没有
+            // compound drawable。数组只读一次，后面循环复用。
+            val drawables = runCatching { tv.compoundDrawables }.getOrNull()
+                ?: return@runCatching
+            if (drawables.all { it == null }) return@runCatching
             if (!isInsideBubble(tv)) return@runCatching
-            for (d in tv.compoundDrawables) {
+            for (d in drawables) {
                 d ?: continue
                 if (d.colorFilter != null) continue
                 val col = solidColorOf(d) ?: continue
@@ -6396,10 +6431,14 @@ private fun hookSummaryBadge(module: XposedModule) {
     }
 
     private fun hookBubbleCompoundIcon(module: XposedModule) {
-        onViewAttached { v ->
-            val tv = v as? TextView ?: return@onViewAttached
+        onViewAttachedIf({ it is TextView }) { v ->
+            val tv = v as TextView
+            // ⚠️ 这里曾经还有一次 `v.post { fixBubbleCompoundIcon(tv) }`（早期用来
+            // 兜"TIM 随后重设 drawable"）。现在 setCompoundDrawables* 的六个重载
+            // 全都挂了 hook，重设由"设置入口"覆盖（身份判据、与时机无关），
+            // 那次 post 等于把每个 attach 的工作量翻倍 + 往 UI 队列里塞一个
+            // Runnable —— 实测这条 attach 路径占主线程 13.4%，故删除。
             fixBubbleCompoundIcon(tv)
-            v.post { fixBubbleCompoundIcon(tv) }
         }
         // ⚠️ 关键：TIM 会在我们染色之后**重新设置** compound drawable（重绑/复用），
         // 一次性染色会被覆盖 —— 实测"进页面时都染对了，几秒后部分图标回到 onSurface"。
@@ -6443,6 +6482,28 @@ private fun hookSummaryBadge(module: XposedModule) {
         logOnce("hook installed: TextView.setCompoundDrawables* (bubble icon align)")
     }
 
+    /** [isInsideBubble] 用的"背景 drawable -> 采样色"弱引用缓存（见那里的注释）。 */
+    private val insideBubbleSampleCache =
+        java.util.Collections.synchronizedMap(
+            java.util.WeakHashMap<android.graphics.drawable.Drawable, Int>()
+        )
+
+    /**
+     * 采样"气泡底"的颜色，结果按 drawable 实例缓存。
+     *
+     * ⚠️ 只缓存**状态无关**的 drawable（皮肤位图/九宫格/普通位图）：
+     * `DrawableContainer`（含 StateListDrawable）会因为按压/选中换子项，
+     * 采样值随状态变 —— 缓存它就会拿到过期颜色，进而把 `isInsideBubble` 判错。
+     * 容器类型本来就便宜（只是取子项），不缓存没有损失。
+     */
+    private fun insideBubbleSample(d: android.graphics.drawable.Drawable): Int {
+        val cacheable = d !is android.graphics.drawable.DrawableContainer
+        if (cacheable) insideBubbleSampleCache[d]?.let { return it }
+        val c = solidColorOf(d) ?: return 0
+        if (cacheable) insideBubbleSampleCache[d] = c
+        return c
+    }
+
     /** 气泡内图标对齐的日志额度（仅日志用）。 */
     private var bubbleIconLog = 0
 
@@ -6453,10 +6514,9 @@ private fun hookSummaryBadge(module: XposedModule) {
     /** 【诊断】当前 Activity（用于按需 dump 视图树）。 */
 
     private fun hookPopupBeak() {
-        onViewAttached { v ->
+        onViewAttachedIf({ isPopupBeakView(it) }) { v ->
             runCatching {
                 if (!MonetPalette.isDarkNow()) return@runCatching
-                if (!isPopupBeakView(v)) return@runCatching
                 val iv = v as ImageView
                 val d = iv.drawable ?: return@runCatching
                 val want = TokenMapper.bgPage()
@@ -6585,8 +6645,28 @@ private fun hookSummaryBadge(module: XposedModule) {
      *  每个都包在 runCatching 里互相隔离。 */
     private val attachHandlers = java.util.concurrent.CopyOnWriteArrayList<(View) -> Unit>()
 
+    /** 见 [onViewAttachedIf]。 */
+    private val gatedAttachHandlers =
+        java.util.concurrent.CopyOnWriteArrayList<Pair<(View) -> Boolean, (View) -> Unit>>()
+
     private fun onViewAttached(handler: (View) -> Unit) {
         attachHandlers.add(handler)
+    }
+
+    /**
+     * 带**廉价身份闸门**的 attach 处理器。
+     *
+     * 为什么需要：`onAttachedToWindow` 的分发器对每个 attach 的 View 跑**全部**
+     * 处理器（实测 21 个 × 每个 attach 的 View；聊天列表滚动 10 秒里 3266 个 View
+     * ⇒ 68,586 次处理器调用、**吃掉主线程 1.72 秒**，占该窗口主线程时间的 17%）。
+     * 绝大多数处理器只关心某一类 View（TextView/ImageView/某个 TIM 类），
+     * 把"类型判断"从这个调用里提到闸门里，不匹配的 View 连处理器都不进。
+     *
+     * ⚠️ [gate] 必须是**纯身份判断**（类名/类型/id 高位），它每个 attach 的 View 都会跑：
+     * 不要在这里查颜色、几何、做 IO；也不要让它抛异常（不走 runCatching）。
+     */
+    private fun onViewAttachedIf(gate: (View) -> Boolean, handler: (View) -> Unit) {
+        gatedAttachHandlers.add(gate to handler)
     }
 
     private fun installAttachDispatcher(module: XposedModule) {
@@ -6602,6 +6682,11 @@ private fun hookSummaryBadge(module: XposedModule) {
                         if (v != null) {
                             for (i in 0 until n) {
                                 runCatching { attachHandlers[i](v) }
+                            }
+                            val gated = gatedAttachHandlers
+                            for (i in gated.indices) {
+                                val (gate, handler) = gated[i]
+                                if (gate(v)) runCatching { handler(v) }
                             }
                         }
                     }

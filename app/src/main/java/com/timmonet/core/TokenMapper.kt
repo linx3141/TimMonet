@@ -791,16 +791,60 @@ object TokenMapper {
      * `surfaceContainerLowest`），历史上 `isSchemeColor` 直接比了它们；
      * 去掉会让"判已染"的覆盖面变窄，等于让这些颜色被重复染色一次。
      */
-    private fun matchesAnyRole(
-        color: Int,
-        roles: List<Role>,
-        scheme: DynamicScheme,
-        extra: List<Int> = emptyList()
-    ): Boolean {
+    /**
+     * "已输出颜色"的集合，按 [MonetPalette.generation] 缓存。
+     *
+     * ⚠️ 必须缓存（性能，不是洁癖）：`isSchemeColor` 在**每次 View attach** 时都会被
+     * 问到（`fixTinySolidBg` / `inferByColor` 等），而旧实现是"对 ~20 个角色逐个
+     * `resolve(role, ROLE_PROBE, scheme)` 再比较"，`resolve` 内部每次都做
+     * `Hct.fromInt()`（CAM16 = libm 的 pow/atan2/log）。
+     * 实测聊天列表滑动（simpleperf，20s）：主线程 `--children` 口径下
+     * `installAttachDispatcher` 23.0%、`fixTinySolidBg` 8.6%、
+     * `TokenMapper.isSchemeColorOfScheme` 11.6%，而 libm 的 pow/fmod/atan2
+     * 合计占了主线程 ~16% —— 大头就是这条"每次 attach 重算 20 次 HCT"。
+     * 集合只依赖配色代次，与调用方无关 ⇒ 缓存是**等价变换**。
+     */
+    private class SchemeColorSets(
+        val all: Set<Int>,
+        val allExtras: Set<Int>,
+        val surfaces: Set<Int>
+    )
+
+    @Volatile
+    private var schemeColorSetsGen = -1L
+
+    @Volatile
+    private var schemeColorSetsCache: SchemeColorSets? = null
+
+    private fun schemeColorSets(): SchemeColorSets {
+        val generation = MonetPalette.generation()
+        schemeColorSetsCache?.let { if (schemeColorSetsGen == generation) return it }
+        synchronized(this) {
+            schemeColorSetsCache?.let { if (schemeColorSetsGen == generation) return it }
+            val scheme = MonetPalette.palette()
+            // extra 的存在是因为有两个方案槽位**没有对应的 Role**
+            // （surfaceDim / surfaceContainerLowest），历史上 isSchemeColor 直接比它们；
+            // 比较用 RGB（两边都去 alpha），与旧实现逐字保持一致。
+            val extras = listOf(scheme.surfaceDim, scheme.surfaceContainerLowest)
+                .mapTo(HashSet()) { ColorMath.opaque(it) and 0x00FFFFFF }
+            val built = SchemeColorSets(
+                all = (SURFACE_ROLES + PRIMARY_ROLES + FOREGROUND_ROLES)
+                    .mapTo(HashSet()) { resolve(it, ROLE_PROBE, scheme) },
+                allExtras = extras,
+                surfaces = SURFACE_ROLES.mapTo(HashSet()) { resolve(it, ROLE_PROBE, scheme) }
+            )
+            schemeColorSetsCache = built
+            schemeColorSetsGen = generation
+            return built
+        }
+    }
+
+    /** [color] 是否属于 [sets] 里的角色色（含 extra 槽位）。 */
+    private fun inScheme(sets: Set<Int>, extras: Set<Int>, color: Int): Boolean {
         val opaque = ColorMath.opaque(color)
+        // AMOLED 下的纯黑是我们自己压出来的底色，认它免得被重复染色。
         if (MonetPalette.isAmoled() && opaque == ROLE_PROBE) return true
-        if (roles.any { resolve(it, ROLE_PROBE, scheme) == opaque }) return true
-        return extra.any { (it and 0x00FFFFFF) == (opaque and 0x00FFFFFF) }
+        return opaque in sets || (opaque and 0x00FFFFFF) in extras
     }
 
     /**
@@ -812,24 +856,14 @@ object TokenMapper {
      * 这是实现层；对外的统一入口是 [BgResolver.isSchemeColor]。
      */
     internal fun isSchemeColorOfScheme(color: Int): Boolean {
-        val scheme = MonetPalette.palette()
-        return matchesAnyRole(
-            color,
-            SURFACE_ROLES + PRIMARY_ROLES + FOREGROUND_ROLES,
-            scheme,
-            extra = listOf(scheme.surfaceDim, scheme.surfaceContainerLowest)
-        )
+        val sets = schemeColorSets()
+        return inScheme(sets.all, sets.allExtras, color)
     }
 
     /** 只判"表面/容器类"角色（[isSchemeColorOfScheme] 的子集）。 */
     internal fun isSurfaceColorOfScheme(color: Int): Boolean {
-        val scheme = MonetPalette.palette()
-        return matchesAnyRole(
-            color,
-            SURFACE_ROLES,
-            scheme,
-            extra = listOf(scheme.surfaceDim, scheme.surfaceContainerLowest)
-        )
+        val sets = schemeColorSets()
+        return inScheme(sets.surfaces, sets.allExtras, color)
     }
 }
 
