@@ -411,6 +411,7 @@ object TimMonetHooks {
         hookSplashBackground(module, classLoader)
         hookForwardDialog(module, classLoader)
         hookQuickMenuTheme(classLoader)
+        hookSwipeMenuReveal(module, classLoader)
         hookAlbumTimelineText(module, classLoader)
         hookForceLight(module, classLoader)
         hookForceLightConfig(module)
@@ -2163,6 +2164,59 @@ private fun hookPlusPanelIcons(module: XposedModule, cl: ClassLoader) {
 /** 会话行滑动/长按菜单按钮的文字（用于无分配比较）。 */
 private val MENU_LABELS = setOf("删除", "置顶", "取消置顶", "标为未读", "标为已读")
 
+/**
+ * 会话行左滑菜单**展开时**染色（`com.tencent.qqnt.widget.SwipeMenuLayout.l()`）。
+ *
+ * 为什么挂这里而不是 attach：
+ *  - 滑动菜单是**每行预建**的，行绑定时会反复 attach，而 TIM 每次绑定都会把按钮的
+ *    文字色/底色重设回自己的白字 + 彩色底 —— 挂在 attach 上等于"每行每次绑定都
+ *    重染一遍"，实测那条分支**单次 2.5ms**（`setColorFilter` 打皮肤 drawable 会
+ *    触发位图重渲染、`setTextColor` 会触发重排），10 秒滑动窗口吃掉 attach 路径
+ *    265ms，是当时最大的一块。
+ *  - `l()` 是"展开这个菜单"的唯一入口（反编译：`com/tencent/qqnt/widget/SwipeMenuLayout.java:323`），
+ *    一次手势只跑一次 —— 既是身份明确的入口，又和时机无关（不猜延时）。
+ */
+private fun hookSwipeMenuReveal(module: XposedModule, cl: ClassLoader) {
+    runCatching {
+        val cls = Class.forName("com.tencent.qqnt.widget.SwipeMenuLayout", false, cl)
+        findMethod(cls, setOf("l"))
+            ?.let { method ->
+                logOnce("hook installed: SwipeMenuLayout.l (swipe menu tint on reveal)")
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    runCatching {
+                        (chain.thisObject as? android.view.ViewGroup)?.let {
+                            tintSwipeMenuButtons(it)
+                        }
+                    }
+                    result
+                }
+            }
+    }.onFailure { Log.w(TAG, "hook SwipeMenuLayout.l failed", it) }
+}
+
+/** 把左滑菜单里的按钮染成 primary 底 + onPrimary 字（只在展开时跑一次）。 */
+private fun tintSwipeMenuButtons(root: android.view.ViewGroup) {
+    val scheme = MonetPalette.palette()
+    walkViewTree(root, 40) { v ->
+        val tv = v as? TextView ?: return@walkViewTree
+        val txt = tv.text?.toString()?.trim() ?: return@walkViewTree
+        if (txt !in MENU_LABELS) return@walkViewTree
+        runCatching {
+            val bg = tv.background
+            if (bg != null && bg.colorFilter == null) {
+                bg.mutate()
+                bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
+                bg.setTint(scheme.primary)
+            }
+            if (opaqueColor(tv.currentTextColor) != opaqueColor(scheme.onPrimary)) {
+                tv.setTextColor(scheme.onPrimary)
+            }
+            logOnce("swipe menu btn monetized ($txt)")
+        }
+    }
+}
+
 private fun hookQuickMenuTheme(cl: ClassLoader) {
     val classes = QUICK_MENU_UI_CLASSES.mapNotNull { name ->
         runCatching { Class.forName(name, false, cl) }.getOrNull()
@@ -2209,44 +2263,15 @@ private fun hookQuickMenuTheme(cl: ClassLoader) {
                 if (trimmed in labels) menuTxt = trimmed
             }
             if (menuTxt == null) return@runCatching
-            var inSwipe = false
-            var p0: android.view.ViewParent? = tv.parent
-            var d0 = 0
-            while (p0 != null && d0 < 6) {
-                if (p0.javaClass.name == "com.tencent.qqnt.widget.SwipeMenuLayout") {
-                    inSwipe = true
-                    break
-                }
-                p0 = p0.parent
-                d0++
-            }
+            // 注意：**左滑菜单按钮不在这里染**（见 hookSwipeMenuReveal）——
+            // 菜单是每行预建的，绑定时会反复 attach，在这里染等于每次绑定都重来一遍。
+            // 这里只处理"长按正上方的横排文字浮层"（无彩色底，白字 → onSurface）。
             val scheme = MonetPalette.palette()
-            if (inSwipe) {
-                // ⚠️ 只在**真的还没染过**时才动手：`setColorFilter`/`setTint` 打在皮肤
-                // drawable 上会触发位图重渲染，`setTextColor` 会触发重排 —— 实测这条
-                // 分支单次 2.5ms（111 次调用 = 301ms / 10 秒滑动窗口）。
-                // 滑动菜单是**每行都预建**的，行绑定时会反复 attach，重复染等于白烧。
-                val bgNow = tv.background
-                val textOk = opaqueColor(tv.currentTextColor) == opaqueColor(scheme.onPrimary)
-                val bgOk = bgNow?.colorFilter != null
-                if (!bgOk || !textOk) {
-                    runCatching {
-                        bgNow?.let { bg ->
-                            bg.mutate()
-                            bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
-                            bg.setTint(scheme.primary)
-                        }
-                        tv.setTextColor(scheme.onPrimary)
-                        logOnce("swipe menu btn monetized ($menuTxt)")
-                    }
-                }
-            } else {
-                runCatching {
-                    val col = opaqueColor(tv.currentTextColor)
-                    if (col == 0xFFFFFFFF.toInt() || col == scheme.onSurface) {
-                        tv.setTextColor(scheme.onSurface)
-                        logOnce("chat float txt monetized ($menuTxt)")
-                    }
+            runCatching {
+                val col = opaqueColor(tv.currentTextColor)
+                if (col == 0xFFFFFFFF.toInt() || col == scheme.onSurface) {
+                    tv.setTextColor(scheme.onSurface)
+                    logOnce("chat float txt monetized ($menuTxt)")
                 }
             }
         }
