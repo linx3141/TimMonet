@@ -266,6 +266,20 @@ object TimMonetHooks {
      * KDoc 见 `ArkPackagePatcher`。
      */
     private fun prePatchArkPackages() {
+        // 等真实调色板就绪（`generation() > 0`）：XML 里的颜色是**静态烤进去**的，
+        // 3s 时可能还是 fallback 方案（DEFAULT_SEED 的灰），烤进去就和运行时对不上。
+        var waited = 0
+        while (MonetPalette.generation() == 0L && waited < 12_000) {
+            runCatching { Thread.sleep(250) }
+            waited += 250
+        }
+        // 调色板还没就绪就**别打**：XML 的颜色是烤进去的，用 fallback 方案
+        // （DEFAULT_SEED 的灰 #36393E…）烤进去会和运行时（真调色板 #003045…）对不上。
+        // 有些进程（插件进程）根本不建调色板，让它打补丁就是写坏别人的结果。
+        if (MonetPalette.generation() == 0L) {
+            Log.w(TAG, "ark pre-patch: palette not ready in this process, skip")
+            return
+        }
         val ctx = Class.forName("android.app.ActivityThread")
             .getMethod("currentApplication").invoke(null) as? android.content.Context
         if (ctx == null) {

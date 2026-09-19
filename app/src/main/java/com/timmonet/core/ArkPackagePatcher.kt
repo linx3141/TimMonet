@@ -67,6 +67,8 @@ object ArkPackagePatcher {
      * 宿主注入的 `app.config.theme.timMonet` 取莫奈色，取不到就退回原值。
      */
     private const val MINIAPP_MARKER = "TimMonetMiniappPatch"
+    /** 补丁内容版本：**改了下面任何映射/代码就要 +1**（幂等判据是 marker 字符串）。 */
+    private const val MINIAPP_PATCH_VERSION = 8
 
     private val KEY = "20180730104551tm".toByteArray(Charsets.US_ASCII)
 
@@ -84,6 +86,46 @@ object ArkPackagePatcher {
     private val MINIAPP_BLOCK_REGEX = Regex(
         "(?s)// ==== TimMonetMiniappPatch.*?// ==== end TimMonetMiniappPatch ====\\s*"
     )
+
+    /**
+     * `com.tencent.miniapp_01` 的 **XML** 里"硬编码颜色 -> 我们的角色"。
+     *
+     * ⚠️ 必须和 JS 那张表分开：同一个字面量在两处语义不同 ——
+     * XML 的 `0xFFFFFFFF` 是卡片里的**标题条**（比卡片底更亮的一档），
+     * JS 的 `0xFFFFFFFF` 是**亮色主题下的卡片底**。混用会把卡片底和标题条对调。
+     */
+    private val MINIAPP_XML_FILL_ROLES: Map<String, String> = mapOf(
+        // 卡片整体底（浅灰）
+        "0xFFEAEDF4" to "background",
+        "0xFFEBEDF5" to "background",
+        "0xFFF5F6FA" to "background",
+        "0xFFEEEEF2" to "background",
+        // 卡片内的标题条（白，比卡片底亮一档）
+        "0xFFFFFFFF" to "backgroundAlt",
+        // 品牌蓝竖条
+        "0xFF4D94FF" to "brand",
+        "0xFF00CAFC" to "brand",
+        "0xFF0099FF" to "brand"
+    ).mapKeys { it.key.uppercase() }
+
+    /**
+     * XML 里 `textcolor=` 的映射。
+     *
+     * ⚠️ **必须和 `color=` 分开**：`0xFFFFFFFF` 在 `color=` 上是"标题条底"、
+     * 在 `textcolor=` 上是**白字**。混在一起会把白字写成卡片底色 → 深色面上
+     * 文字直接消失（用户实测："背景正常了但文字被吞了"）。
+     */
+    private val MINIAPP_XML_TEXT_ROLES: Map<String, String> = mapOf(
+        "0xFFFFFFFF" to "title",
+        "0xFF03081A" to "title",
+        "0xFF222222" to "title",
+        "0xFF666666" to "title",
+        "0xFF878B99" to "summary",
+        "0xFF909094" to "summary",
+        "0xFFB2B2B2" to "summary",
+        "0xFF999999" to "summary",
+        "0xFFCBCED6" to "summary"
+    ).mapKeys { it.key.uppercase() }
 
     /**
      * 小程序卡片 JS 里"硬编码颜色 -> 我们的角色"对照表。
@@ -104,18 +146,21 @@ object ArkPackagePatcher {
         "0xFFEAEDF4" to "backgroundAlt",
         "0xFFEEEEF2" to "backgroundAlt",
         "0xFFF5F6F5" to "backgroundAlt",
-        // 标题/正文（深色）
+        // 主标题/正文 -> onSurface（用户要求："文字要 onSurface"）
         "0xFF03081A" to "title",
         "0xFF222222" to "title",
         "0xFF2E2E2E" to "title",
-        "0xFF666666" to "title",
-        // 次要文字（灰）
+        // ⚠️ JS 里 `descUIObj`（卡片主标题）夜间用的是 0xFF999999，
+        // 不是深灰那两个 —— 它必须走 onSurface；mis-map 成 onSurfaceVariant
+        // 会让主标题比正文暗一档（用户实测："染错色了，我要 onSurface 文字"）。
+        "0xFF999999" to "title",
+        // 次要文字（应用名 "哔哩哔哩"/页脚 "QQ小程序"）才用 onSurfaceVariant
         "0xFF878B99" to "summary",
-        "0xFF999999" to "summary",
         "0xFFB2B2B2" to "summary",
         "0xFF909094" to "summary",
         "0xFFCBCED6" to "summary",
         "0xFF616573" to "summary",
+        "0xFF666666" to "summary",
         // 品牌蓝（左侧竖条等）
         "0xFF0099FF" to "brand",
         "0xFF4D94FF" to "brand",
@@ -175,12 +220,28 @@ object ArkPackagePatcher {
                     STRUCTMSG_MARKER,
                     STRUCTMSG_BLOCK_REGEX
                 ) { _, lua -> injectStructmsgPatch(lua) }
-                Kind.MINIAPP -> patchInPlace(
-                    file,
-                    { it.endsWith(".js") },
-                    MINIAPP_MARKER,
-                    MINIAPP_BLOCK_REGEX
-                ) { _, js -> injectMiniappPatch(js) }
+                Kind.MINIAPP -> {
+                    // 配色指纹进 marker：调色板一变（换壁纸/改设置）指纹就变，
+                    // 幂等检查自然失败 → 重打一遍（旧的块由 blockRegex 剥掉）。
+                    // XML 里的颜色是**静态**的（Ark 的 XML 不能写表达式），只能把
+                    // 当前调色板的值烤进去，所以必须能随调色板重打。
+                    val roleColors = miniappRoleColors()
+                    val fingerprint = roleColors.values.joinToString("-") {
+                        Integer.toHexString(it)
+                    }
+                    patchInPlace(
+                        file,
+                        { it.endsWith(".js") || it.endsWith(".xml") },
+                        "$MINIAPP_MARKER v$MINIAPP_PATCH_VERSION $fingerprint",
+                        MINIAPP_BLOCK_REGEX
+                    ) { name, text ->
+                        if (name.endsWith(".js")) {
+                            injectMiniappPatch(text, roleColors, fingerprint)
+                        } else {
+                            injectMiniappXml(text, roleColors, fingerprint)
+                        }
+                    }
+                }
             }
         } catch (t: Throwable) {
             Log.w(TAG, "ark repack failed: ${file.name}", t)
@@ -428,16 +489,92 @@ object ArkPackagePatcher {
      * 只改 JS 不改 XML：这些卡片的颜色最终都由 JS 在 `OnSetValue`/`darkModeAdapt`
      * 里重设（XML 里只是首帧初值），改 JS 就够，也避开 XML 不能写表达式的限制。
      */
-    private fun injectMiniappPatch(js: String): String? {
+    /** 小程序卡片用到的角色 -> 当前调色板的具体颜色。 */
+    private fun miniappRoleColors(): Map<String, Int> {
+        val scheme = MonetPalette.palette()
+        return mapOf(
+            "background" to TokenMapper.bgCard(),
+            "backgroundAlt" to TokenMapper.inputBg(),
+            "title" to scheme.onSurface,
+            "summary" to scheme.onSurfaceVariant,
+            "brand" to scheme.primary
+        )
+    }
+
+    /**
+     * XML 里的颜色是**静态字面量**（Ark 的 XML 不能写表达式/读 token），所以这里把
+     * 当前调色板的值直接烤进去；调色板变化时靠 marker 里的指纹触发重打（见调用点）。
+     */
+    private fun injectMiniappXml(
+        xml: String,
+        roleColors: Map<String, Int>,
+        fingerprint: String
+    ): String? {
+        // ⚠️ XML 的改色是**不可逆**的（把字面量换成了我们的颜色），所以补丁块里
+        // 必须保存**原始 XML**（base64）：重打（换壁纸/改配色）时先还原原文再重新
+        // 上色。否则第二次打补丁时原始字面量已经不存在，替换数 0 → 直接返回原文
+        // → 卡片永远停在上一次的配色（踩过：marker 已更新但颜色没变）。
+        val blockRegex = Regex("(?s)<!--\\s*TimMonetMiniappPatch.*?-->\\s*")
+        val existing = blockRegex.find(xml)?.value
+        val original = if (existing != null) {
+            val b64 = Regex("orig=([A-Za-z0-9+/=]+)").find(existing)?.groupValues?.get(1)
+            val decoded = b64?.let {
+                runCatching {
+                    String(android.util.Base64.decode(it, android.util.Base64.NO_WRAP), Charsets.UTF_8)
+                }.getOrNull()
+            }
+            decoded ?: xml
+        } else {
+            xml
+        }
+        var replaced = 0
+        val body = Regex("(textcolor|color)=\"(0x[0-9A-Fa-f]{6,8})\"").replace(original) { m ->
+            val attr = m.groupValues[1]
+            val literal = m.groupValues[2].uppercase()
+            val table = if (attr == "textcolor") {
+                MINIAPP_XML_TEXT_ROLES
+            } else {
+                MINIAPP_XML_FILL_ROLES
+            }
+            val argb = table[literal]?.let { roleColors[it] }
+            if (argb == null) {
+                m.value
+            } else {
+                replaced++
+                attr + "=\"0x" + Integer.toHexString(argb).uppercase().padStart(8, '0') + "\""
+            }
+        }
+        if (replaced == 0) return original
+        val encoded = android.util.Base64.encodeToString(
+            original.toByteArray(Charsets.UTF_8),
+            android.util.Base64.NO_WRAP
+        )
+        val header =
+            "<!--TimMonetMiniappPatch v$MINIAPP_PATCH_VERSION $fingerprint orig=$encoded-->\n"
+        return header + body
+    }
+
+    private fun injectMiniappPatch(
+        js: String,
+        roleColors: Map<String, Int>,
+        fingerprint: String
+    ): String? {
         val current = MINIAPP_BLOCK_REGEX.replace(js, "")
         var replaced = 0
         val body = Regex("0x[0-9A-Fa-f]{6,8}").replace(current) { m ->
             val role = MINIAPP_COLOR_ROLES[m.value.uppercase()]
-            if (role == null) {
+            val argb = role?.let { roleColors[it] }
+            if (argb == null) {
                 m.value
             } else {
                 replaced++
-                "__tm(\"$role\",${m.value})"
+                // ⚠️ 直接**烤成当前调色板的颜色**，不做任何运行时查询：
+                //  - 试过 `function __tm(...)`（全局辅助函数）：卡片底染上了、
+                //    文字全没 —— 典型的"后续语句抛错/取不到值导致渲染中断"；
+                //  - 试过就地 IIFE 查 `app.config.theme.timMonet`：运行时那个对象
+                //    不一定可见（实测又退回它自己的灰色）。
+                // 调色板变化时靠 marker 里的指纹触发重打（TIM 改配色本来就会重启）。
+                "0x" + Integer.toHexString(argb).uppercase().padStart(8, '0')
             }
         }
         // ⚠️ 没有任何可替换字面量的 entry 要**原样返回**，不能返回 null：
@@ -445,19 +582,8 @@ object ArkPackagePatcher {
         // （踩过：all.js 里没有认识的色值 → 整个 miniapp_01 补丁被放弃）。
         if (replaced == 0) return current
         val header =
-            "// ==== $MINIAPP_MARKER: 硬编码配色 -> 模块注入的莫奈色 ====\n" +
-                "function __tm(role, fallback) {\n" +
-                "    try {\n" +
-                "        var th = (typeof app !== 'undefined' && app.config) ? app.config.theme : null;\n" +
-                "        var m = th ? th.timMonet : null;\n" +
-                "        if (!m) { return fallback; }\n" +
-                "        var v = m[role];\n" +
-                "        if (v === null || v === undefined || v === '') { return fallback; }\n" +
-                "        var n = Number(v);\n" +
-                "        return isNaN(n) ? fallback : (n | 0);\n" +
-                "    } catch (e) { return fallback; }\n" +
-                "}\n" +
-                "// ==== end $MINIAPP_MARKER ====\n"
+            "// ==== $MINIAPP_MARKER v$MINIAPP_PATCH_VERSION $fingerprint: " +
+                "硬编码配色 -> 模块注入的莫奈色（就地 IIFE，无全局依赖）====\n"
         return header + body
     }
 
