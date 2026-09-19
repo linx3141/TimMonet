@@ -290,21 +290,19 @@ object TimMonetHooks {
         val apks = installDir.listFiles()?.flatMap { dir ->
             dir.listFiles()?.filter { it.name.endsWith(".ark") } ?: emptyList()
         } ?: emptyList()
-        Log.i(TAG, "ark pre-patch: ${apks.size} packages")
-        var touched = 0
+        var patched = 0
+        var failed = 0
         for (f in apks) {
-            val name = f.parentFile?.name ?: f.name
             try {
-                val ok = ArkPackagePatcher.patchIfNeeded(f)
-                if (ok) {
-                    touched++
-                    Log.i(TAG, "ark pre-patch: $name ok")
-                }
+                // ArkPackagePatcher 自己按包名筛选 + 幂等（marker 里带调色板指纹），
+                // 不支持的包立刻返回 false；这里只统计"这个进程实际处理了几个"。
+                if (ArkPackagePatcher.patchIfNeeded(f)) patched++
             } catch (t: Throwable) {
-                Log.w(TAG, "ark pre-patch: $name failed", t)
+                failed++
+                Log.w(TAG, "ark pre-patch failed: ${f.parentFile?.name ?: f.name}", t)
             }
         }
-        Log.i(TAG, "ark pre-patch done: touched/already=$touched of ${apks.size}")
+        Log.i(TAG, "ark pre-patch: ${apks.size} packages, handled=$patched failed=$failed")
     }
 
     /** 全部功能钩子的统一入口（MainModule 调用）。 */
@@ -8616,9 +8614,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                     )
                                     putColor("separator", scheme.outlineVariant)
                                     putColor("picBorder", scheme.outlineVariant)
-                                    // 小程序卡片 JS 用到的另外两档
-                                    putColor("backgroundAlt", TokenMapper.inputBg())
-                                    putColor("brand", scheme.primary)
                                     theme.put("timMonet", tm)
                                 }
                             }.onFailure { Log.w(TAG, "ark theme rewrite failed", it) }
@@ -8688,11 +8683,6 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                                     "fill_light_primary=${out.optString("fill_light_primary")}, " +
                                     "bg_nav_primary=${out.optString("bg_nav_primary")}, " +
                                     "text_primary=${out.optString("text_primary")}"
-                            )
-                            Log.i(
-                                TAG,
-                                "Ark token object caller:\n" +
-                                    Log.getStackTraceString(Throwable()).take(1500)
                             )
                         }
                         arkTokenCache = out
