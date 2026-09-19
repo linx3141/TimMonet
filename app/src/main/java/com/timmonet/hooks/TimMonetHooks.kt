@@ -411,7 +411,7 @@ object TimMonetHooks {
         hookSplashBackground(module, classLoader)
         hookForwardDialog(module, classLoader)
         hookQuickMenuTheme(classLoader)
-        hookSwipeMenuReveal(module, classLoader)
+        hookSwipeMenuButtonRenderer(module, classLoader)
         hookAlbumTimelineText(module, classLoader)
         hookForceLight(module, classLoader)
         hookForceLightConfig(module)
@@ -2165,57 +2165,63 @@ private fun hookPlusPanelIcons(module: XposedModule, cl: ClassLoader) {
 private val MENU_LABELS = setOf("删除", "置顶", "取消置顶", "标为未读", "标为已读")
 
 /**
- * 会话行左滑菜单**展开时**染色（`com.tencent.qqnt.widget.SwipeMenuLayout.l()`）。
+ * 会话行左滑菜单按钮：**在 TIM 创建/重绑按钮的那一刻**就染成 primary 底 + onPrimary 字。
  *
- * 为什么挂这里而不是 attach：
- *  - 滑动菜单是**每行预建**的，行绑定时会反复 attach，而 TIM 每次绑定都会把按钮的
- *    文字色/底色重设回自己的白字 + 彩色底 —— 挂在 attach 上等于"每行每次绑定都
- *    重染一遍"，实测那条分支**单次 2.5ms**（`setColorFilter` 打皮肤 drawable 会
- *    触发位图重渲染、`setTextColor` 会触发重排），10 秒滑动窗口吃掉 attach 路径
- *    265ms，是当时最大的一块。
- *  - `l()` 是"展开这个菜单"的唯一入口（反编译：`com/tencent/qqnt/widget/SwipeMenuLayout.java:323`），
- *    一次手势只跑一次 —— 既是身份明确的入口，又和时机无关（不猜延时）。
+ * 反编译实证（`com/tencent/qqnt/chats/core/adapter/c/a/c.java`）：
+ *  - `b(ViewGroup, item)`：**创建**按钮 TextView —— `setTextColor(-1)`（白字）+
+ *    `setBackgroundResource(彩色 webp 底)`（第 352~354 行）；
+ *  - `a(View, item)`：重绑已有按钮，只有 id 变化时才换背景（第 305~312 行）。
+ *
+ * 为什么挂这里（而不是 attach / 展开时）：
+ *  - attach 兜底：菜单是**每行预建**的，行绑定时反复 attach，等于每行每次绑定都重染，
+ *    实测单次 2.5ms（`setColorFilter` 打皮肤 drawable 会触发位图重渲染、
+ *    `setTextColor` 会触发重排），10 秒滑动窗口吃掉 attach 路径 265ms；
+ *  - 展开时兜底（`SwipeMenuLayout.l()`）：能用，但一次手势仍要遍历菜单子树；
+ *  - **创建入口**：TIM 自己刚设完颜色，我们在同一处顺手改掉 —— 一次创建只跑一次，
+ *    而且 `a()` 里只在背景真被换掉（`bg.colorFilter == null`）时才补染，
+ *    正常绑定的开销就是一次拦截 + 一次字段比较。
  */
-private fun hookSwipeMenuReveal(module: XposedModule, cl: ClassLoader) {
+private fun hookSwipeMenuButtonRenderer(module: XposedModule, cl: ClassLoader) {
     runCatching {
-        val cls = Class.forName("com.tencent.qqnt.widget.SwipeMenuLayout", false, cl)
-        findMethod(cls, setOf("l"))
+        val cls = Class.forName("com.tencent.qqnt.chats.core.adapter.c.a.c", false, cl)
+        val itemCls = Class.forName("com.tencent.qqnt.chats.core.adapter.c.a", false, cl)
+        findMethod(cls, setOf("b"), ViewGroup::class.java, itemCls)
             ?.let { method ->
-                logOnce("hook installed: SwipeMenuLayout.l (swipe menu tint on reveal)")
+                logOnce("hook installed: chats swipe button create (c.a.c.b)")
+                module.hook(method).intercept { chain ->
+                    val result = chain.proceed()
+                    runCatching { (result as? TextView)?.let { tintSwipeMenuButton(it) } }
+                    result
+                }
+            }
+        findMethod(cls, setOf("a"), View::class.java, itemCls)
+            ?.let { method ->
+                logOnce("hook installed: chats swipe button bind (c.a.c.a)")
                 module.hook(method).intercept { chain ->
                     val result = chain.proceed()
                     runCatching {
-                        (chain.thisObject as? android.view.ViewGroup)?.let {
-                            tintSwipeMenuButtons(it)
-                        }
+                        (chain.getArg(0) as? TextView)?.let { tintSwipeMenuButton(it) }
                     }
                     result
                 }
             }
-    }.onFailure { Log.w(TAG, "hook SwipeMenuLayout.l failed", it) }
+    }.onFailure { Log.w(TAG, "hook chats swipe button renderer failed", it) }
 }
 
-/** 把左滑菜单里的按钮染成 primary 底 + onPrimary 字（只在展开时跑一次）。 */
-private fun tintSwipeMenuButtons(root: android.view.ViewGroup) {
+/** 把左滑菜单按钮染成 primary 底 + onPrimary 字；已经染过（背景带 filter）就跳过。 */
+private fun tintSwipeMenuButton(tv: TextView) {
     val scheme = MonetPalette.palette()
-    walkViewTree(root, 40) { v ->
-        val tv = v as? TextView ?: return@walkViewTree
-        val txt = tv.text?.toString()?.trim() ?: return@walkViewTree
-        if (txt !in MENU_LABELS) return@walkViewTree
-        runCatching {
-            val bg = tv.background
-            if (bg != null && bg.colorFilter == null) {
-                bg.mutate()
-                bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
-                bg.setTint(scheme.primary)
-            }
-            if (opaqueColor(tv.currentTextColor) != opaqueColor(scheme.onPrimary)) {
-                tv.setTextColor(scheme.onPrimary)
-            }
-            logOnce("swipe menu btn monetized ($txt)")
-        }
+    val bg = tv.background
+    if (bg != null && bg.colorFilter == null) {
+        bg.mutate()
+        bg.setColorFilter(scheme.primary, PorterDuff.Mode.SRC_IN)
+        bg.setTint(scheme.primary)
+    }
+    if (opaqueColor(tv.currentTextColor) != opaqueColor(scheme.onPrimary)) {
+        tv.setTextColor(scheme.onPrimary)
     }
 }
+
 
 private fun hookQuickMenuTheme(cl: ClassLoader) {
     val classes = QUICK_MENU_UI_CLASSES.mapNotNull { name ->
@@ -2263,7 +2269,7 @@ private fun hookQuickMenuTheme(cl: ClassLoader) {
                 if (trimmed in labels) menuTxt = trimmed
             }
             if (menuTxt == null) return@runCatching
-            // 注意：**左滑菜单按钮不在这里染**（见 hookSwipeMenuReveal）——
+            // 注意：**左滑菜单按钮不在这里染**（见 hookSwipeMenuButtonRenderer）——
             // 菜单是每行预建的，绑定时会反复 attach，在这里染等于每次绑定都重来一遍。
             // 这里只处理"长按正上方的横排文字浮层"（无彩色底，白字 → onSurface）。
             val scheme = MonetPalette.palette()
