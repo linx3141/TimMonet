@@ -457,6 +457,45 @@ adb shell am force-stop com.tencent.tim      # Xposed 改动必须重启宿主�
       而补面时**别忘描边**（要么同色、要么显式给 outline 角色），否则会多出一圈线
       或者留下一条亮边。
 
+31. **"处理器个数 × attach 的 View 个数"是滚动性能的头号开销**（聊天列表滑动卡顿）。
+    用户报"滑动特别卡"。受控 A/B（同一套合成滑动 + 热机 50s + `gfxinfo` 重置取增量）
+    先量出地板：**模块完全不装 0.6% SlowUI/帧、p90 10ms**；模块装上 8.4% / p90 38ms。
+    而模块自己的 **self CPU 只有 0.2%** —— 开销从来不在"算得慢"。
+    探针（临时计数 + 计时，测完删）指出钱花在哪：
+    - `View.onAttachedToWindow` 的分发器对**每个** attach 的 View 跑**全部**处理器：
+      10 秒滑动 = 3266 个 View × 21 个处理器 = **68,586 次调用 / 1.72 秒主线程**；
+    - 其中 `hookQuickMenuTheme` 占 58%、`hookBubbleCompoundIcon` 占 34%。
+    修法（都在本仓库已落地）：
+    - **`onViewAttachedIf(gate) { }`**：闸门是**纯身份判断**（类型/类名/id 高位），
+      不匹配的 View 连处理器都不进（调用数 68,586 → 10,379）。判据仍然身份明确，
+      不要用颜色/几何兜底（坑 26）。
+    - **热路径上禁止 `text.toString()`**：聊天行的 `text` 是带 span 的 Spannable，
+      `toString()` 是整串拷贝 + `trim()` 再一次。菜单文字只有 2~5 个字 ⇒
+      闸门先卡 `TextView && text.length in 1..8`，再 `TextUtils.equals` 逐字符比（零分配）。
+    - **`setColorFilter`/`setTint` 打在皮肤 drawable 上 = 位图重渲染**（实测单次 2.5ms），
+      `setTextColor` = 重排。**不要挂在 attach/展开时兜底**，要挂 TIM 的**设置/创建入口**
+      （左滑菜单 = `chats.core.adapter.c.a.c.b()`，反编译第 352~354 行就是
+      `setTextColor(-1)` + `setBackgroundResource` 的来源），一次创建只跑一次。
+    - **`solidColorOf` 对皮肤 drawable 是渲染采样**（每次一个位图，实测单次 ~480µs）。
+      气泡内的图标判断原来对每个 attach 的气泡 TextView 向上采样最多 6 层 ⇒
+      先走零成本判据"祖先背景带 colorFilter = 已经被我们染过"，再对**状态无关**的
+      drawable（排除 `DrawableContainer`，它会因按压换子项）按实例弱引用缓存采样值。
+    attach 路径 CPU：1,724,494µs → 583,963µs / 10 秒窗口；p90 帧 38ms → 19ms。
+    ⚠️ 剩下的差距（6.4% vs 地板 0.6%）来自"TIM 每次绑定重设颜色、我们再染回去"
+    这类**必然重复**的工作 —— 要再进一步只能粗化 hook 点（挂 item-part 绑加入口，
+    像左滑菜单/badge/pill 那样），别再逐个 setter 拦。
+
+32. **性能测量方法（本仓库可复用的那套）**：合成滑动 + `gfxinfo` 增量 + 模块开关对照。
+    - 合成滑动：`adb shell input swipe 270 750 270 200 120`（输入坐标系 ≈ 帧缓冲 ×0.4，
+      见调试手段），循环 6 次 ×2 组，每次间隔 0.3s；
+    - 每轮**先 `KEYCODE_WAKEUP` + `wm dismiss-keyguard`**：熄屏时 TIM 一帧不渲染，
+      会得到 `Total frames rendered: 0` 的假数据（踩过，整轮白测）；
+    - 每轮**同样的热机时间（50s）**：刚装完包/刚启动时 JIT + 首次染色会把数字拉坏；
+    - 对照必须包含"模块完全不装"那一组，否则无法判断"剩下的是不是我们的"；
+    - CPU 归属用 `simpleperf`（`--children` 看子树、单看 self 判断"是不是我们的计算"），
+      但 Java 帧 unwind 常失败 ⇒ 想精确到函数就用**临时探针**（计数 + `System.nanoTime()`
+      累加，跑一轮合成滑动后从 logcat 读，**测完整段删**）。
+
 ## 调试手段
 
 - **日志**：`adb logcat -v time -s TimMonet:*`
