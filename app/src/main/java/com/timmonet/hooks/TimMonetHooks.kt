@@ -258,6 +258,41 @@ object TimMonetHooks {
         }
     }
 
+    /**
+     * 启动时主动补一遍已安装的 Ark 包。
+     *
+     * 为什么不能只靠 `verifyAppPackage`/`checkAppSignature`：TIM 只在它自己的
+     * 应用更新检查里做校验（时机不定、可能几天不跑），补丁会迟迟不生效。
+     * KDoc 见 `ArkPackagePatcher`。
+     */
+    private fun prePatchArkPackages() {
+        val ctx = Class.forName("android.app.ActivityThread")
+            .getMethod("currentApplication").invoke(null) as? android.content.Context
+        if (ctx == null) {
+            Log.w(TAG, "ark pre-patch: no application context yet, skipped")
+            return
+        }
+        val installDir = java.io.File(ctx.filesDir, "ArkApp/Install")
+        val apks = installDir.listFiles()?.flatMap { dir ->
+            dir.listFiles()?.filter { it.name.endsWith(".ark") } ?: emptyList()
+        } ?: emptyList()
+        Log.i(TAG, "ark pre-patch: ${apks.size} packages")
+        var touched = 0
+        for (f in apks) {
+            val name = f.parentFile?.name ?: f.name
+            try {
+                val ok = ArkPackagePatcher.patchIfNeeded(f)
+                if (ok) {
+                    touched++
+                    Log.i(TAG, "ark pre-patch: $name ok")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "ark pre-patch: $name failed", t)
+            }
+        }
+        Log.i(TAG, "ark pre-patch done: touched/already=$touched of ${apks.size}")
+    }
+
     /** 全部功能钩子的统一入口（MainModule 调用）。 */
     fun install(module: XposedModule, classLoader: ClassLoader) {
         timClassLoader = classLoader
@@ -336,6 +371,13 @@ object TimMonetHooks {
         hookAioNavBadge(module, classLoader)
         hookArkToken(module, classLoader)
         hookArkPackagePatch(module, classLoader)
+        // 启动时把已安装的 Ark 包主动补一遍（延迟 3s：install() 跑在
+        // Application 创建之前，`ActivityThread.currentApplication()` 这时还是 null，
+        // 之前同步调用直接静默 return —— 日志里连一行都看不到，补丁永远不生效）。
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            runCatching { prePatchArkPackages() }
+                .onFailure { Log.w(TAG, "ark pre-patch failed", it) }
+        }, 3000L)
         hookFileDownloadIcons()
         hookPlusPanelIcons(module, classLoader)
         hookSingleLineDrawables(module, classLoader)
@@ -8515,6 +8557,57 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                             } catch (t: Throwable) {
                                 // ignore
                             }
+                            // ⚠️ Ark 应用按 config 里的 `theme.mode/themeId` 选**自己内置**的
+                            // 配色方案，卡片底色/文字色都是方案里的硬编码值 —— 不走 token 表，
+                            // 我们的 token 重映射管不到。反编译实证（structmsg 的
+                            // `base/theme.lua` + `view2021/miniapp.lua`）：
+                            //   mode == "concise" 且 themeId == "2920" -> COLOR_SCHEME_CONCISE_NIGHT
+                            //   否则                                   -> COLOR_SCHEME_CONCISE_WHITE
+                            // 而 `hookForceLight` 让 TIM 一直报 2971（简洁白），于是深色莫奈下
+                            // 小程序/结构化消息卡片的**白底永远是白的**（用户报"ark 卡片没被染色"；
+                            // TIM 原生深色下它们是暗的，因为那时 TIM 自己报 2920）。
+                            // 这里按我们调色板的深浅改写 themeId，让 Ark 应用走它自己的夜间方案。
+                            runCatching {
+                                val theme = obj.optJSONObject("theme")
+                                if (theme != null) {
+                                    val dark = MonetPalette.palette().isDark
+                                    val mode = theme.optString("mode")
+                                    val cur = theme.optString("themeId")
+                                    val next = when {
+                                        mode == "concise" -> if (dark) "2920" else "2971"
+                                        dark -> "1103" // 默认模式-夜间(Android)
+                                        else -> cur
+                                    }
+                                    if (next != cur) {
+                                        theme.put("themeId", next)
+                                        logOnce("ark theme -> $next (mode=$mode, dark=$dark)")
+                                    }
+                                    // 把**莫奈色**注入 theme.timMonet：结构化消息/小程序卡片
+                                    // (com.tencent.structmsg) 的内置方案表由 ArkPackagePatcher
+                                    // 打补丁读这里，卡片才会是莫奈面而不是它自己的灰/白底。
+                                    // 值是 32 位无符号十进制（lua 侧 tonumber 直接得到 ARGB）。
+                                    val scheme = MonetPalette.palette()
+                                    val tm = JSONObject()
+                                    fun putColor(key: String, argb: Int) {
+                                        tm.put(key, (argb.toLong() and 0xFFFFFFFFL).toString())
+                                    }
+                                    putColor("background", TokenMapper.bgCard())
+                                    putColor("title", scheme.onSurface)
+                                    putColor("summary", scheme.onSurfaceVariant)
+                                    putColor("source", scheme.onSurfaceVariant)
+                                    putColor("tag", scheme.onSurfaceVariant)
+                                    putColor(
+                                        "tagBackground",
+                                        ColorMath.withAlpha(scheme.onSurface, 0x21)
+                                    )
+                                    putColor("separator", scheme.outlineVariant)
+                                    putColor("picBorder", scheme.outlineVariant)
+                                    // 小程序卡片 JS 用到的另外两档
+                                    putColor("backgroundAlt", TokenMapper.inputBg())
+                                    putColor("brand", scheme.primary)
+                                    theme.put("timMonet", tm)
+                                }
+                            }.onFailure { Log.w(TAG, "ark theme rewrite failed", it) }
                             result = obj.toString()
                         }
                     } catch (t: Throwable) {
@@ -8624,7 +8717,9 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                     val file = chain.getArg(0) as? File
                     if (file != null &&
                         (file.absolutePath.contains("com.tencent.multimsg") ||
-                            file.absolutePath.contains("com.tencent.mannounce"))
+                            file.absolutePath.contains("com.tencent.mannounce") ||
+                            file.absolutePath.contains("com.tencent.structmsg") ||
+                            file.absolutePath.contains("com.tencent.miniapp_01"))
                     ) {
                         if (ArkPackagePatcher.patchIfNeeded(file)) {
                             Log.i(TAG, "ark app verify bypassed: ${file.name}")
@@ -8653,7 +8748,9 @@ private fun hookAioEditText(module: XposedModule, cl: ClassLoader) {
                         }
                         if (path != null &&
                             (path.contains("com.tencent.multimsg") ||
-                                path.contains("com.tencent.mannounce"))
+                                path.contains("com.tencent.mannounce") ||
+                                path.contains("com.tencent.structmsg") ||
+                                path.contains("com.tencent.miniapp_01"))
                         ) {
                             if (ArkPackagePatcher.patchIfNeeded(File(path))) {
                                 return@intercept true

@@ -45,6 +45,29 @@ object ArkPackagePatcher {
     private const val MANNOUNCE_MARKER = "TimMonetMannouncePatch"
     private const val MANNOUNCE_TARGET_ENTRY = "mannounce.lua"
 
+    /**
+     * 结构化消息卡片（`com.tencent.structmsg`）的配色补丁。
+     *
+     * 它把卡片配色**硬编码**在 `base/theme.lua` 的方案表里
+     * （`COLOR_SCHEME_CONCISE_WHITE = { background = 0xFFFFFFFF, ... }`），完全不走
+     * QUI token 表 —— 所以深色莫奈下这类卡片一直是它自己的白/灰底。
+     * 补丁在文件末尾追加一段包装：`getThemeColorConfig()` 返回前，用宿主注入在
+     * 配置里的 `theme.timMonet`（模块按 token 算好的**莫奈色**）覆盖方案表。
+     */
+    private const val STRUCTMSG_MARKER = "TimMonetStructmsgPatch"
+    private const val STRUCTMSG_TARGET_ENTRY = "base/theme.lua"
+
+    /**
+     * 小程序卡片（`com.tencent.miniapp_01`）的配色补丁。
+     *
+     * 卡片视图是 JS 画的，颜色**硬编码**在 JS 里（亮色 `0xFFFFFFFF`/`0xFFF5F6FA`…、
+     * 夜间 `0xFF242526`/`0xFF262626`…、品牌蓝 `0xFF0099FF`…），既不读 QUI token
+     * 也不看我们的 token 重映射 —— 深色下永远是它自己的灰、亮色下永远是白。
+     * 补丁把每个 `.js` entry 里这些字面量换成 `__tm("role", 原值)`：运行时从
+     * 宿主注入的 `app.config.theme.timMonet` 取莫奈色，取不到就退回原值。
+     */
+    private const val MINIAPP_MARKER = "TimMonetMiniappPatch"
+
     private val KEY = "20180730104551tm".toByteArray(Charsets.US_ASCII)
 
     private val PATCH_BLOCK_REGEX =
@@ -54,8 +77,53 @@ object ArkPackagePatcher {
         "(?s)-- ==== TimMonetMannouncePatch.*?-- ==== end TimMonetMannouncePatch ====\\s*"
     )
 
+    private val STRUCTMSG_BLOCK_REGEX = Regex(
+        "(?s)-- ==== TimMonetStructmsgPatch.*?-- ==== end TimMonetStructmsgPatch ====\\s*"
+    )
 
-    private enum class Kind { MULTIMSG, MANNOUNCE }
+    private val MINIAPP_BLOCK_REGEX = Regex(
+        "(?s)// ==== TimMonetMiniappPatch.*?// ==== end TimMonetMiniappPatch ====\\s*"
+    )
+
+    /**
+     * 小程序卡片 JS 里"硬编码颜色 -> 我们的角色"对照表。
+     *
+     * ⚠️ 查表前两边都要**统一成大写**（map 键已 `.mapKeys{uppercase}`，查表用
+     * `m.value.uppercase()`）：JS 里同一个颜色大小写混用（`0xFF242526` / `0xff878B99`），
+     * 只按原样做键会一个都匹配不上 —— 踩过：替换数 0 → transform 原样返回 →
+     * 文件被"成功重打包"但内容一点没变（日志还写着 repacked），极难查。
+     */
+    private val MINIAPP_COLOR_ROLES: Map<String, String> = mapOf(
+        // 卡片底（亮色白 / 夜间 #242526、#262626）
+        "0xFFFFFFFF" to "background",
+        "0xFF242526" to "background",
+        "0xFF262626" to "background",
+        // 卡片内的次级底（浅灰条/占位底）
+        "0xFFF5F6FA" to "backgroundAlt",
+        "0xFFEBEDF5" to "backgroundAlt",
+        "0xFFEAEDF4" to "backgroundAlt",
+        "0xFFEEEEF2" to "backgroundAlt",
+        "0xFFF5F6F5" to "backgroundAlt",
+        // 标题/正文（深色）
+        "0xFF03081A" to "title",
+        "0xFF222222" to "title",
+        "0xFF2E2E2E" to "title",
+        "0xFF666666" to "title",
+        // 次要文字（灰）
+        "0xFF878B99" to "summary",
+        "0xFF999999" to "summary",
+        "0xFFB2B2B2" to "summary",
+        "0xFF909094" to "summary",
+        "0xFFCBCED6" to "summary",
+        "0xFF616573" to "summary",
+        // 品牌蓝（左侧竖条等）
+        "0xFF0099FF" to "brand",
+        "0xFF4D94FF" to "brand",
+        "0xFF00CAFC" to "brand"
+    ).mapKeys { it.key.uppercase() }
+
+
+    private enum class Kind { MULTIMSG, MANNOUNCE, STRUCTMSG, MINIAPP }
 
     @Volatile
     private var patchedPath: String? = null
@@ -81,6 +149,8 @@ object ArkPackagePatcher {
         val kind = when {
             file.absolutePath.contains("com.tencent.multimsg") -> Kind.MULTIMSG
             file.absolutePath.contains("com.tencent.mannounce") -> Kind.MANNOUNCE
+            file.absolutePath.contains("com.tencent.structmsg") -> Kind.STRUCTMSG
+            file.absolutePath.contains("com.tencent.miniapp_01") -> Kind.MINIAPP
             else -> return false
         }
         val stamp = file.lastModified() xor file.length()
@@ -88,15 +158,29 @@ object ArkPackagePatcher {
         val ok = try {
             when (kind) {
                 Kind.MULTIMSG -> patchInPlace(
-                    file, TARGET_ENTRY, MARKER, PATCH_BLOCK_REGEX, ::injectMultimsgPatch
-                )
+                    file,
+                    { it == TARGET_ENTRY },
+                    MARKER,
+                    PATCH_BLOCK_REGEX
+                ) { _, js -> injectMultimsgPatch(js) }
                 Kind.MANNOUNCE -> patchInPlace(
                     file,
-                    MANNOUNCE_TARGET_ENTRY,
+                    { it == MANNOUNCE_TARGET_ENTRY },
                     MANNOUNCE_MARKER,
-                    MANNOUNCE_BLOCK_REGEX,
-                    ::injectMannouncePatch
-                )
+                    MANNOUNCE_BLOCK_REGEX
+                ) { _, lua -> injectMannouncePatch(lua) }
+                Kind.STRUCTMSG -> patchInPlace(
+                    file,
+                    { it == STRUCTMSG_TARGET_ENTRY },
+                    STRUCTMSG_MARKER,
+                    STRUCTMSG_BLOCK_REGEX
+                ) { _, lua -> injectStructmsgPatch(lua) }
+                Kind.MINIAPP -> patchInPlace(
+                    file,
+                    { it.endsWith(".js") },
+                    MINIAPP_MARKER,
+                    MINIAPP_BLOCK_REGEX
+                ) { _, js -> injectMiniappPatch(js) }
             }
         } catch (t: Throwable) {
             Log.w(TAG, "ark repack failed: ${file.name}", t)
@@ -111,10 +195,10 @@ object ArkPackagePatcher {
 
     private fun patchInPlace(
         file: File,
-        targetEntry: String,
+        selectEntries: (String) -> Boolean,
         marker: String,
         blockRegex: Regex,
-        injector: (String) -> String?
+        transform: (String, String) -> String?
     ): Boolean {
         if (!file.isFile) return false
         val src = file.readBytes()
@@ -133,30 +217,36 @@ object ArkPackagePatcher {
 
         val indexPlain = xorWithKey(src, indexStart, indexStart + indexSize)
         val entries = parseIndex(indexPlain, fileCount) ?: return false
-        if (entries.none { it.name == targetEntry }) return false
+        val targets = entries.filter { selectEntries(it.name) }
+        if (targets.isEmpty()) return false
 
-        val baseEntry = entries.first { it.name == targetEntry }
-        val baseJs = inflateEntry(src, dataBase, baseEntry) ?: return false
-        if (marker in baseJs) {
-            Log.i(TAG, "ark app already patched: ${file.name}")
-            return true
+        // 幂等判据：任一目标 entry 里已有 marker 就算打过了。
+        // ⚠️ 注入内容一变就要升 marker 版本号（否则设备上已打过旧补丁的包会被跳过），
+        // 旧块由 blockRegex 在下面剥掉。
+        val originals = HashMap<String, String>()
+        for (e in targets) {
+            val text = inflateEntry(src, dataBase, e) ?: return false
+            if (marker in text) {
+                Log.i(TAG, "ark app already patched: ${file.name}")
+                return true
+            }
+            originals[e.name] = text
         }
 
-        // ⚠️ 注入前必须先剥掉**旧版本**的补丁块：幂等只认 `marker`（含版本号，
-        // 如 TimMonetPatchV3），所以注入内容一变就得把 MARKER 升到 V4 —— 而那时
-        // 包里躺着的是 V3 的块，不剥掉就会出现"同一个文件里两份补丁"（旧块在前，
-        // 覆盖新块的变量/逻辑）。blockRegex 就是为这件事准备的（此前它被传进来
-        // 却从未使用，等于这条路径是空的）。
-        val stripped = blockRegex.replace(baseJs, "")
-        val patchedJs = injector(stripped) ?: return false
-        val newStored = deflateAndEncrypt(patchedJs.toByteArray(Charsets.UTF_8))
+        val newStoredByName = HashMap<String, ByteArray>()
+        for ((name, text) in originals) {
+            val stripped = blockRegex.replace(text, "")
+            val patched = transform(name, stripped) ?: return false
+            newStoredByName[name] = deflateAndEncrypt(patched.toByteArray(Charsets.UTF_8))
+        }
 
         // 保持原始记录顺序重建数据区与文件表（offset 相对数据区起点）
         val rebuilt = ArrayList<Entry>(entries.size)
         var runningOffset = 0
         for (entry in entries) {
-            val stored = if (entry.name == targetEntry) {
-                newStored
+            val patchedEntry = newStoredByName[entry.name]
+            val stored = if (patchedEntry != null) {
+                patchedEntry
             } else {
                 val start = dataBase + entry.offset
                 if (start < 0 || start + entry.size > src.size) return false
@@ -286,6 +376,91 @@ object ArkPackagePatcher {
      * 文字硬编码成 0xFF03081A / 0xFF878B99，完全不走 token。这里在该分支里
      * 追加按 token（bubble_guest_text_primary/secondary）取色，覆盖硬编码值。
      */
+    /**
+     * 给 `com.tencent.structmsg` 的 `base/theme.lua` 追加一段包装：返回前用宿主注入的
+     * `theme.timMonet`（模块算好的**莫奈色**）覆盖它内部的配色方案表。
+     *
+     * 追加在**文件末尾**（不按 anchor 插进函数体）：lua 里这些函数与 `THEME_COLOR_*`
+     * 常量都是该模块的全局，末尾重定义 `getThemeColorConfig` 即生效，跨版本最稳；
+     * 找不到目标函数就返回 null（放弃），绝不写坏包。
+     */
+    private fun injectStructmsgPatch(lua: String): String? {
+        val current = STRUCTMSG_BLOCK_REGEX.replace(lua, "")
+        if (!current.contains("function getThemeColorConfig")) return null
+        if (!current.contains("THEME_COLOR_BACKGROUND")) return null
+        val block =
+            "\n" +
+                "-- ==== $STRUCTMSG_MARKER: 用模块注入的莫奈配色覆盖内置方案 ====\n" +
+                "do\n" +
+                "    local __tmOrigGetThemeColorConfig = getThemeColorConfig\n" +
+                "    function getThemeColorConfig(view)\n" +
+                "        local cfg = __tmOrigGetThemeColorConfig(view)\n" +
+                "        local tm = nil\n" +
+                "        local ok, t = pcall(function() return app.getThemeConfig() end)\n" +
+                "        if ok and t ~= nil then tm = t[\"timMonet\"] end\n" +
+                "        if tm == nil or cfg == nil then return cfg end\n" +
+                "        local function __tmSet(key, v)\n" +
+                "            if v ~= nil then\n" +
+                "                local n = tonumber(v)\n" +
+                "                if n ~= nil then cfg[key] = n end\n" +
+                "            end\n" +
+                "        end\n" +
+                "        __tmSet(THEME_COLOR_BACKGROUND, tm[\"background\"])\n" +
+                "        __tmSet(THEME_COLOR_TITLE, tm[\"title\"])\n" +
+                "        __tmSet(THEME_COLOR_SUMMARY, tm[\"summary\"])\n" +
+                "        __tmSet(THEME_COLOR_SOURCE, tm[\"source\"])\n" +
+                "        __tmSet(THEME_COLOR_TAG, tm[\"tag\"])\n" +
+                "        __tmSet(THEME_COLOR_TAG_BACKGROUND, tm[\"tagBackground\"])\n" +
+                "        __tmSet(THEME_COLOR_SEPERATOR, tm[\"separator\"])\n" +
+                "        __tmSet(THEME_COLOR_PIC_BORDER, tm[\"picBorder\"])\n" +
+                "        return cfg\n" +
+                "    end\n" +
+                "end\n" +
+                "-- ==== end $STRUCTMSG_MARKER ====\n"
+        return current + block
+    }
+
+    /**
+     * 给 `com.tencent.miniapp_01` 的每个 `.js` 打补丁：把硬编码颜色字面量替换成
+     * `__tm("role", 原值)` —— 运行时从宿主注入的 `app.config.theme.timMonet` 取
+     * 莫奈色；取不到（老宿主/未注入）就退回原来的字面量，行为与打补丁前一致。
+     *
+     * 只改 JS 不改 XML：这些卡片的颜色最终都由 JS 在 `OnSetValue`/`darkModeAdapt`
+     * 里重设（XML 里只是首帧初值），改 JS 就够，也避开 XML 不能写表达式的限制。
+     */
+    private fun injectMiniappPatch(js: String): String? {
+        val current = MINIAPP_BLOCK_REGEX.replace(js, "")
+        var replaced = 0
+        val body = Regex("0x[0-9A-Fa-f]{6,8}").replace(current) { m ->
+            val role = MINIAPP_COLOR_ROLES[m.value.uppercase()]
+            if (role == null) {
+                m.value
+            } else {
+                replaced++
+                "__tm(\"$role\",${m.value})"
+            }
+        }
+        // ⚠️ 没有任何可替换字面量的 entry 要**原样返回**，不能返回 null：
+        // 多 entry 打补丁时 null 表示"这个包放弃"，会让整个补丁失败
+        // （踩过：all.js 里没有认识的色值 → 整个 miniapp_01 补丁被放弃）。
+        if (replaced == 0) return current
+        val header =
+            "// ==== $MINIAPP_MARKER: 硬编码配色 -> 模块注入的莫奈色 ====\n" +
+                "function __tm(role, fallback) {\n" +
+                "    try {\n" +
+                "        var th = (typeof app !== 'undefined' && app.config) ? app.config.theme : null;\n" +
+                "        var m = th ? th.timMonet : null;\n" +
+                "        if (!m) { return fallback; }\n" +
+                "        var v = m[role];\n" +
+                "        if (v === null || v === undefined || v === '') { return fallback; }\n" +
+                "        var n = Number(v);\n" +
+                "        return isNaN(n) ? fallback : (n | 0);\n" +
+                "    } catch (e) { return fallback; }\n" +
+                "}\n" +
+                "// ==== end $MINIAPP_MARKER ====\n"
+        return header + body
+    }
+
     private fun injectMannouncePatch(js: String): String? {
         var current = MANNOUNCE_BLOCK_REGEX.replace(js, "")
         val anchor = "Console.Log(\"mannounce setBackground ConciseWhite\")"
