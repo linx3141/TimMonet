@@ -68,7 +68,7 @@ object ArkPackagePatcher {
      */
     private const val MINIAPP_MARKER = "TimMonetMiniappPatch"
     /** 补丁内容版本：**改了下面任何映射/代码就要 +1**（幂等判据是 marker 字符串）。 */
-    private const val MINIAPP_PATCH_VERSION = 8
+    private const val MINIAPP_PATCH_VERSION = 9
 
     private val KEY = "20180730104551tm".toByteArray(Charsets.US_ASCII)
 
@@ -82,6 +82,9 @@ object ArkPackagePatcher {
     private val STRUCTMSG_BLOCK_REGEX = Regex(
         "(?s)-- ==== TimMonetStructmsgPatch.*?-- ==== end TimMonetStructmsgPatch ====\\s*"
     )
+
+    /** 上一次替换留下的"原值"标记：`0xFF003045/*tm0xFF999999*/`。 */
+    private val TM_ORIG_MARKER = Regex("0x[0-9A-Fa-f]{8}/\\*tm(0x[0-9A-Fa-f]{8})\\*/")
 
     private val MINIAPP_BLOCK_REGEX = Regex(
         "(?s)// ==== TimMonetMiniappPatch.*?// ==== end TimMonetMiniappPatch ====\\s*"
@@ -99,13 +102,9 @@ object ArkPackagePatcher {
         "0xFFEAEDF4" to "background",
         "0xFFEBEDF5" to "background",
         "0xFFF5F6FA" to "background",
-        "0xFFEEEEF2" to "background",
         // 卡片内的标题条（白，比卡片底亮一档）
         "0xFFFFFFFF" to "backgroundAlt",
         // 品牌蓝竖条
-        "0xFF4D94FF" to "brand",
-        "0xFF00CAFC" to "brand",
-        "0xFF0099FF" to "brand"
     ).mapKeys { it.key.uppercase() }
 
     /**
@@ -119,12 +118,9 @@ object ArkPackagePatcher {
         "0xFFFFFFFF" to "title",
         "0xFF03081A" to "title",
         "0xFF222222" to "title",
-        "0xFF666666" to "title",
         "0xFF878B99" to "summary",
         "0xFF909094" to "summary",
         "0xFFB2B2B2" to "summary",
-        "0xFF999999" to "summary",
-        "0xFFCBCED6" to "summary"
     ).mapKeys { it.key.uppercase() }
 
     /**
@@ -143,12 +139,9 @@ object ArkPackagePatcher {
         // 卡片内的次级底（浅灰条/占位底）
         "0xFFF5F6FA" to "backgroundAlt",
         "0xFFEBEDF5" to "backgroundAlt",
-        "0xFFEAEDF4" to "backgroundAlt",
         "0xFFEEEEF2" to "backgroundAlt",
-        "0xFFF5F6F5" to "backgroundAlt",
         // 主标题/正文 -> onSurface（用户要求："文字要 onSurface"）
         "0xFF03081A" to "title",
-        "0xFF222222" to "title",
         "0xFF2E2E2E" to "title",
         // ⚠️ JS 里 `descUIObj`（卡片主标题）夜间用的是 0xFF999999，
         // 不是深灰那两个 —— 它必须走 onSurface；mis-map 成 onSurfaceVariant
@@ -156,15 +149,9 @@ object ArkPackagePatcher {
         "0xFF999999" to "title",
         // 次要文字（应用名 "哔哩哔哩"/页脚 "QQ小程序"）才用 onSurfaceVariant
         "0xFF878B99" to "summary",
-        "0xFFB2B2B2" to "summary",
-        "0xFF909094" to "summary",
-        "0xFFCBCED6" to "summary",
-        "0xFF616573" to "summary",
         "0xFF666666" to "summary",
         // 品牌蓝（左侧竖条等）
         "0xFF0099FF" to "brand",
-        "0xFF4D94FF" to "brand",
-        "0xFF00CAFC" to "brand"
     ).mapKeys { it.key.uppercase() }
 
 
@@ -560,8 +547,13 @@ object ArkPackagePatcher {
         fingerprint: String
     ): String? {
         val current = MINIAPP_BLOCK_REGEX.replace(js, "")
+        // ⚠️ 先把上一次替换过的颜色**还原成原值**（替换时留了 `/*tm0x…*/` 标记）。
+        // 不还原的话，换调色板后文件里的字面量已经是我们上次烤进去的颜色，查表
+        // 必然 0 命中 → transform 原样返回 → 卡片永远停在上一次的配色
+        // （XML 那边靠补丁块里存的原文还原，这里是同一件事的内联版本）。
+        val restored = TM_ORIG_MARKER.replace(current) { m -> m.groupValues[1] }
         var replaced = 0
-        val body = Regex("0x[0-9A-Fa-f]{6,8}").replace(current) { m ->
+        val body = Regex("0x[0-9A-Fa-f]{8}").replace(restored) { m ->
             val role = MINIAPP_COLOR_ROLES[m.value.uppercase()]
             val argb = role?.let { roleColors[it] }
             if (argb == null) {
@@ -574,7 +566,8 @@ object ArkPackagePatcher {
                 //  - 试过就地 IIFE 查 `app.config.theme.timMonet`：运行时那个对象
                 //    不一定可见（实测又退回它自己的灰色）。
                 // 调色板变化时靠 marker 里的指纹触发重打（TIM 改配色本来就会重启）。
-                "0x" + Integer.toHexString(argb).uppercase().padStart(8, '0')
+                "0x" + Integer.toHexString(argb).uppercase().padStart(8, '0') +
+                    "/*tm" + m.value + "*/"
             }
         }
         // ⚠️ 没有任何可替换字面量的 entry 要**原样返回**，不能返回 null：
